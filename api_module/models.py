@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -48,3 +48,75 @@ class ProfileOut(BaseModel):
     email: EmailStr
     uiLanguage: Literal["en", "tr"]
     isEmailVerified: bool
+
+
+class PlayerPoolSearchIn(BaseModel):
+    name: Optional[str] = None
+    gender: Optional[Literal["male", "female"]] = None
+    nationality: Optional[str] = None
+    nationalityExact: Optional[bool] = False
+    league: Optional[str] = None
+    leagueExact: Optional[bool] = False
+    team: Optional[str] = None
+    teamExact: Optional[bool] = False
+    minAge: Optional[float] = Field(default=None, ge=0)
+    maxAge: Optional[float] = Field(default=None, ge=0)
+    minHeight: Optional[float] = Field(default=None, ge=0)
+    maxHeight: Optional[float] = Field(default=None, ge=0)
+    minWeight: Optional[float] = Field(default=None, ge=0)
+    maxWeight: Optional[float] = Field(default=None, ge=0)
+    position: Optional[str] = None
+    limit: Optional[int] = Field(default=100, ge=1, le=200)
+    worldCupMode: Optional[bool] = False
+
+
+class PlayerPoolSearchRow(BaseModel):
+    id: str | int
+    content: Dict[str, Any]
+
+
+class PlayerPoolWeeklyPopularIn(BaseModel):
+    limit: Optional[int] = Field(default=10, ge=1, le=10)
+    worldCupMode: Optional[bool] = False
+
+
+class PlayerPoolFilterOptionsOut(BaseModel):
+    teams: List[str]
+    leagues: List[str]
+    nationalities: List[str]
+    positions: List[str]
+
+
+class PlayerPoolPotentialOut(BaseModel):
+    player_id: str
+    status: str
+    potential: int = Field(ge=0, le=100)
+    source: str
+
+
+class PlayerPoolFormOut(BaseModel):
+    player_id: str
+    status: str
+    form: int = Field(ge=0, le=100)
+    source: str
+
+
+class EnterpriseFavoritePlayerIn(BaseModel):
+    playerId: str
+    worldCupMode: Optional[bool] = False
+
+
+class EnterpriseFavoritePlayerOut(BaseModel):
+    id: str
+    clubPlayerId: Optional[int] = None
+    name: str
+    nationality: Optional[str] = None
+    age: Optional[int] = None
+    potential: Optional[int] = Field(default=None, ge=0, le=100)
+    form: Optional[int] = Field(default=None, ge=0, le=100)
+    gender: Optional[str] = None
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    team: Optional[str] = None
+    league: Optional[str] = None
+    roles: List[str] = Field(default_factory=list)
