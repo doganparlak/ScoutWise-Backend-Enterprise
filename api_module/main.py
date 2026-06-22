@@ -18,6 +18,8 @@ from api_module.database import SessionLocal, get_db
 from api_module.models import (
     LoginIn,
     LoginOut,
+    MatchupComparisonIn,
+    MatchupComparisonOut,
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
     PasswordResetRequestIn,
@@ -48,6 +50,7 @@ from api_module.utilities import (
 )
 from player_pool_module.player_pool import get_player_pool_filter_options, search_players
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
+from matchup_module.comparison import get_matchup_comparison
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 
@@ -712,6 +715,19 @@ def player_pool_weekly_popular(
 ):
     del user_id
     return get_weekly_popular_players(db, payload.limit or 10, bool(payload.worldCupMode))
+
+
+@app.post("/player-pool/matchup/comparison", response_model=MatchupComparisonOut)
+def player_pool_matchup_comparison(
+    payload: MatchupComparisonIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    try:
+        return get_matchup_comparison(db, payload.player1Id, payload.player2Id, bool(payload.worldCupMode))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/player-pool/options", response_model=PlayerPoolFilterOptionsOut)

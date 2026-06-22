@@ -101,6 +101,22 @@ class PlayerPoolFormOut(BaseModel):
     source: str
 
 
+class MatchupComparisonIn(BaseModel):
+    player1Id: str
+    player2Id: str
+    worldCupMode: Optional[bool] = False
+
+
+class MatchupComparisonPlayer(BaseModel):
+    id: str | int
+    content: Dict[str, Any]
+
+
+class MatchupComparisonOut(BaseModel):
+    player1: MatchupComparisonPlayer
+    player2: MatchupComparisonPlayer
+
+
 class EnterpriseFavoritePlayerIn(BaseModel):
     playerId: str
     worldCupMode: Optional[bool] = False
