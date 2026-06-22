@@ -136,3 +136,25 @@ class EnterpriseFavoritePlayerOut(BaseModel):
     team: Optional[str] = None
     league: Optional[str] = None
     roles: List[str] = Field(default_factory=list)
+
+
+class EnterpriseScoutingReportIn(BaseModel):
+    name: Optional[str] = None
+    gender: Optional[str] = None
+    nationality: Optional[str] = None
+    team: Optional[str] = None
+    age: Optional[int] = None
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    potential: Optional[int] = Field(default=None, ge=0, le=100)
+    form: Optional[int] = Field(default=None, ge=0, le=100)
+    clubPlayerId: Optional[int] = None
+
+
+class EnterpriseScoutingReportOut(BaseModel):
+    favorite_player_id: str
+    status: str
+    content: Optional[str] = None
+    content_json: Optional[Dict[str, Any]] = None
+    language: str
+    version: int

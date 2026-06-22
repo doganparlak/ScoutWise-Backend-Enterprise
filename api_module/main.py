@@ -7,7 +7,7 @@ import uuid
 from typing import Any, Dict
 
 from dotenv import load_dotenv
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query as FastAPIQuery, Response, status
+from fastapi import Body, BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query as FastAPIQuery, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -22,6 +22,8 @@ from api_module.models import (
     MatchupComparisonOut,
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
+    EnterpriseScoutingReportIn,
+    EnterpriseScoutingReportOut,
     PasswordResetRequestIn,
     PlayerPoolFilterOptionsOut,
     PlayerPoolFormOut,
@@ -53,6 +55,7 @@ from player_pool_module.weekly_popular import get_weekly_popular_players, record
 from matchup_module.comparison import get_matchup_comparison
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
+from report_module.report import generate_report_content
 
 PASSWORD_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
@@ -553,6 +556,112 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
     )
 
 
+def _enterprise_favorite_identity(row: Any) -> Dict[str, Any]:
+    data = row._mapping if hasattr(row, "_mapping") else row
+    roles_raw = data.get("roles_json") or []
+    if isinstance(roles_raw, str):
+        try:
+            roles_raw = json.loads(roles_raw)
+        except json.JSONDecodeError:
+            roles_raw = []
+    return {
+        "favorite_id": str(data["id"]),
+        "club_player_id": data.get("club_player_id"),
+        "name": data.get("name"),
+        "nationality": data.get("nationality"),
+        "age": data.get("age"),
+        "potential": data.get("potential"),
+        "form": data.get("form"),
+        "gender": data.get("gender"),
+        "height": data.get("height"),
+        "weight": data.get("weight"),
+        "team": data.get("team"),
+        "league": data.get("league"),
+        "roles": [str(role) for role in roles_raw if str(role).strip()] if isinstance(roles_raw, list) else [],
+    }
+
+
+def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) -> Any:
+    row = db.execute(
+        text(
+            """
+            SELECT id, club_player_id, name, nationality, age, potential, form,
+                   gender, height, weight, team, league, roles_json
+            FROM enterprise_favorite_players
+            WHERE id = :favorite_id
+              AND user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"favorite_id": favorite_id, "user_id": user_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Favorite not found")
+    return row
+
+
+def _generate_enterprise_report_background(
+    report_id: str,
+    favorite_id: str,
+    user_id: str,
+    lang: str,
+    version: int,
+    player_payload: Dict[str, Any],
+) -> None:
+    db = SessionLocal()
+    try:
+        generated = generate_report_content(
+            db,
+            favorite_id=favorite_id,
+            lang=lang,
+            version=version,
+            player_identity=player_payload,
+        )
+        db.execute(
+            text(
+                """
+                UPDATE enterprise_scouting_reports
+                SET status = 'ready',
+                    content = :content,
+                    content_json = CAST(:content_json AS jsonb),
+                    error = NULL,
+                    ready_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :id
+                  AND user_id = :user_id
+                  AND favorite_player_id = :favorite_id
+                """
+            ),
+            {
+                "id": report_id,
+                "user_id": user_id,
+                "favorite_id": favorite_id,
+                "content": generated["content"],
+                "content_json": json.dumps(generated["content_json"], ensure_ascii=False, default=str),
+            },
+        )
+        db.commit()
+    except Exception as exc:
+        print(f"[enterprise_report_generation_failed] report_id={report_id} favorite_id={favorite_id} error={exc}")
+        db.execute(
+            text(
+                """
+                UPDATE enterprise_scouting_reports
+                SET status = 'failed',
+                    error = :error,
+                    updated_at = NOW()
+                WHERE id = :id
+                  AND user_id = :user_id
+                  AND favorite_player_id = :favorite_id
+                """
+            ),
+            {"id": report_id, "user_id": user_id, "favorite_id": favorite_id, "error": str(exc)},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def _get_player_metadata(db: Session, player_id: str, world_cup_mode: bool) -> Dict[str, Any]:
     table_name = "player_data_wc" if world_cup_mode else "player_data"
     row = db.execute(
@@ -861,6 +970,110 @@ def save_enterprise_favorite_player(
         {"id": favorite_id, "user_id": user_id},
     ).mappings().first()
     return _favorite_out(row)
+
+
+@app.post("/favorite-players/{favorite_id}/report", response_model=EnterpriseScoutingReportOut)
+def get_or_create_enterprise_scouting_report(
+    favorite_id: str,
+    background_tasks: BackgroundTasks,
+    payload: EnterpriseScoutingReportIn = Body(default=EnterpriseScoutingReportIn()),
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    lang = normalize_lang(accept_language) or "en"
+    version = 2
+
+    favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
+    player_payload = _enterprise_favorite_identity(favorite_row)
+    incoming_payload = payload.model_dump(exclude_none=True)
+    if incoming_payload.get("clubPlayerId") is not None:
+        incoming_payload["club_player_id"] = incoming_payload.pop("clubPlayerId")
+    player_payload.update(incoming_payload)
+
+    row = db.execute(
+        text(
+            """
+            SELECT id, status, content, content_json, language, version
+            FROM enterprise_scouting_reports
+            WHERE user_id = :user_id
+              AND favorite_player_id = :favorite_id
+              AND COALESCE(language, 'en') = :lang
+              AND version = :version
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id, "favorite_id": favorite_id, "lang": lang, "version": version},
+    ).mappings().first()
+
+    if row:
+        if row["status"] == "failed":
+            db.execute(text("DELETE FROM enterprise_scouting_reports WHERE id = :id"), {"id": row["id"]})
+            db.commit()
+            row = None
+        elif row["status"] == "ready":
+            content_json = row["content_json"] if isinstance(row["content_json"], dict) else {}
+            player_card = content_json.get("player_card") if isinstance(content_json, dict) else {}
+            player_card = player_card if isinstance(player_card, dict) else {}
+            missing_requested_score = any(
+                player_payload.get(score_key) is not None and player_card.get(score_key) is None
+                for score_key in ("potential", "form")
+            )
+            if missing_requested_score:
+                db.execute(text("DELETE FROM enterprise_scouting_reports WHERE id = :id"), {"id": row["id"]})
+                db.commit()
+                row = None
+            else:
+                return {
+                    "favorite_player_id": favorite_id,
+                    "status": row["status"],
+                    "content": row["content"],
+                    "content_json": row["content_json"],
+                    "language": row["language"],
+                    "version": row["version"],
+                }
+        else:
+            return {
+                "favorite_player_id": favorite_id,
+                "status": row["status"],
+                "content": row["content"],
+                "content_json": row["content_json"],
+                "language": row["language"],
+                "version": row["version"],
+            }
+
+    report_id = str(uuid.uuid4())
+    db.execute(
+        text(
+            """
+            INSERT INTO enterprise_scouting_reports (
+                id, user_id, favorite_player_id, status, language, version, created_at, updated_at
+            )
+            VALUES (:id, :user_id, :favorite_id, 'processing', :lang, :version, NOW(), NOW())
+            """
+        ),
+        {"id": report_id, "user_id": user_id, "favorite_id": favorite_id, "lang": lang, "version": version},
+    )
+    db.commit()
+
+    background_tasks.add_task(
+        _generate_enterprise_report_background,
+        report_id,
+        favorite_id,
+        user_id,
+        lang,
+        version,
+        player_payload,
+    )
+
+    return {
+        "favorite_player_id": favorite_id,
+        "status": "processing",
+        "content": None,
+        "content_json": None,
+        "language": lang,
+        "version": version,
+    }
 
 
 @app.delete("/favorite-players/{favorite_id}", status_code=status.HTTP_204_NO_CONTENT)
