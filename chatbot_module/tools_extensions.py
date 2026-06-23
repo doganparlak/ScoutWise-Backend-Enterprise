@@ -421,6 +421,7 @@ def build_player_payload_new(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
             output["players"].append({
+                "id": resolved.get("id") or m.get("id"),
                 "name": name,
                 "meta": {
                     "gender": gender_final,

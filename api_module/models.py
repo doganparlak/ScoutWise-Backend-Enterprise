@@ -118,7 +118,18 @@ class MatchupComparisonOut(BaseModel):
 
 
 class EnterpriseFavoritePlayerIn(BaseModel):
-    playerId: str
+    playerId: Optional[str] = None
+    name: Optional[str] = None
+    nationality: Optional[str] = None
+    age: Optional[int] = None
+    potential: Optional[int] = Field(default=None, ge=0, le=100)
+    form: Optional[int] = Field(default=None, ge=0, le=100)
+    gender: Optional[str] = None
+    height: Optional[int | str] = None
+    weight: Optional[int | str] = None
+    team: Optional[str] = None
+    league: Optional[str] = None
+    roles: List[str] = Field(default_factory=list)
     worldCupMode: Optional[bool] = False
 
 

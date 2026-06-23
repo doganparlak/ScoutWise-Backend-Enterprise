@@ -2044,6 +2044,7 @@ def validate_candidate(candidate: Dict[str, Any], ctx: AgenticContext) -> Option
 def candidate_to_meta(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "players": [{
+            "id": candidate.get("id"),
             "name": candidate.get("name"),
             "gender": candidate.get("gender"),
             "height": candidate.get("height"),
@@ -2066,6 +2067,7 @@ def build_payload_from_candidate(candidate: Dict[str, Any], seen_players: set[st
     meta_new, new_names = filter_players_by_seen(meta, seen_players)
     payload = build_player_payload_new(meta_new) if new_names else {"players": []}
     if payload.get("players"):
+        payload["players"][0].setdefault("id", candidate.get("id"))
         payload_meta = payload["players"][0].setdefault("meta", {})
         payload_meta["potential"] = candidate.get("potential")
         payload_meta["form"] = candidate.get("form")

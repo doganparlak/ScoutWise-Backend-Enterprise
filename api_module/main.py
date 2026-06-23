@@ -786,6 +786,50 @@ def _resolve_club_player_row(db: Session, player_id: str, world_cup_mode: bool) 
     return row
 
 
+def _resolve_club_player_row_from_favorite_payload(
+    db: Session,
+    payload: EnterpriseFavoritePlayerIn,
+) -> Any | None:
+    roles = [role for role in (payload.roles or []) if role]
+    attempts = [
+        ("name_team_nationality_gender", {"name": payload.name, "team": payload.team, "nationality": payload.nationality, "gender": payload.gender}),
+        ("name_team_nationality", {"name": payload.name, "team": payload.team, "nationality": payload.nationality}),
+        ("name_team", {"name": payload.name, "team": payload.team}),
+        ("name_nationality", {"name": payload.name, "nationality": payload.nationality}),
+        ("name_only", {"name": payload.name}),
+    ]
+
+    rows = []
+    winning_stage = "none"
+    for stage, filters in attempts:
+        search_filters = {key: value for key, value in filters.items() if value not in (None, "", [])}
+        search_filters["limit"] = 10
+        search_filters["worldCupMode"] = False
+        rows = search_players(db, search_filters)
+        print(
+            "[enterprise_favorite_save] "
+            f"event=snapshot_resolve stage={stage} name={payload.name!r} team={payload.team!r} "
+            f"nationality={payload.nationality!r} role={(roles[0] if roles else None)!r} "
+            f"matches={len(rows)}",
+            flush=True,
+        )
+        if rows:
+            winning_stage = stage
+            break
+
+    if not rows:
+        return None
+
+    best = rows[0]
+    player_id = str(best["id"])
+    print(
+        "[enterprise_favorite_save] "
+        f"event=snapshot_resolved stage={winning_stage} player_id={player_id} player={payload.name!r}",
+        flush=True,
+    )
+    return _resolve_club_player_row(db, player_id, False)
+
+
 def _favorite_values_from_club_row(
     club_row: Any,
     potential: int,
@@ -805,6 +849,23 @@ def _favorite_values_from_club_row(
         "team": _metadata_text(metadata, "team_name", "team"),
         "league": _metadata_text(metadata, "league_name", "league"),
         "roles": _metadata_roles(metadata),
+    }
+
+
+def _favorite_values_from_payload(payload: EnterpriseFavoritePlayerIn) -> Dict[str, Any]:
+    return {
+        "club_player_id": None,
+        "name": (payload.name or "").strip(),
+        "nationality": (payload.nationality or "").strip() or None,
+        "age": payload.age,
+        "potential": payload.potential if payload.potential is not None else 0,
+        "form": payload.form if payload.form is not None else 0,
+        "gender": (payload.gender or "").strip() or None,
+        "height": str(payload.height).strip() if payload.height is not None else None,
+        "weight": str(payload.weight).strip() if payload.weight is not None else None,
+        "team": (payload.team or "").strip() or None,
+        "league": (payload.league or "").strip() or None,
+        "roles": [str(role).strip() for role in (payload.roles or []) if str(role).strip()],
     }
 
 
@@ -969,11 +1030,31 @@ def save_enterprise_favorite_player(
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
-    club_row = _resolve_club_player_row(db, payload.playerId, bool(payload.worldCupMode))
-    club_player_id = int(club_row["id"])
-    potential = reveal_player_potential(db, club_player_id, False)["potential"]
-    form = reveal_player_form(db, club_player_id, False)["form"]
-    favorite_values = _favorite_values_from_club_row(club_row, potential, form)
+    print(
+        "[enterprise_favorite_save] "
+        f"event=request has_player_id={bool(payload.playerId)} "
+        f"player_id={payload.playerId!r} name={payload.name!r} team={payload.team!r}",
+        flush=True,
+    )
+    if payload.playerId:
+        club_row = _resolve_club_player_row(db, payload.playerId, bool(payload.worldCupMode))
+    else:
+        club_row = _resolve_club_player_row_from_favorite_payload(db, payload)
+        if club_row is None:
+            print(
+                "[enterprise_favorite_save] "
+                f"event=snapshot_resolve_failed name={payload.name!r} team={payload.team!r}",
+                flush=True,
+            )
+            favorite_values = _favorite_values_from_payload(payload)
+        else:
+            payload.playerId = str(club_row["id"])
+
+    if payload.playerId:
+        club_player_id = int(club_row["id"])
+        potential = reveal_player_potential(db, club_player_id, False)["potential"]
+        form = reveal_player_form(db, club_player_id, False)["form"]
+        favorite_values = _favorite_values_from_club_row(club_row, potential, form)
 
     if not favorite_values["name"]:
         raise HTTPException(status_code=400, detail="Player name is missing")
@@ -998,7 +1079,7 @@ def save_enterprise_favorite_player(
     params = {
         "id": favorite_id,
         "user_id": user_id,
-        "player_id": str(favorite_values["club_player_id"]),
+        "player_id": str(favorite_values["club_player_id"]) if favorite_values["club_player_id"] is not None else None,
         "player_name": favorite_values["name"],
         "club_player_id": favorite_values["club_player_id"],
         "name": favorite_values["name"],
@@ -1013,6 +1094,12 @@ def save_enterprise_favorite_player(
         "league": favorite_values["league"],
         "roles_json": json.dumps(favorite_values["roles"], ensure_ascii=False),
     }
+    print(
+        "[enterprise_favorite_save] "
+        f"event=upsert favorite_id={favorite_id} club_player_id={favorite_values['club_player_id']!r} "
+        f"name={favorite_values['name']!r}",
+        flush=True,
+    )
 
     if existing:
         db.execute(
