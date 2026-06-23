@@ -196,3 +196,18 @@ class EnterpriseLineupOut(EnterpriseLineupIn):
     id: str
     createdAt: str
     updatedAt: str
+
+
+class EnterpriseProStrategyIn(BaseModel):
+    strategy: str = Field(default="", max_length=6000)
+
+
+class EnterpriseProStrategyOut(EnterpriseProStrategyIn):
+    updatedAt: Optional[str] = None
+
+
+class EnterpriseProChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    session_id: Optional[str] = "default"
+    strategy: Optional[str] = None
+    tutorial_mode: Optional[bool] = False

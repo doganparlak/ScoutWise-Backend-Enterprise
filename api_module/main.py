@@ -7,7 +7,7 @@ import uuid
 from typing import Any, Dict
 
 from dotenv import load_dotenv
-from fastapi import Body, BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query as FastAPIQuery, Response, status
+from fastapi import Body, BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query as FastAPIQuery, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -24,6 +24,9 @@ from api_module.models import (
     EnterpriseFavoritePlayerOut,
     EnterpriseLineupIn,
     EnterpriseLineupOut,
+    EnterpriseProChatIn,
+    EnterpriseProStrategyIn,
+    EnterpriseProStrategyOut,
     EnterpriseScoutingReportIn,
     EnterpriseScoutingReportOut,
     PasswordResetRequestIn,
@@ -59,6 +62,13 @@ from lineup_module.lineup import create_lineup, delete_lineup, list_lineups, upd
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 from report_module.report import generate_report_content
+from scoutwise_pro_module.pro import (
+    get_strategy,
+    reset_chat_session,
+    save_strategy,
+    send_chat,
+    user_session_token,
+)
 
 PASSWORD_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
@@ -117,6 +127,16 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def log_pro_chat_route(request: Request, call_next):
+    if request.url.path == "/pro/chat":
+        print("[enterprise_pro_chat] event=route_hit path=/pro/chat", flush=True)
+    response = await call_next(request)
+    if request.url.path == "/pro/chat":
+        print(f"[enterprise_pro_chat] event=route_done status={response.status_code}", flush=True)
+    return response
+
+
 @app.on_event("startup")
 def ensure_enterprise_sessions_table() -> None:
     db = SessionLocal()
@@ -159,6 +179,43 @@ def ensure_enterprise_sessions_table() -> None:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {"ok": True}
+
+
+@app.get("/pro/strategy", response_model=EnterpriseProStrategyOut)
+def pro_strategy_get(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return get_strategy(db, user_id)
+
+
+@app.put("/pro/strategy", response_model=EnterpriseProStrategyOut)
+def pro_strategy_put(
+    payload: EnterpriseProStrategyIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return save_strategy(db, user_id, payload)
+
+
+@app.post("/pro/chat")
+def pro_chat(
+    payload: EnterpriseProChatIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    return send_chat(db, user_id=user_id, payload=payload, accept_language=accept_language)
+
+
+@app.post("/pro/chat/reset")
+def pro_chat_reset(
+    session_id: str = FastAPIQuery("default"),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    token = user_session_token(user_id, session_id)
+    return reset_chat_session(db, token=token)
 
 
 @app.post("/auth/signup")

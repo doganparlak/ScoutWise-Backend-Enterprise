@@ -5,11 +5,12 @@ import hashlib
 import hmac
 import os
 import random
+import re
 import secrets
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Header, HTTPException
 from sqlalchemy import text
@@ -28,6 +29,36 @@ settings: Dict[str, Any] = {
         "sender_password": os.environ.get("SMTP_APP_PASSWORD", ""),
         "smtp_port": int(os.environ.get("SMTP_PORT", "587")),
     }
+}
+
+IMG_TAG = re.compile(r'<img[^>]+src="([^"]+)"[^>]*>', re.IGNORECASE)
+HTMLY_RE = re.compile(r'</?(table|thead|tbody|tr|td|th|ul|ol|li|div|p|h[1-6]|span)\b', re.IGNORECASE)
+
+ROLE_SHORT_TO_LONG = {
+    "GK": "Goal Keeper",
+    "LWB": "Left Wing Back",
+    "LB": "Left Back",
+    "LCB": "Left Center Back",
+    "CB": "Center Back",
+    "RCB": "Right Center Back",
+    "RB": "Right Back",
+    "RWB": "Right Wing Back",
+    "LM": "Left Midfield",
+    "LDM": "Left Defensive Midfield",
+    "LCM": "Left Center Midfield",
+    "LAM": "Left Attacking Midfield",
+    "CM": "Center Midfield",
+    "CAM": "Center Attacking Midfield",
+    "CDM": "Center Defensive Midfield",
+    "RCM": "Right Center Midfield",
+    "RM": "Right Midfield",
+    "RDM": "Right Defensive Midfield",
+    "RAM": "Right Attacking Midfield",
+    "CF": "Center Forward",
+    "RCF": "Right Center Forward",
+    "LCF": "Left Center Forward",
+    "LW": "Left Wing",
+    "RW": "Right Wing",
 }
 
 
@@ -54,6 +85,98 @@ def now_utc() -> dt.datetime:
 
 def now_iso() -> str:
     return now_utc().isoformat()
+
+
+def get_db() -> Session:
+    return SessionLocal()
+
+
+def append_chat_message(db: Session, session_token: str, role: str, content: str) -> None:
+    db.execute(
+        text(
+            """
+            INSERT INTO enterprise_pro_chat_messages (session_token, role, content, created_at)
+            VALUES (:token, :role, :content, NOW())
+            """
+        ),
+        {"token": session_token, "role": role, "content": content},
+    )
+    db.commit()
+
+
+def delete_chat_messages(db: Session, session_token: str) -> None:
+    db.execute(
+        text("DELETE FROM enterprise_pro_chat_messages WHERE session_token = :token"),
+        {"token": session_token},
+    )
+    db.commit()
+
+
+def load_chat_messages(db: Session, session_token: str) -> List[Dict[str, str]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT role, content
+            FROM enterprise_pro_chat_messages
+            WHERE session_token = :token
+            ORDER BY id ASC
+            """
+        ),
+        {"token": session_token},
+    ).mappings().all()
+    return [{"role": row["role"], "content": row["content"]} for row in rows]
+
+
+def session_exists_and_active(db: Session, session_id: str) -> bool:
+    row = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM enterprise_pro_chat_sessions
+            WHERE token = :token
+              AND ended_at IS NULL
+            """
+        ),
+        {"token": session_id},
+    ).first()
+    return row is not None
+
+
+def get_session_language(db: Session, token: str) -> Optional[str]:
+    row = db.execute(
+        text(
+            """
+            SELECT language
+            FROM enterprise_pro_chat_sessions
+            WHERE token = :token
+              AND ended_at IS NULL
+            """
+        ),
+        {"token": token},
+    ).mappings().first()
+    return row["language"] if row and row["language"] else None
+
+
+def split_response_parts(html: str):
+    parts = []
+    pos = 0
+    html = html or ""
+
+    for match in IMG_TAG.finditer(html):
+        start, end = match.start(), match.end()
+        if start > pos:
+            chunk = html[pos:start].strip()
+            if chunk:
+                parts.append({"type": "html" if HTMLY_RE.search(chunk) else "text", "html": chunk})
+        parts.append({"type": "image", "src": match.group(1)})
+        pos = end
+
+    if pos < len(html):
+        tail = html[pos:].strip()
+        if tail:
+            parts.append({"type": "html" if HTMLY_RE.search(tail) else "text", "html": tail})
+
+    return parts
 
 
 def hash_pw(password: str) -> str:
