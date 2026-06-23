@@ -24,6 +24,158 @@ _report_prompt = ChatPromptTemplate.from_messages(
 
 report_chain = _report_prompt | CHAT_LLM | StrOutputParser()
 
+ROLE_SHORT_TO_LONG: Dict[str, str] = {
+    "GK": "Goalkeeper",
+    "LB": "Left Back",
+    "CB": "Center Back",
+    "RB": "Right Back",
+    "LM": "Left Midfield",
+    "CDM": "Center Defensive Midfield",
+    "CM": "Center Midfield",
+    "CAM": "Center Attacking Midfield",
+    "RM": "Right Midfield",
+    "LW": "Left Wing",
+    "CF": "Center Forward",
+    "RW": "Right Wing",
+}
+
+ROLE_LONG_TO_SHORT: Dict[str, str] = {
+    **{long.lower(): short for short, long in ROLE_SHORT_TO_LONG.items()},
+    "g": "GK",
+    "goal keeper": "GK",
+    "left wing back": "LB",
+    "right wing back": "RB",
+    "left center back": "CB",
+    "right center back": "CB",
+    "centre back": "CB",
+    "left defensive midfield": "CDM",
+    "right defensive midfield": "CDM",
+    "defensive midfield": "CDM",
+    "left center midfield": "CM",
+    "right center midfield": "CM",
+    "central midfield": "CM",
+    "left attacking midfield": "CAM",
+    "right attacking midfield": "CAM",
+    "attacking midfield": "CAM",
+    "a": "CF",
+    "f": "CF",
+    "attacker": "CF",
+    "forward": "CF",
+    "centre forward": "CF",
+    "right center forward": "CF",
+    "left center forward": "CF",
+}
+
+ROLE_USAGE_CONSTRAINTS: Dict[str, Dict[str, Any]] = {
+    "GK": {
+        "allowed": "goalkeeper only",
+        "forbidden": "outfield roles such as defender, midfielder, winger, forward, striker",
+    },
+    "LB": {
+        "allowed": "left back / fullback only",
+        "forbidden": "center midfield, number 8, winger, striker, center forward, goalkeeper",
+    },
+    "RB": {
+        "allowed": "right back / fullback only",
+        "forbidden": "center midfield, number 8, winger, striker, center forward, goalkeeper",
+    },
+    "CB": {
+        "allowed": "center back only",
+        "forbidden": "fullback, center midfield, number 8, winger, striker, center forward, goalkeeper",
+    },
+    "LM": {
+        "allowed": "left midfield / wide midfielder only",
+        "forbidden": "center back, fullback, defensive midfielder, striker, goalkeeper",
+    },
+    "RM": {
+        "allowed": "right midfield / wide midfielder only",
+        "forbidden": "center back, fullback, defensive midfielder, striker, goalkeeper",
+    },
+    "CDM": {
+        "allowed": "defensive midfielder / holding midfielder only",
+        "forbidden": "center forward, striker, winger, fullback, center back, goalkeeper",
+    },
+    "CM": {
+        "allowed": "central midfielder / number 8 only",
+        "forbidden": "center forward, striker, winger, fullback, center back, goalkeeper",
+    },
+    "CAM": {
+        "allowed": "attacking midfielder / number 10 only",
+        "forbidden": "center forward, striker, fullback, center back, goalkeeper",
+    },
+    "LW": {
+        "allowed": "left winger / left wide forward only",
+        "forbidden": "center midfield, number 8, defensive midfielder, fullback, center back, goalkeeper",
+    },
+    "RW": {
+        "allowed": "right winger / right wide forward only",
+        "forbidden": "center midfield, number 8, defensive midfielder, fullback, center back, goalkeeper",
+    },
+    "CF": {
+        "allowed": "striker / center forward only",
+        "forbidden": "center midfield, number 8, attacking midfielder, defensive midfielder, winger, fullback, center back, goalkeeper",
+    },
+}
+
+
+def _role_short(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    upper = raw.upper()
+    if upper in ROLE_SHORT_TO_LONG:
+        return upper
+    return ROLE_LONG_TO_SHORT.get(raw.lower())
+
+
+def _role_constraint_block(player_card: Dict[str, Any]) -> str:
+    raw_roles: List[Any] = []
+    roles = player_card.get("roles")
+    if isinstance(roles, list):
+        raw_roles.extend(roles)
+    elif roles:
+        raw_roles.append(roles)
+    raw_roles.extend(
+        value for value in (
+            player_card.get("position_name"),
+            player_card.get("position"),
+            player_card.get("role"),
+        )
+        if value
+    )
+
+    mapped = []
+    for role in raw_roles:
+        short = _role_short(role)
+        if short and short not in mapped:
+            mapped.append(short)
+
+    if not mapped:
+        return (
+            "ROLE_CONSTRAINTS:\n"
+            "- No reliable role was provided. Do not invent a new position; keep role recommendations generic and avoid naming a different position.\n"
+        )
+
+    primary = mapped[0]
+    constraint = ROLE_USAGE_CONSTRAINTS.get(primary, {})
+    allowed = constraint.get("allowed", ROLE_SHORT_TO_LONG.get(primary, primary))
+    forbidden = constraint.get("forbidden", "any unrelated role family")
+    mapped_labels = ", ".join(f"{short} ({ROLE_SHORT_TO_LONG.get(short, short)})" for short in mapped)
+
+    return "\n".join(
+        [
+            "ROLE_CONSTRAINTS:",
+            f"- Source roles mapped from the player data: {mapped_labels}.",
+            f"- Primary role for Role & Usage recommendations: {primary} ({ROLE_SHORT_TO_LONG.get(primary, primary)}).",
+            f"- Allowed recommendation space: {allowed}.",
+            f"- Forbidden recommendation space: {forbidden}.",
+            "- In CONCLUSION / Role & Usage, every role, system, in-possession, and out-of-possession recommendation MUST stay inside the allowed recommendation space.",
+            "- If metrics suggest a different role family, ignore that temptation and explain how those metrics help the mapped primary role instead.",
+        ]
+    )
+
 
 def fetch_docs_for_favorite(
     db,
@@ -172,6 +324,7 @@ def build_player_card_from_docs(metric_docs: List[Dict[str, Any]]) -> Dict[str, 
 
 def _build_llm_input(player_card: Dict[str, Any], metric_docs: List[Dict[str, Any]]) -> str:
     parts: List[str] = ["PLAYER_CARD_JSON:", str(player_card or {}), "\nMETRIC_DOCUMENTS (newest first):"]
+    parts.insert(0, _role_constraint_block(player_card))
 
     if not metric_docs:
         parts.append("[]")
@@ -202,6 +355,11 @@ def generate_report_content(
     for key, value in identity.items():
         if key not in player_card and value is not None:
             player_card[key] = value
+    if identity.get("roles"):
+        player_card["roles"] = identity["roles"]
+    for role_key in ("position_name", "position", "role"):
+        if identity.get(role_key):
+            player_card[role_key] = identity[role_key]
     for score_key in ("potential", "form"):
         if score_key not in player_card and identity.get(score_key) is not None:
             player_card[score_key] = identity[score_key]

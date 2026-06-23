@@ -22,6 +22,8 @@ from api_module.models import (
     MatchupComparisonOut,
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
+    EnterpriseLineupIn,
+    EnterpriseLineupOut,
     EnterpriseScoutingReportIn,
     EnterpriseScoutingReportOut,
     PasswordResetRequestIn,
@@ -53,6 +55,7 @@ from api_module.utilities import (
 from player_pool_module.player_pool import get_player_pool_filter_options, search_players
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison
+from lineup_module.lineup import create_lineup, delete_lineup, list_lineups, update_lineup
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 from report_module.report import generate_report_content
@@ -849,6 +852,42 @@ def player_pool_options(
     return get_player_pool_filter_options(db, worldCupMode)
 
 
+@app.get("/lineups", response_model=list[EnterpriseLineupOut])
+def list_enterprise_lineups(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return list_lineups(db, user_id)
+
+
+@app.post("/lineups", response_model=EnterpriseLineupOut)
+def create_enterprise_lineup(
+    payload: EnterpriseLineupIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return create_lineup(db, user_id, payload)
+
+
+@app.patch("/lineups/{lineup_id}", response_model=EnterpriseLineupOut)
+def update_enterprise_lineup(
+    lineup_id: str,
+    payload: EnterpriseLineupIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return update_lineup(db, user_id, lineup_id, payload)
+
+
+@app.delete("/lineups/{lineup_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_enterprise_lineup(
+    lineup_id: str,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return delete_lineup(db, user_id, lineup_id)
+
+
 @app.get("/favorite-players", response_model=list[EnterpriseFavoritePlayerOut])
 def list_enterprise_favorite_players(
     user_id: str = Depends(require_auth),
@@ -982,7 +1021,7 @@ def get_or_create_enterprise_scouting_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 2
+    version = 6
 
     favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
     player_payload = _enterprise_favorite_identity(favorite_row)

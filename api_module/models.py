@@ -158,3 +158,41 @@ class EnterpriseScoutingReportOut(BaseModel):
     content_json: Optional[Dict[str, Any]] = None
     language: str
     version: int
+
+
+class EnterpriseLineupSlotPlayer(BaseModel):
+    id: str
+    favoriteId: Optional[str] = None
+    name: str
+    age: Optional[int] = None
+    nationality: Optional[str] = None
+    league: Optional[str] = None
+    team: Optional[str] = None
+    role: Optional[str] = None
+    gender: Optional[str] = None
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    potential: Optional[int] = Field(default=None, ge=0, le=100)
+    form: Optional[int] = Field(default=None, ge=0, le=100)
+    traits: List[str] = Field(default_factory=list)
+
+
+class EnterpriseLineupSlot(BaseModel):
+    slotId: str
+    slotLabel: str
+    row: int
+    orderIndex: int
+    player: Optional[EnterpriseLineupSlotPlayer] = None
+
+
+class EnterpriseLineupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    formation: str = Field(min_length=1, max_length=40)
+    teamRating: float = Field(default=0, ge=0, le=100)
+    slots: List[EnterpriseLineupSlot] = Field(default_factory=list)
+
+
+class EnterpriseLineupOut(EnterpriseLineupIn):
+    id: str
+    createdAt: str
+    updatedAt: str
