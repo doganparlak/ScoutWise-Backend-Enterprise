@@ -64,6 +64,7 @@ from chatbot_module.tools_agentic import (
     constraint_relaxation_label,
     infer_league_from_text,
     infer_nationality_from_text,
+    infer_excluded_constraints_from_text,
     infer_position_from_text,
     infer_preferred_stats_from_text,
     _quality_debug,
@@ -450,6 +451,14 @@ def _merge_turn_constraints(previous: Dict[str, Any], current: Dict[str, Any], q
         value = current.get(key)
         if value is not None:
             merged[key] = value
+
+    for key in ["excluded_nationalities", "excluded_positions", "excluded_leagues", "excluded_teams"]:
+        values: List[str] = []
+        for value in [*(previous.get(key) or []), *(current.get(key) or [])]:
+            text = str(value or "").strip()
+            if text and text not in values:
+                values.append(text)
+        merged[key] = values[:5]
 
     removed_stats = set(_infer_removed_stats(text))
     preferred_stats: List[str] = []
@@ -981,11 +990,19 @@ def answer_question(
         history_rows=history_rows,
         trace=trace,
     )
-    previous_constraints = _last_agentic_constraints(history_rows)
-    carried_constraints = collect_recent_human_constraints(
-        history_rows,
-        is_generic_alternative_fn=is_generic_alternative_request,
-        limit=3,
+    planner_intent = planner_data.get("intent")
+    continuation_request = planner_intent == "alternative_recommendation" or is_generic_alternative_request(
+        planner_data.get("effective_query") or translated_raw,
+    )
+    previous_constraints = _last_agentic_constraints(history_rows) if continuation_request else {}
+    carried_constraints = (
+        collect_recent_human_constraints(
+            history_rows,
+            is_generic_alternative_fn=is_generic_alternative_request,
+            limit=3,
+        )
+        if continuation_request
+        else []
     )
     constraints = _constraint_decision(
         original_question=original_question,
@@ -994,13 +1011,27 @@ def answer_question(
         recent_constraints=carried_constraints,
         trace=trace,
     )
+    inferred_exclusions = infer_excluded_constraints_from_text(
+        original_question,
+        translated_raw,
+        planner_data.get("effective_query") or "",
+    )
+    for key, values in inferred_exclusions.items():
+        if values:
+            constraints[key] = [*(constraints.get(key) or []), *values]
+    constraints = clean_constraints(constraints)
+
     inferred_nationality = infer_nationality_from_text(
         original_question,
         translated_raw,
         planner_data.get("effective_query") or "",
         strategy or "",
     )
-    if inferred_nationality and not constraints.get("nationality"):
+    if (
+        inferred_nationality
+        and not constraints.get("nationality")
+        and inferred_nationality not in (constraints.get("excluded_nationalities") or [])
+    ):
         constraints["nationality"] = inferred_nationality
     inferred_position = infer_position_from_text(
         original_question,
@@ -1008,7 +1039,11 @@ def answer_question(
         planner_data.get("effective_query") or "",
         strategy or "",
     )
-    if inferred_position and not constraints.get("position"):
+    if (
+        inferred_position
+        and not constraints.get("position")
+        and inferred_position not in (constraints.get("excluded_positions") or [])
+    ):
         constraints["position"] = inferred_position
     inferred_league = infer_league_from_text(
         original_question,
@@ -1016,7 +1051,7 @@ def answer_question(
         planner_data.get("effective_query") or "",
         strategy or "",
     )
-    if inferred_league and not constraints.get("league"):
+    if inferred_league and not constraints.get("league") and inferred_league not in (constraints.get("excluded_leagues") or []):
         constraints["league"] = inferred_league
     inferred_stats = infer_preferred_stats_from_text(
         original_question,

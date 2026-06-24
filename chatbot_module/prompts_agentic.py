@@ -248,8 +248,12 @@ Return strict JSON only:
   "age_min": null,
   "age_max": null,
   "nationality": null,
+  "excluded_nationalities": [],
   "league": null,
+  "excluded_leagues": [],
   "team": null,
+  "excluded_teams": [],
+  "excluded_positions": [],
   "height_min": null,
   "height_max": null,
   "weight_min": null,
@@ -263,6 +267,8 @@ Return strict JSON only:
 
 Rules:
 - Use null for absent constraints.
+- If the user says they do NOT want a nationality, role/position, league, or team, do not put that value in the positive field. Put it in the matching excluded_* list instead.
+- Examples: "non-English" -> excluded_nationalities ["England"]; "kaleci olmayan" / "not a goalkeeper" -> excluded_positions ["Goalkeeper"].
 - Treat recent carried constraints as the current working filter set. If the user adds a new criterion, keep the existing compatible constraints and add the new one.
 - If the user says "another", "different", "next", or similar without changing filters, keep the carried constraints.
 - If the user says "remove", "without", "no longer", "not anymore", "any <constraint>", or "instead of/rather than <constraint>", remove that constraint from the carried set.
