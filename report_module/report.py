@@ -117,6 +117,31 @@ ROLE_USAGE_CONSTRAINTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+NEGATIVE_METRIC_RANGES: Dict[str, Tuple[float, float]] = {
+    "Goals Conceded": (0, 2),
+    "Penalties Committed": (0, 0.15),
+    "Penalties Missed": (0, 0.15),
+    "Shots Off Target": (0, 2.5),
+    "Big Chances Missed": (0, 1),
+    "Aerials Lost": (0, 4),
+    "Duels Lost": (0, 6),
+    "Fouls": (0, 2),
+    "Dispossessed": (0, 5),
+    "Dribbled Past": (0, 2),
+    "Turn Over": (0, 3),
+    "Possession Lost": (0, 20),
+    "Offsides": (0, 0.3),
+    "Own Goals": (0, 0.2),
+    "Error Lead To Goal": (0, 0.25),
+    "Error Lead To Shot": (0, 0.4),
+    "Yellow Cards": (0, 0.4),
+    "Yellow & Red Cards": (0, 1),
+    "Red Cards": (0, 0.2),
+}
+
+CONCERN_RISK_THRESHOLD = 0.33
+WATCH_RISK_THRESHOLD = 0.66
+
 
 def _role_short(value: Any) -> Optional[str]:
     if value is None:
@@ -175,6 +200,99 @@ def _role_constraint_block(player_card: Dict[str, Any]) -> str:
             "- If metrics suggest a different role family, ignore that temptation and explain how those metrics help the mapped primary role instead.",
         ]
     )
+
+
+def _metric_key(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+NEGATIVE_METRIC_BY_KEY = {_metric_key(metric): metric for metric in NEGATIVE_METRIC_RANGES}
+
+
+def _num(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if number == number else None
+    raw = str(value).strip().replace("%", "").replace(",", ".")
+    if not raw:
+        return None
+    try:
+        number = float(raw)
+    except ValueError:
+        return None
+    return number if number == number else None
+
+
+def _iter_negative_metric_values(metadata: Dict[str, Any]) -> List[Tuple[str, float]]:
+    values: Dict[str, float] = {}
+    meta = metadata or {}
+
+    for raw_metric, raw_value in meta.items():
+        metric = NEGATIVE_METRIC_BY_KEY.get(_metric_key(raw_metric))
+        if not metric:
+            continue
+        value = _num(raw_value)
+        if value is not None:
+            values[metric] = value
+
+    for container_key in ("stats", "statistics", "metrics"):
+        raw_stats = meta.get(container_key)
+        if not isinstance(raw_stats, list):
+            continue
+        for stat in raw_stats:
+            if not isinstance(stat, dict):
+                continue
+            metric = NEGATIVE_METRIC_BY_KEY.get(
+                _metric_key(stat.get("metric") or stat.get("stat") or stat.get("label") or stat.get("name"))
+            )
+            if not metric:
+                continue
+            value = _num(stat.get("value") or stat.get("amount") or stat.get("score"))
+            if value is not None:
+                values[metric] = value
+
+    return sorted(values.items())
+
+
+def _build_metric_significance_block(metric_docs: List[Dict[str, Any]]) -> str:
+    strongest_values: Dict[str, float] = {}
+    for doc in metric_docs or []:
+        for metric, value in _iter_negative_metric_values(doc.get("metadata") or {}):
+            previous = strongest_values.get(metric)
+            if previous is None or value > previous:
+                strongest_values[metric] = value
+
+    if not strongest_values:
+        return "\nMETRIC_SIGNIFICANCE_GUIDE:\nNo normalized risk metrics available."
+
+    concern_lines: List[str] = []
+    low_risk_lines: List[str] = []
+
+    for metric, value in sorted(strongest_values.items()):
+        min_value, max_value = NEGATIVE_METRIC_RANGES[metric]
+        if max_value <= min_value:
+            continue
+        risk = max(0.0, min(1.0, (value - min_value) / (max_value - min_value)))
+        line = f"- {metric}: value={value:g}, risk={risk:.2f}"
+        if risk >= CONCERN_RISK_THRESHOLD:
+            severity = "problem" if risk >= WATCH_RISK_THRESHOLD else "watch"
+            concern_lines.append(f"{line}, concern_level={severity}")
+        else:
+            low_risk_lines.append(f"{line}, concern_level=low")
+
+    lines = [
+        "\nMETRIC_SIGNIFICANCE_GUIDE:",
+        "For negative/risk metrics, risk is normalized as (value - min) / (max - min).",
+        "Only use CONCERN_CANDIDATES as direct weaknesses. Do not cite LOW_RISK_NEGATIVES as weaknesses.",
+        "If a low-risk negative metric is mentioned in PLAYER STATS, keep it factual or positive-neutral; do not frame it as a concern.",
+        "CONCERN_CANDIDATES:",
+    ]
+    lines.extend(concern_lines or ["- None"])
+    lines.append("LOW_RISK_NEGATIVES:")
+    lines.extend(low_risk_lines or ["- None"])
+    return "\n".join(lines)
 
 
 def fetch_docs_for_favorite(
@@ -325,6 +443,7 @@ def build_player_card_from_docs(metric_docs: List[Dict[str, Any]]) -> Dict[str, 
 def _build_llm_input(player_card: Dict[str, Any], metric_docs: List[Dict[str, Any]]) -> str:
     parts: List[str] = ["PLAYER_CARD_JSON:", str(player_card or {}), "\nMETRIC_DOCUMENTS (newest first):"]
     parts.insert(0, _role_constraint_block(player_card))
+    parts.insert(1, _build_metric_significance_block(metric_docs))
 
     if not metric_docs:
         parts.append("[]")

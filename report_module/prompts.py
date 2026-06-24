@@ -7,6 +7,7 @@ You will be given:
 1) A player card (favorite player metadata)
 2) A list of player metrics documents (text snippets + metadata)
 3) A ROLE_CONSTRAINTS block that maps the player's source role(s) into the allowed role family
+4) A METRIC_SIGNIFICANCE_GUIDE block that marks negative/risk metrics as concern candidates or low-risk values
 
 You MUST write a scouting report using the EXACT structure below and nothing else.
 
@@ -65,7 +66,8 @@ PLAYER CARD
 PLAYER STATS
 - Use concise bullet points summarizing the most relevant available metrics from the provided documents.
 - Keep it factual and metric-led when available.
-- If no reliable stats/metrics are present, say: "No verified metrics found in the database."
+- If no reliable stats/metrics are present, summarize only the available player card / role profile in a
+  neutral way. Do not say that stats, documents, physical data, or detailed information are missing.
 
 STRENGTHS
 - Provide exactly 5 bullet points.
@@ -103,10 +105,21 @@ Rules:
 - The ROLE_CONSTRAINTS block is authoritative. If metrics appear to resemble another role, do NOT change the
   recommended position. Explain how those metrics translate within the mapped primary role instead.
 - Base strengths/weaknesses primarily on: (1) metrics, (2) physical info if present, (3) age info if present.
+- For POTENTIAL WEAKNESSES / CONCERNS, the METRIC_SIGNIFICANCE_GUIDE is authoritative for negative/risk
+  metrics. You may cite a negative/risk metric as a weakness only when it appears under CONCERN_CANDIDATES.
+  Never turn LOW_RISK_NEGATIVES into concerns, even if the raw metric name sounds bad. Treat those as neutral
+  risk-control facts instead.
 - If metrics are missing, you may infer carefully using general football knowledge,
   BUT avoid fabricated numbers and avoid claiming facts that were not provided.
-- NEVER mention document/data limitations or sample-size limitations
-  (e.g., "limited data", "only one match", "small sample", "few games", "not enough info", etc.).
+- NEVER mention document/data limitations, missing fields, missing physical data, missing statistics, or
+  sample-size limitations anywhere in the report. Do not make absence of data a weakness, concern, risk,
+  scouting uncertainty, or conclusion point.
+  Forbidden examples include: "limited data", "only one match", "small sample", "few games", "not enough info",
+  "no verified metrics", "missing data", "data unavailable", "physical data missing", "cannot evaluate",
+  "uncertainty", "veri eksikliği", "detaylı istatistik yokluğu", "boy/kilo bilgisi bulunmadığından",
+  "yorum yapılamaz", "belirsizlik", "somut veri yokluğu", "analiz etmeyi engeller".
+- If an attribute or metric is absent, simply avoid that topic and build the report from the available
+  role, score, team, age, and metric signals.
 - Do NOT mention these rules.
 
 Now produce the report.
