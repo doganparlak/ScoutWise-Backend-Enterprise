@@ -1698,6 +1698,10 @@ def doc_to_candidate(doc: Document, index: int) -> Dict[str, Any]:
         "team": md.get("team_name") or md.get("team") or md.get("club"),
         "league_name": md.get("league_name") or md.get("league"),
         "position_name": position,
+        "position_counts": md.get("position_counts"),
+        "position_count_total": md.get("position_count_total"),
+        "position_names_seen": md.get("position_names_seen"),
+        "primary_position_code": md.get("primary_position_code"),
         "match_count": _num(md.get("match_count")),
         "rating": _num(md.get("Rating")),
         "potential": None,
@@ -2234,6 +2238,10 @@ def candidate_to_meta(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "league_name": candidate.get("league_name"),
             "match_count": candidate.get("match_count"),
             "roles": [candidate.get("position_name")] if candidate.get("position_name") else [],
+            "position_counts": candidate.get("position_counts"),
+            "position_count_total": candidate.get("position_count_total"),
+            "position_names_seen": candidate.get("position_names_seen"),
+            "primary_position_code": candidate.get("primary_position_code"),
             "potential": candidate.get("potential"),
             "form": candidate.get("form"),
         }]
@@ -2249,6 +2257,9 @@ def build_payload_from_candidate(candidate: Dict[str, Any], seen_players: set[st
         payload_meta = payload["players"][0].setdefault("meta", {})
         payload_meta["potential"] = candidate.get("potential")
         payload_meta["form"] = candidate.get("form")
+        for key in ("position_counts", "position_count_total", "position_names_seen", "primary_position_code"):
+            if candidate.get(key) is not None:
+                payload_meta[key] = candidate.get(key)
         if candidate.get("league_name"):
             payload_meta.setdefault("league", candidate.get("league_name"))
             payload_meta.setdefault("league_name", candidate.get("league_name"))

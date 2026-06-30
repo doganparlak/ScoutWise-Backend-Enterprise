@@ -20,6 +20,54 @@ def _metadata_value(metadata: Dict[str, Any], key: str) -> str:
     return str(value).strip()
 
 
+def _normalize_position_counts(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+
+    counts: Dict[str, int] = {}
+    for key, count in value.items():
+        if key is None:
+            continue
+        code = str(key).strip()
+        if not code:
+            continue
+        try:
+            numeric_count = int(count)
+        except (TypeError, ValueError):
+            continue
+        if numeric_count > 0:
+            counts[code] = numeric_count
+
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _with_position_distribution(row: Dict[str, Any]) -> Dict[str, Any]:
+    content = dict(row.get("content") or {})
+    position_counts = _normalize_position_counts(content.get("position_counts"))
+
+    raw_seen = content.get("position_names_seen")
+    if isinstance(raw_seen, list):
+        position_names_seen = []
+        for value in raw_seen:
+            code = str(value or "").strip()
+            if code and code not in position_names_seen:
+                position_names_seen.append(code)
+    else:
+        position_names_seen = []
+
+    if not position_names_seen:
+        position_names_seen = list(position_counts.keys())
+
+    content["position_counts"] = position_counts
+    content["position_count_total"] = sum(position_counts.values())
+    content["position_names_seen"] = position_names_seen
+    content["primary_position_code"] = (
+        str(content.get("primary_position_code") or "").strip()
+        or (position_names_seen[0] if position_names_seen else None)
+    )
+    return {**row, "content": content}
+
+
 def _cached_score(metadata: Dict[str, Any], key: str) -> int | None:
     value = metadata.get(key)
     if value is None:
@@ -229,7 +277,11 @@ def get_weekly_popular_players(
             {"limit": int(limit or DEFAULT_LIMIT)},
         ).mappings().all()
         return [
-            _ensure_weekly_scores(db, {"id": row["id"], "content": row["content"] or {}}, True)
+            _ensure_weekly_scores(
+                db,
+                _with_position_distribution({"id": row["id"], "content": row["content"] or {}}),
+                True,
+            )
             for row in rows
         ]
 
@@ -248,6 +300,10 @@ def get_weekly_popular_players(
         {"limit": int(limit or DEFAULT_LIMIT)},
     ).mappings().all()
     return [
-        _ensure_weekly_scores(db, {"id": row["id"], "content": row["content"] or {}}, False)
+        _ensure_weekly_scores(
+            db,
+            _with_position_distribution({"id": row["id"], "content": row["content"] or {}}),
+            False,
+        )
         for row in rows
     ]

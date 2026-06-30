@@ -48,6 +48,57 @@ ROLE_SEARCH_SHORT_ALIASES = {
 }
 
 
+def role_value_short_sql(value_expr: str) -> str:
+    position = f"LOWER(TRIM(COALESCE({value_expr}, '')))"
+    return f"""
+    CASE
+        WHEN {position} IN ('g', 'gk', 'goalkeeper', 'goal keeper') THEN 'GK'
+        WHEN {position} = 'lwb' THEN 'LWB'
+        WHEN {position} = 'left wing back' THEN 'LWB'
+        WHEN {position} = 'lb' THEN 'LB'
+        WHEN {position} = 'left back' THEN 'LB'
+        WHEN {position} = 'lcb' THEN 'LCB'
+        WHEN {position} = 'left center back' THEN 'LCB'
+        WHEN {position} IN ('cb', 'center back', 'centre back') THEN 'CB'
+        WHEN {position} = 'rcb' THEN 'RCB'
+        WHEN {position} = 'right center back' THEN 'RCB'
+        WHEN {position} = 'rb' THEN 'RB'
+        WHEN {position} = 'right back' THEN 'RB'
+        WHEN {position} = 'rwb' THEN 'RWB'
+        WHEN {position} = 'right wing back' THEN 'RWB'
+        WHEN {position} = 'lm' THEN 'LM'
+        WHEN {position} = 'left midfield' THEN 'LM'
+        WHEN {position} = 'ldm' THEN 'LDM'
+        WHEN {position} = 'left defensive midfield' THEN 'LDM'
+        WHEN {position} = 'lcm' THEN 'LCM'
+        WHEN {position} = 'left center midfield' THEN 'LCM'
+        WHEN {position} = 'lam' THEN 'LAM'
+        WHEN {position} = 'left attacking midfield' THEN 'LAM'
+        WHEN {position} IN ('cm', 'center midfield', 'central midfield') THEN 'CM'
+        WHEN {position} IN ('cam', 'center attacking midfield', 'attacking midfield') THEN 'CAM'
+        WHEN {position} IN ('cdm', 'center defensive midfield', 'defensive midfield') THEN 'CDM'
+        WHEN {position} = 'rdm' THEN 'RDM'
+        WHEN {position} = 'right defensive midfield' THEN 'RDM'
+        WHEN {position} = 'rcm' THEN 'RCM'
+        WHEN {position} = 'right center midfield' THEN 'RCM'
+        WHEN {position} = 'ram' THEN 'RAM'
+        WHEN {position} = 'right attacking midfield' THEN 'RAM'
+        WHEN {position} = 'rm' THEN 'RM'
+        WHEN {position} = 'right midfield' THEN 'RM'
+        WHEN {position} IN ('a', 'f', 'cf', 'center forward', 'centre forward', 'attacker', 'forward') THEN 'CF'
+        WHEN {position} = 'rcf' THEN 'RCF'
+        WHEN {position} = 'right center forward' THEN 'RCF'
+        WHEN {position} = 'lcf' THEN 'LCF'
+        WHEN {position} = 'left center forward' THEN 'LCF'
+        WHEN {position} = 'lw' THEN 'LW'
+        WHEN {position} = 'left wing' THEN 'LW'
+        WHEN {position} = 'rw' THEN 'RW'
+        WHEN {position} = 'right wing' THEN 'RW'
+        ELSE UPPER(TRIM(COALESCE({value_expr}, '')))
+    END
+    """
+
+
 def role_short_sql() -> str:
     position = "LOWER(COALESCE(metadata->>'position_name', ''))"
     return f"""
@@ -131,6 +182,34 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
           AND (
                 :position_filter IS NULL
                 OR (:position_short IS NOT NULL AND {role_short_sql()} = :position_short)
+                OR (
+                    :position_short IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(
+                            CASE
+                                WHEN jsonb_typeof(metadata->'position_names_seen') = 'array'
+                                THEN metadata->'position_names_seen'
+                                ELSE '[]'::jsonb
+                            END
+                        ) AS seen_position(value)
+                        WHERE {role_value_short_sql("seen_position.value")} = :position_short
+                    )
+                )
+                OR (
+                    :position_short IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM jsonb_object_keys(
+                            CASE
+                                WHEN jsonb_typeof(metadata->'position_counts') = 'object'
+                                THEN metadata->'position_counts'
+                                ELSE '{{}}'::jsonb
+                            END
+                        ) AS counted_position(value)
+                        WHERE {role_value_short_sql("counted_position.value")} = :position_short
+                    )
+                )
                 OR metadata->>'position_name' ILIKE :position_q
                 OR {folded_text_sql("position_name")} LIKE :position_folded_q
               )
@@ -141,6 +220,26 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
           AND {numeric_filter_sql("weight", "min_weight", ">=")}
           AND {numeric_filter_sql("weight", "max_weight", "<=")}
         ORDER BY
+            CASE
+                WHEN :position_short IS NOT NULL THEN COALESCE((
+                    SELECT MAX(
+                        CASE
+                            WHEN counted_position.count_value ~ '^-?[0-9]+([.][0-9]+)?$'
+                            THEN counted_position.count_value::numeric
+                            ELSE 0
+                        END
+                    )
+                    FROM jsonb_each_text(
+                        CASE
+                            WHEN jsonb_typeof(metadata->'position_counts') = 'object'
+                            THEN metadata->'position_counts'
+                            ELSE '{{}}'::jsonb
+                        END
+                    ) AS counted_position(role_value, count_value)
+                    WHERE {role_value_short_sql("counted_position.role_value")} = :position_short
+                ), 0)
+                ELSE 0
+            END DESC,
             COALESCE(metadata->>'player_name', ''),
             COALESCE(metadata->>'team_name', ''),
             id DESC
@@ -191,9 +290,30 @@ def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) ->
         """)).scalars().all()
         return [value for value in rows if value]
 
+    position_rows = db.execute(text(f"""
+        SELECT DISTINCT value
+        FROM (
+            SELECT metadata->>'position_name' AS value
+            FROM {table_name}
+            WHERE COALESCE(metadata->>'position_name', '') <> ''
+            UNION
+            SELECT seen_position.value AS value
+            FROM {table_name}
+            CROSS JOIN LATERAL jsonb_array_elements_text(
+                CASE
+                    WHEN jsonb_typeof(metadata->'position_names_seen') = 'array'
+                    THEN metadata->'position_names_seen'
+                    ELSE '[]'::jsonb
+                END
+            ) AS seen_position(value)
+            WHERE COALESCE(seen_position.value, '') <> ''
+        ) positions
+        ORDER BY value
+    """)).scalars().all()
+
     return {
         "teams": distinct_metadata_values("team_name"),
         "leagues": distinct_metadata_values("league_name"),
         "nationalities": distinct_metadata_values("nationality_name"),
-        "positions": distinct_metadata_values("position_name"),
+        "positions": [value for value in position_rows if value],
     }

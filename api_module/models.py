@@ -147,6 +147,10 @@ class EnterpriseFavoritePlayerOut(BaseModel):
     team: Optional[str] = None
     league: Optional[str] = None
     roles: List[str] = Field(default_factory=list)
+    positionCounts: Dict[str, int] = Field(default_factory=dict)
+    positionCountTotal: int = 0
+    positionNamesSeen: List[str] = Field(default_factory=list)
+    primaryPositionCode: Optional[str] = None
 
 
 class EnterpriseScoutingReportIn(BaseModel):

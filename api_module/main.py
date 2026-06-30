@@ -582,13 +582,27 @@ def _metadata_int(metadata: Dict[str, Any], *keys: str) -> int | None:
 
 
 def _metadata_roles(metadata: Dict[str, Any]) -> list[str]:
-    raw_roles = metadata.get("roles") or metadata.get("positions")
-    if isinstance(raw_roles, list):
-        roles = [str(role).strip() for role in raw_roles if str(role).strip()]
-        if roles:
-            return roles
-    position = _metadata_text(metadata, "position_name", "position", "role")
-    return [position] if position else []
+    roles: list[str] = []
+
+    def add_role(value: Any) -> None:
+        role = str(value or "").strip()
+        if role and role not in roles:
+            roles.append(role)
+
+    for key in ("roles", "positions", "position_names_seen"):
+        raw_roles = metadata.get(key)
+        if isinstance(raw_roles, list):
+            for role in raw_roles:
+                add_role(role)
+
+    position_counts = metadata.get("position_counts")
+    if isinstance(position_counts, dict):
+        for role in position_counts.keys():
+            add_role(role)
+
+    add_role(metadata.get("primary_position_code"))
+    add_role(_metadata_text(metadata, "position_name", "position", "role"))
+    return roles
 
 
 def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
@@ -599,6 +613,34 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
             roles_raw = json.loads(roles_raw)
         except json.JSONDecodeError:
             roles_raw = []
+
+    position_counts_raw = data.get("position_counts") or {}
+    if isinstance(position_counts_raw, str):
+        try:
+            position_counts_raw = json.loads(position_counts_raw)
+        except json.JSONDecodeError:
+            position_counts_raw = {}
+    position_counts = {
+        str(role): int(count)
+        for role, count in (position_counts_raw.items() if isinstance(position_counts_raw, dict) else [])
+        if str(role).strip() and isinstance(count, (int, float)) and int(count) > 0
+    }
+    position_counts = dict(sorted(position_counts.items(), key=lambda item: (-item[1], item[0])))
+
+    position_names_raw = data.get("position_names_seen") or []
+    if isinstance(position_names_raw, str):
+        try:
+            position_names_raw = json.loads(position_names_raw)
+        except json.JSONDecodeError:
+            position_names_raw = []
+    position_names_seen = [str(role).strip() for role in position_names_raw if str(role).strip()] if isinstance(position_names_raw, list) else []
+    if not position_names_seen:
+        position_names_seen = list(position_counts.keys())
+
+    position_count_total = data.get("position_count_total")
+    if position_count_total is None:
+        position_count_total = sum(position_counts.values())
+
     return EnterpriseFavoritePlayerOut(
         id=str(data["id"]),
         clubPlayerId=data.get("club_player_id"),
@@ -613,6 +655,10 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
         team=data.get("team"),
         league=data.get("league"),
         roles=[str(role) for role in roles_raw if str(role).strip()],
+        positionCounts=position_counts,
+        positionCountTotal=int(position_count_total or 0),
+        positionNamesSeen=position_names_seen,
+        primaryPositionCode=data.get("primary_position_code") or (position_names_seen[0] if position_names_seen else None),
     )
 
 
@@ -624,6 +670,22 @@ def _enterprise_favorite_identity(row: Any) -> Dict[str, Any]:
             roles_raw = json.loads(roles_raw)
         except json.JSONDecodeError:
             roles_raw = []
+    position_counts_raw = data.get("position_counts") or {}
+    if isinstance(position_counts_raw, str):
+        try:
+            position_counts_raw = json.loads(position_counts_raw)
+        except json.JSONDecodeError:
+            position_counts_raw = {}
+    position_counts = position_counts_raw if isinstance(position_counts_raw, dict) else {}
+
+    position_names_raw = data.get("position_names_seen") or []
+    if isinstance(position_names_raw, str):
+        try:
+            position_names_raw = json.loads(position_names_raw)
+        except json.JSONDecodeError:
+            position_names_raw = []
+    position_names_seen = position_names_raw if isinstance(position_names_raw, list) else []
+
     return {
         "favorite_id": str(data["id"]),
         "club_player_id": data.get("club_player_id"),
@@ -638,6 +700,10 @@ def _enterprise_favorite_identity(row: Any) -> Dict[str, Any]:
         "team": data.get("team"),
         "league": data.get("league"),
         "roles": [str(role) for role in roles_raw if str(role).strip()] if isinstance(roles_raw, list) else [],
+        "position_counts": position_counts,
+        "position_count_total": int(data.get("position_count_total") or sum(int(v) for v in position_counts.values() if isinstance(v, (int, float)))),
+        "position_names_seen": [str(role) for role in position_names_seen if str(role).strip()],
+        "primary_position_code": data.get("primary_position_code"),
     }
 
 
@@ -645,11 +711,16 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
     row = db.execute(
         text(
             """
-            SELECT id, club_player_id, name, nationality, age, potential, form,
-                   gender, height, weight, team, league, roles_json
-            FROM enterprise_favorite_players
-            WHERE id = :favorite_id
-              AND user_id = :user_id
+            SELECT efp.id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
+                   efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json,
+                   pd.metadata->'position_counts' AS position_counts,
+                   pd.metadata->>'position_count_total' AS position_count_total,
+                   pd.metadata->'position_names_seen' AS position_names_seen,
+                   pd.metadata->>'primary_position_code' AS primary_position_code
+            FROM enterprise_favorite_players efp
+            LEFT JOIN player_data pd ON pd.id = efp.club_player_id
+            WHERE efp.id = :favorite_id
+              AND efp.user_id = :user_id
             LIMIT 1
             """
         ),
@@ -1013,11 +1084,16 @@ def list_enterprise_favorite_players(
 ):
     rows = db.execute(
         text("""
-        SELECT id, club_player_id, name, nationality, age, potential, form,
-               gender, height, weight, team, league, roles_json, created_at
-        FROM enterprise_favorite_players
-        WHERE user_id = :user_id
-        ORDER BY created_at DESC
+        SELECT efp.id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
+               efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json, efp.created_at,
+               pd.metadata->'position_counts' AS position_counts,
+               pd.metadata->>'position_count_total' AS position_count_total,
+               pd.metadata->'position_names_seen' AS position_names_seen,
+               pd.metadata->>'primary_position_code' AS primary_position_code
+        FROM enterprise_favorite_players efp
+        LEFT JOIN player_data pd ON pd.id = efp.club_player_id
+        WHERE efp.user_id = :user_id
+        ORDER BY efp.created_at DESC
         """),
         {"user_id": user_id},
     ).mappings().all()
@@ -1144,11 +1220,16 @@ def save_enterprise_favorite_player(
     db.commit()
     row = db.execute(
         text("""
-        SELECT id, club_player_id, name, nationality, age, potential, form,
-               gender, height, weight, team, league, roles_json
-        FROM enterprise_favorite_players
-        WHERE id = :id
-          AND user_id = :user_id
+        SELECT efp.id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
+               efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json,
+               pd.metadata->'position_counts' AS position_counts,
+               pd.metadata->>'position_count_total' AS position_count_total,
+               pd.metadata->'position_names_seen' AS position_names_seen,
+               pd.metadata->>'primary_position_code' AS primary_position_code
+        FROM enterprise_favorite_players efp
+        LEFT JOIN player_data pd ON pd.id = efp.club_player_id
+        WHERE efp.id = :id
+          AND efp.user_id = :user_id
         """),
         {"id": favorite_id, "user_id": user_id},
     ).mappings().first()
