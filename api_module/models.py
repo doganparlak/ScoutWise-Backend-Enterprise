@@ -28,6 +28,11 @@ class PasswordResetRequestIn(BaseModel):
     email: EmailStr
 
 
+class EnterpriseAllowlistEmailIn(BaseModel):
+    email: EmailStr
+    note: Optional[str] = None
+
+
 class VerifyResetIn(BaseModel):
     email: EmailStr
     code: str

@@ -22,6 +22,7 @@ from api_module.models import (
     MatchupComparisonOut,
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
+    EnterpriseAllowlistEmailIn,
     EnterpriseLineupIn,
     EnterpriseLineupOut,
     EnterpriseProChatIn,
@@ -106,12 +107,48 @@ MESSAGES = {
         "en": "New password must be different from your current password",
         "tr": "Yeni şifre mevcut şifrenden farklı olmalı",
     },
+    "signup_not_allowed": {
+        "en": "You are not authorized to sign up. Please contact us via support@scoutwise.ai.",
+        "tr": "Kayıt olma yetkiniz tanımlanmamıştır. Lütfen support@scoutwise.ai aracılığı ile iletişime geçin.",
+    },
+    "admin_only": {
+        "en": "Only the ScoutWise admin can manage authorized enterprise users.",
+        "tr": "Yetkili enterprise kullanıcılarını yalnızca ScoutWise admin yönetebilir.",
+    },
 }
 
 
 def msg(key: str, lang: str | None) -> str:
     preferred = normalize_lang(lang) or "tr"
     return MESSAGES[key][preferred]
+
+
+ENTERPRISE_ADMIN_EMAILS = {"dgnprlk@gmail.com", "cemzengin@gmail.com"}
+
+
+def is_enterprise_email_allowed(db: Session, email: str) -> bool:
+    row = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM enterprise_auth_allowlist
+            WHERE lower(email) = lower(:email)
+              AND is_active = TRUE
+            LIMIT 1
+            """
+        ),
+        {"email": email.strip()},
+    ).first()
+    return bool(row)
+
+
+def require_enterprise_admin(db: Session, user_id: str, accept_language: str | None = None) -> None:
+    row = db.execute(
+        text("SELECT email FROM enterprise_users WHERE id = :id"),
+        {"id": user_id},
+    ).mappings().first()
+    if not row or str(row["email"]).strip().lower() not in ENTERPRISE_ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail=msg("admin_only", accept_language))
 
 app = FastAPI(title="ScoutWise Enterprise Backend")
 
@@ -141,6 +178,28 @@ async def log_pro_chat_route(request: Request, call_next):
 def ensure_enterprise_sessions_table() -> None:
     db = SessionLocal()
     try:
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS public.enterprise_auth_allowlist (
+                  id BIGSERIAL PRIMARY KEY,
+                  email TEXT NOT NULL UNIQUE,
+                  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                  note TEXT,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        )
+        db.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS enterprise_auth_allowlist_email_idx
+                ON public.enterprise_auth_allowlist (lower(email))
+                """
+            )
+        )
         db.execute(
             text(
                 """
@@ -218,21 +277,51 @@ def pro_chat_reset(
     return reset_chat_session(db, token=token)
 
 
+@app.post("/admin/enterprise-auth-allowlist")
+def add_enterprise_auth_allowlist_email(
+    payload: EnterpriseAllowlistEmailIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    require_enterprise_admin(db, user_id, accept_language)
+    email = payload.email.strip().lower()
+    note = payload.note or "Added from enterprise portal admin"
+    row = db.execute(
+        text(
+            """
+            INSERT INTO enterprise_auth_allowlist (email, is_active, note)
+            VALUES (:email, TRUE, :note)
+            ON CONFLICT (email) DO UPDATE
+            SET is_active = TRUE,
+                note = EXCLUDED.note,
+                updated_at = NOW()
+            RETURNING id, email, is_active, note, created_at, updated_at
+            """
+        ),
+        {"email": email, "note": note},
+    ).mappings().first()
+    db.commit()
+    return {"ok": True, "email": row["email"], "isActive": row["is_active"]}
+
+
 @app.post("/auth/signup")
 def signup(
     payload: SignUpIn,
     accept_language: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    email_norm = payload.email.strip()
+    preferred = normalize_lang(payload.uiLanguage) or normalize_lang(accept_language) or "tr"
+
+    if not is_enterprise_email_allowed(db, email_norm):
+        raise HTTPException(status_code=403, detail=msg("signup_not_allowed", preferred))
+
     if not PASSWORD_RE.match(payload.password):
-        preferred = normalize_lang(payload.uiLanguage) or normalize_lang(accept_language) or "tr"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=msg("weak_pw", preferred),
         )
-
-    email_norm = payload.email.strip()
-    preferred = normalize_lang(payload.uiLanguage) or normalize_lang(accept_language) or "tr"
 
     existing = db.execute(
         text(
@@ -300,6 +389,10 @@ def request_signup_code(
     db: Session = Depends(get_db),
 ):
     email = body.email.strip()
+    preferred = normalize_lang(accept_language) or "tr"
+    if not is_enterprise_email_allowed(db, email):
+        raise HTTPException(status_code=403, detail=msg("signup_not_allowed", preferred))
+
     row = db.execute(
         text(
             """
@@ -312,7 +405,6 @@ def request_signup_code(
     ).mappings().first()
 
     if not row:
-        preferred = normalize_lang(accept_language) or "tr"
         raise HTTPException(status_code=400, detail=msg("no_pending_signup", preferred))
     if row["is_email_verified"]:
         return {"ok": True}
@@ -379,6 +471,10 @@ def request_reset(
     db: Session = Depends(get_db),
 ):
     email = body.email.strip()
+    preferred = normalize_lang(accept_language) or "tr"
+    if not is_enterprise_email_allowed(db, email):
+        raise HTTPException(status_code=403, detail=msg("signup_not_allowed", preferred))
+
     row = db.execute(
         text(
             """
