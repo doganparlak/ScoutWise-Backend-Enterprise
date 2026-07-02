@@ -254,6 +254,8 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
 
 def is_direct_player_lookup_request_agentic(original_question: Optional[str], translated_question: Optional[str]) -> bool:
+    if extract_named_player_lookup_query(original_question, translated_question):
+        return True
     if is_direct_player_lookup_request(original_question):
         return True
 
@@ -278,6 +280,69 @@ def is_direct_player_lookup_request_agentic(original_question: Optional[str], tr
     if len(tokens) == 1:
         return len(tokens[0]) >= 5
     return 2 <= len(tokens) <= 5 and all(len(token) >= 2 for token in tokens)
+
+
+def _looks_like_player_name_fragment(value: Optional[str], *, allow_single: bool = False) -> Optional[str]:
+    text = re.sub(r"\s+", " ", (value or "").strip(" .?!,:;\"'’“”")).strip()
+    if not text:
+        return None
+    lowered = norm_name(text)
+    blocked = {
+        "bana", "bir", "oyuncu", "futbolcu", "player", "footballer", "profile", "scouting",
+        "report", "analysis", "analyze", "analyse", "tell", "about", "what", "kind", "how",
+        "is", "the", "a", "an", "young", "powerful", "explosive", "striker", "forward",
+    }
+    tokens = _lookup_tokens(lowered)
+    tokens = [token for token in tokens if token not in blocked]
+    if len(tokens) > 5:
+        return None
+    if len(tokens) < 2 and not (allow_single and len(tokens) == 1 and len(tokens[0]) >= 5):
+        return None
+    if any(len(token) < 2 for token in tokens):
+        return None
+    if any(token in {"player", "oyuncu", "futbolcu", "striker", "forward", "midfielder", "defender"} for token in tokens):
+        return None
+    original_tokens = [
+        token
+        for token in re.split(r"\s+", text)
+        if norm_name(token) in set(tokens)
+    ]
+    return " ".join(original_tokens[: len(tokens)]).strip() or " ".join(tokens).strip()
+
+
+def extract_named_player_lookup_query(
+    original_question: Optional[str],
+    translated_question: Optional[str] = None,
+    effective_query: Optional[str] = None,
+) -> Optional[str]:
+    candidates = [original_question or "", effective_query or "", translated_question or ""]
+    patterns = [
+        r"^\s*(?P<name>.+?)\s+(?:nasil|nasıl)\s+bir\s+(?:oyuncu|futbolcu)\b",
+        r"^\s*(?P<name>.+?)\s+(?:nasildir|nasıldır|kimdir)\b",
+        r"^\s*(?P<name>.+?)\s+(?:player\s+profile|scouting\s+report|profile|analysis|analizi)\b",
+        r"^\s*(?:tell\s+me\s+about|analy[sz]e|profile)\s+(?P<name>.+?)\s*$",
+        r"^\s*(?:what\s+kind\s+of\s+player\s+is|who\s+is|how\s+is)\s+(?P<name>.+?)\s*$",
+        r"^\s*(?:how\s+would)\s+(?P<name>.+?)\s+(?:fit|be)\s+(?:for|at|in|to)\s+.+$",
+        r"^\s*(?P<name>[A-Za-zÀ-ÿ.'’\- ]{3,50}?)\s+\S+(?:'?[aeıiuü]|ye|ya|de|da|te|ta|e|a)?\s+(?:nasil|nasıl)\s+olur\b",
+    ]
+    for text in candidates:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        if not compact:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, compact, flags=re.IGNORECASE)
+            if not match:
+                continue
+            name = _looks_like_player_name_fragment(match.group("name"), allow_single=True)
+            if name:
+                return name
+
+    # Controller often returns "Name player profile scouting report"; recover the leading identity.
+    compact_effective = re.sub(r"\s+", " ", effective_query or "").strip()
+    match = re.search(r"^(?P<name>.+?)\s+(?:player\s+profile|scouting\s+report|profile|analysis)\b", compact_effective, flags=re.IGNORECASE)
+    if match:
+        return _looks_like_player_name_fragment(match.group("name"))
+    return None
 
 
 def is_narrow_filtered_suggestion_request(question: Optional[str], strategy: Optional[str] = None) -> bool:
@@ -1013,10 +1078,17 @@ def build_agentic_context(
     planner_data = planner_data or {}
     generic_alternative = is_generic_alternative_request(translated)
     planner_intent = planner_data.get("intent")
+    named_lookup_query = extract_named_player_lookup_query(
+        original_question,
+        translated,
+        planner_data.get("effective_query") or "",
+    )
     heuristic_direct_lookup = is_direct_player_lookup_request_agentic(original_question, translated)
     direct_lookup = planner_intent == "direct_player_lookup" or (
         not planner_intent and heuristic_direct_lookup
     )
+    if named_lookup_query:
+        direct_lookup = True
 
     target_team = extract_target_team_from_question(translated)
     if not target_team and generic_alternative:
@@ -1035,7 +1107,7 @@ def build_agentic_context(
             limit=3,
         )
 
-    effective_query = (planner_data.get("effective_query") or translated).strip()
+    effective_query = (named_lookup_query or planner_data.get("effective_query") or translated).strip()
     if generic_alternative and recent_constraints:
         constraints_block = "\n".join(f"- {msg}" for msg in recent_constraints)
         effective_query = (
@@ -1073,6 +1145,8 @@ def build_agentic_context(
         intent = "alternative_recommendation"
     if len(comparison_players) >= 2:
         intent = "comparison"
+    if named_lookup_query:
+        intent = "direct_player_lookup"
     if intent != "direct_player_lookup":
         direct_lookup = False
 
@@ -1106,7 +1180,7 @@ def build_agentic_context(
         suffix = f" Treated {target_team} as target team, not source team."
         cleaned_constraints["notes"] = (note + suffix).strip()[:160]
 
-    if direct_lookup and _has_search_constraints(cleaned_constraints) and (
+    if direct_lookup and not named_lookup_query and _has_search_constraints(cleaned_constraints) and (
         _looks_like_generic_player_search(original_question)
         or _looks_like_generic_player_search(translated)
     ):

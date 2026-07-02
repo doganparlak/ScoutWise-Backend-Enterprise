@@ -387,6 +387,7 @@ AGENTIC_NARRATIVE_PROMPT = (
 FINAL NARRATIVE TASK:
 You will be given the user's question, optional strategy, one selected player profile, and the player's stats.
 Write exactly 3 concise professional sentences, strengths only.
+If the player profile contains target_team_fit_context, interpret the selected player's fit for that target team specifically; do not turn it into a generic recommendation for another player.
 Use metric names qualitatively and do not output metric values, percentages, decimals, ranges, numerals, or number words.
 Do not output PLAYER_PROFILE blocks or tags.
 """
