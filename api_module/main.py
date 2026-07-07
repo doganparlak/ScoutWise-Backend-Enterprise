@@ -25,6 +25,8 @@ from api_module.models import (
     EnterpriseAllowlistEmailIn,
     EnterpriseLineupIn,
     EnterpriseLineupOut,
+    EnterpriseTacticBoardIn,
+    EnterpriseTacticBoardOut,
     EnterpriseProChatIn,
     EnterpriseProStrategyIn,
     EnterpriseProStrategyOut,
@@ -60,6 +62,7 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison
 from lineup_module.lineup import create_lineup, delete_lineup, list_lineups, update_lineup
+from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 from report_module.report import generate_report_content
@@ -1171,6 +1174,42 @@ def delete_enterprise_lineup(
     db: Session = Depends(get_db),
 ):
     return delete_lineup(db, user_id, lineup_id)
+
+
+@app.get("/tactic-boards", response_model=list[EnterpriseTacticBoardOut])
+def list_enterprise_tactic_boards(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return list_tactic_boards(db, user_id)
+
+
+@app.post("/tactic-boards", response_model=EnterpriseTacticBoardOut)
+def create_enterprise_tactic_board(
+    payload: EnterpriseTacticBoardIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return create_tactic_board(db, user_id, payload)
+
+
+@app.patch("/tactic-boards/{board_id}", response_model=EnterpriseTacticBoardOut)
+def update_enterprise_tactic_board(
+    board_id: str,
+    payload: EnterpriseTacticBoardIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return update_tactic_board(db, user_id, board_id, payload)
+
+
+@app.delete("/tactic-boards/{board_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_enterprise_tactic_board(
+    board_id: str,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return delete_tactic_board(db, user_id, board_id)
 
 
 @app.get("/favorite-players", response_model=list[EnterpriseFavoritePlayerOut])

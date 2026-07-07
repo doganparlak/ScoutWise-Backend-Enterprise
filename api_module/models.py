@@ -218,6 +218,18 @@ class EnterpriseLineupOut(EnterpriseLineupIn):
     updatedAt: str
 
 
+class EnterpriseTacticBoardIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    formation: str = Field(default="4-3-3", min_length=1, max_length=40)
+    board_data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EnterpriseTacticBoardOut(EnterpriseTacticBoardIn):
+    id: str
+    createdAt: str
+    updatedAt: str
+
+
 class EnterpriseProStrategyIn(BaseModel):
     strategy: str = Field(default="", max_length=6000)
 
