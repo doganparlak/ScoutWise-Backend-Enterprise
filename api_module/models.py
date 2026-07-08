@@ -159,16 +159,20 @@ class EnterpriseFavoritePlayerOut(BaseModel):
 
 
 class EnterpriseScoutingReportIn(BaseModel):
+    playerId: Optional[str] = None
+    clubPlayerId: Optional[int] = None
+    club_player_id: Optional[int] = None
+    worldCupMode: Optional[bool] = False
     name: Optional[str] = None
     gender: Optional[str] = None
     nationality: Optional[str] = None
     team: Optional[str] = None
+    league: Optional[str] = None
     age: Optional[int] = None
     height: Optional[str] = None
     weight: Optional[str] = None
     potential: Optional[int] = Field(default=None, ge=0, le=100)
     form: Optional[int] = Field(default=None, ge=0, le=100)
-    clubPlayerId: Optional[int] = None
 
 
 class EnterpriseScoutingReportOut(BaseModel):

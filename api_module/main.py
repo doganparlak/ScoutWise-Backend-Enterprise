@@ -233,6 +233,37 @@ def ensure_enterprise_sessions_table() -> None:
                 """
             )
         )
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS public.enterprise_player_pool_scouting_reports (
+                  id UUID PRIMARY KEY,
+                  user_id UUID NOT NULL REFERENCES public.enterprise_users(id) ON DELETE CASCADE,
+                  cache_key TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'processing',
+                  language TEXT DEFAULT 'en',
+                  version INTEGER NOT NULL DEFAULT 1,
+                  player_name TEXT,
+                  player_payload JSONB,
+                  content TEXT,
+                  content_json JSONB,
+                  error TEXT,
+                  ready_at TIMESTAMPTZ,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  UNIQUE (user_id, cache_key, language, version)
+                )
+                """
+            )
+        )
+        db.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_enterprise_player_pool_scouting_reports_user
+                ON public.enterprise_player_pool_scouting_reports (user_id, created_at DESC)
+                """
+            )
+        )
         db.commit()
     finally:
         db.close()
@@ -936,7 +967,10 @@ def _resolve_club_player_row(db: Session, player_id: str, world_cup_mode: bool) 
         FROM player_data
         WHERE LOWER(TRIM(metadata->>'player_name')) = LOWER(TRIM(:player_name))
           AND (:gender IS NULL OR LOWER(COALESCE(metadata->>'gender', '')) = LOWER(:gender))
-          AND (:age IS NULL OR COALESCE(metadata->>'age', '') = CAST(:age AS text))
+          AND (:age IS NULL OR (
+                COALESCE(metadata->>'age', '') ~ '^-?[0-9]+([.][0-9]+)?$'
+                AND (metadata->>'age')::numeric = :age
+              ))
         ORDER BY
           CASE WHEN :height IS NOT NULL AND COALESCE(metadata->>'height', '') = :height THEN 0 ELSE 1 END,
           CASE WHEN :weight IS NOT NULL AND COALESCE(metadata->>'weight', '') = :weight THEN 0 ELSE 1 END,
@@ -951,9 +985,60 @@ def _resolve_club_player_row(db: Session, player_id: str, world_cup_mode: bool) 
             "weight": weight,
         },
     ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Matching club player not found")
-    return row
+    if row:
+        return row
+
+    nationality = _metadata_text(wc_metadata, "nationality_name", "nationality")
+    roles = _metadata_roles(wc_metadata)
+    name_tokens = [token for token in re.split(r"\s+", player_name or "") if token]
+    last_name = re.sub(r"[^\wÀ-ž'-]", "", name_tokens[-1]) if name_tokens else ""
+    last_name = last_name if last_name and last_name.lower() != player_name.lower() else None
+    attempts = [
+        ("name_gender_age", {"name": player_name, "gender": gender, "minAge": age, "maxAge": age}),
+        ("name_nationality_gender", {"name": player_name, "nationality": nationality, "gender": gender}),
+        ("name_nationality", {"name": player_name, "nationality": nationality}),
+        ("last_name_gender_age", {"name": last_name, "gender": gender, "minAge": age, "maxAge": age}),
+        ("last_name_nationality", {"name": last_name, "nationality": nationality}),
+        ("name_role", {"name": player_name, "position": roles[0] if roles else None}),
+        ("last_name_role", {"name": last_name, "position": roles[0] if roles else None}),
+        ("name_only", {"name": player_name}),
+        ("last_name_only", {"name": last_name}),
+    ]
+
+    for stage, filters in attempts:
+        search_filters = {key: value for key, value in filters.items() if value not in (None, "", [])}
+        search_filters["limit"] = 10
+        search_filters["worldCupMode"] = False
+        rows = search_players(db, search_filters)
+        print(
+            "[enterprise_club_resolve] "
+            f"event=fallback stage={stage} wc_player_id={player_id!r} name={player_name!r} "
+            f"nationality={nationality!r} gender={gender!r} matches={len(rows)}",
+            flush=True,
+        )
+        if not rows:
+            continue
+
+        best = rows[0]
+        club_row = db.execute(
+            text("""
+            SELECT id, metadata
+            FROM player_data
+            WHERE id = :player_id
+            LIMIT 1
+            """),
+            {"player_id": best["id"]},
+        ).mappings().first()
+        if club_row:
+            print(
+                "[enterprise_club_resolve] "
+                f"event=resolved stage={stage} wc_player_id={player_id!r} club_player_id={club_row['id']!r} "
+                f"name={player_name!r}",
+                flush=True,
+            )
+            return club_row
+
+    raise HTTPException(status_code=404, detail="Matching club player not found")
 
 
 def _resolve_club_player_row_from_favorite_payload(
@@ -1369,6 +1454,321 @@ def save_enterprise_favorite_player(
         {"id": favorite_id, "user_id": user_id},
     ).mappings().first()
     return _favorite_out(row)
+
+
+
+def _resolve_enterprise_player_pool_report_club_row(db: Session, player_payload: Dict[str, Any]) -> Any | None:
+    club_player_id = player_payload.get("club_player_id") or player_payload.get("clubPlayerId")
+    if club_player_id is not None:
+        row = db.execute(
+            text("""
+            SELECT id, metadata
+            FROM player_data
+            WHERE id = :player_id
+            LIMIT 1
+            """),
+            {"player_id": club_player_id},
+        ).mappings().first()
+        return row
+
+    player_id = player_payload.get("playerId") or player_payload.get("player_id")
+    world_cup_mode = bool(player_payload.get("worldCupMode") or player_payload.get("world_cup_mode"))
+
+    if player_id:
+        try:
+            return _resolve_club_player_row(db, str(player_id), world_cup_mode)
+        except HTTPException:
+            if world_cup_mode:
+                raise
+            return None
+
+    if not world_cup_mode:
+        return None
+
+    player_name = str(player_payload.get("name") or "").strip()
+    if not player_name:
+        return None
+
+    gender = player_payload.get("gender")
+    nationality = player_payload.get("nationality")
+    age = player_payload.get("age")
+    roles = [role for role in (player_payload.get("roles") or []) if role]
+    name_tokens = [token for token in re.split(r"\s+", player_name) if token]
+    last_name = re.sub(r"[^\wÀ-ž'-]", "", name_tokens[-1]) if name_tokens else ""
+    last_name = last_name if last_name and last_name.lower() != player_name.lower() else None
+    attempts = [
+        ("name_gender_age", {"name": player_name, "gender": gender, "minAge": age, "maxAge": age}),
+        ("name_nationality_gender", {"name": player_name, "nationality": nationality, "gender": gender}),
+        ("name_nationality", {"name": player_name, "nationality": nationality}),
+        ("last_name_gender_age", {"name": last_name, "gender": gender, "minAge": age, "maxAge": age}),
+        ("last_name_nationality", {"name": last_name, "nationality": nationality}),
+        ("name_role", {"name": player_name, "position": roles[0] if roles else None}),
+        ("last_name_role", {"name": last_name, "position": roles[0] if roles else None}),
+        ("name_only", {"name": player_name}),
+        ("last_name_only", {"name": last_name}),
+    ]
+
+    for stage, filters in attempts:
+        search_filters = {key: value for key, value in filters.items() if value not in (None, "", [])}
+        search_filters["limit"] = 10
+        search_filters["worldCupMode"] = False
+        rows = search_players(db, search_filters)
+        print(
+            "[enterprise_player_pool_report] "
+            f"event=club_resolve_fallback stage={stage} name={player_name!r} "
+            f"nationality={nationality!r} gender={gender!r} matches={len(rows)}",
+            flush=True,
+        )
+        if not rows:
+            continue
+
+        row = db.execute(
+            text("""
+            SELECT id, metadata
+            FROM player_data
+            WHERE id = :player_id
+            LIMIT 1
+            """),
+            {"player_id": rows[0]["id"]},
+        ).mappings().first()
+        if row:
+            return row
+
+    return None
+
+
+def _apply_enterprise_club_row_to_report_payload(
+    db: Session,
+    player_payload: Dict[str, Any],
+    club_row: Any,
+) -> Dict[str, Any]:
+    metadata = dict(club_row["metadata"] or {})
+    next_payload = dict(player_payload)
+    next_payload["club_player_id"] = int(club_row["id"])
+    next_payload["playerId"] = str(club_row["id"])
+    next_payload["worldCupMode"] = False
+    next_payload["name"] = _metadata_text(metadata, "player_name", "name") or next_payload.get("name")
+    next_payload["nationality"] = _metadata_text(metadata, "nationality_name", "nationality") or next_payload.get("nationality")
+    next_payload["gender"] = _metadata_text(metadata, "gender") or next_payload.get("gender")
+    next_payload["team"] = _metadata_text(metadata, "team_name", "team", "club") or next_payload.get("team")
+    next_payload["league"] = _metadata_text(metadata, "league_name", "league") or next_payload.get("league")
+    next_payload["age"] = _metadata_int(metadata, "age") or next_payload.get("age")
+    next_payload["height"] = _metadata_text(metadata, "height") or next_payload.get("height")
+    next_payload["weight"] = _metadata_text(metadata, "weight") or next_payload.get("weight")
+
+    roles = _metadata_roles(metadata)
+    if roles:
+        next_payload["roles"] = roles
+
+    position_counts = metadata.get("position_counts")
+    if isinstance(position_counts, dict):
+        next_payload["position_counts"] = position_counts
+        next_payload["positionCounts"] = position_counts
+    position_names_seen = metadata.get("position_names_seen")
+    if isinstance(position_names_seen, list):
+        next_payload["position_names_seen"] = position_names_seen
+        next_payload["positionNamesSeen"] = position_names_seen
+    position_count_total = _metadata_int(metadata, "position_count_total")
+    if position_count_total is not None:
+        next_payload["position_count_total"] = position_count_total
+        next_payload["positionCountTotal"] = position_count_total
+    primary_position_code = _metadata_text(metadata, "primary_position_code")
+    if primary_position_code:
+        next_payload["primary_position_code"] = primary_position_code
+        next_payload["primaryPositionCode"] = primary_position_code
+
+    if player_payload.get("worldCupMode"):
+        try:
+            next_payload["potential"] = reveal_player_potential(db, club_row["id"], False).get("potential")
+            next_payload["form"] = reveal_player_form(db, club_row["id"], False).get("form")
+        except Exception as exc:
+            print(f"[enterprise_player_pool_report] event=club_score_resolve_failed club_player_id={club_row['id']} error={exc}", flush=True)
+
+    return next_payload
+
+
+def _enterprise_player_pool_report_cache_key(player_payload: Dict[str, Any]) -> str:
+    cache_identity = {
+        key: player_payload.get(key)
+        for key in (
+            "name",
+            "gender",
+            "nationality",
+            "team",
+            "league",
+            "age",
+            "height",
+            "weight",
+        )
+        if player_payload.get(key) is not None
+    }
+    raw = json.dumps(cache_identity, ensure_ascii=False, sort_keys=True, default=str).lower()
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"scoutwise:enterprise-player-pool-report:{raw}"))
+
+
+@app.post("/player-pool/report", response_model=EnterpriseScoutingReportOut)
+def create_enterprise_player_pool_report(
+    payload: EnterpriseScoutingReportIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    lang = normalize_lang(accept_language) or "en"
+    version = 6
+    player_payload = payload.model_dump(exclude_none=True)
+    if player_payload.get("clubPlayerId") is not None:
+        player_payload["club_player_id"] = player_payload.pop("clubPlayerId")
+
+    club_row = _resolve_enterprise_player_pool_report_club_row(db, player_payload)
+    if club_row is not None:
+        player_payload = _apply_enterprise_club_row_to_report_payload(db, player_payload, club_row)
+    elif player_payload.get("worldCupMode"):
+        raise HTTPException(status_code=404, detail="Matching club player not found")
+
+    name = str(player_payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Player name is required")
+
+    cache_key = _enterprise_player_pool_report_cache_key(player_payload)
+    row = db.execute(
+        text("""
+        SELECT id, status, content, content_json, language, version, player_payload
+        FROM enterprise_player_pool_scouting_reports
+        WHERE user_id = :user_id
+          AND cache_key = :cache_key
+          AND COALESCE(language, 'en') = :lang
+          AND version = :version
+        LIMIT 1
+        """),
+        {"user_id": user_id, "cache_key": cache_key, "lang": lang, "version": version},
+    ).mappings().first()
+
+    if row:
+        if row["status"] == "failed":
+            db.execute(text("DELETE FROM enterprise_player_pool_scouting_reports WHERE id = :id"), {"id": row["id"]})
+            db.commit()
+            row = None
+        elif row["status"] == "ready":
+            content_json = row["content_json"] if isinstance(row["content_json"], dict) else {}
+            player_card = content_json.get("player_card") if isinstance(content_json, dict) else {}
+            player_card = player_card if isinstance(player_card, dict) else {}
+            missing_requested_score = any(
+                player_payload.get(score_key) is not None and player_card.get(score_key) is None
+                for score_key in ("potential", "form")
+            )
+            if missing_requested_score:
+                db.execute(text("DELETE FROM enterprise_player_pool_scouting_reports WHERE id = :id"), {"id": row["id"]})
+                db.commit()
+                row = None
+            else:
+                return {
+                    "favorite_player_id": cache_key,
+                    "status": row["status"],
+                    "content": row["content"],
+                    "content_json": row["content_json"],
+                    "language": row["language"],
+                    "version": row["version"],
+                }
+        else:
+            return {
+                "favorite_player_id": cache_key,
+                "status": row["status"],
+                "content": row["content"],
+                "content_json": row["content_json"],
+                "language": row["language"],
+                "version": row["version"],
+            }
+
+    report_id = str(uuid.uuid4())
+    try:
+        generated = generate_report_content(
+            db,
+            favorite_id=cache_key,
+            lang=lang,
+            version=version,
+            player_identity=player_payload,
+        )
+        db.execute(
+            text("""
+            INSERT INTO enterprise_player_pool_scouting_reports (
+                id, user_id, cache_key, status, language, version,
+                player_name, player_payload, content, content_json,
+                ready_at, created_at, updated_at
+            )
+            VALUES (
+                :id, :user_id, :cache_key, 'ready', :lang, :version,
+                :player_name, CAST(:player_payload AS jsonb), :content, CAST(:content_json AS jsonb),
+                NOW(), NOW(), NOW()
+            )
+            ON CONFLICT (user_id, cache_key, language, version)
+            DO UPDATE SET
+                status = 'ready',
+                player_name = EXCLUDED.player_name,
+                player_payload = EXCLUDED.player_payload,
+                content = EXCLUDED.content,
+                content_json = EXCLUDED.content_json,
+                error = NULL,
+                ready_at = NOW(),
+                updated_at = NOW()
+            """),
+            {
+                "id": report_id,
+                "user_id": user_id,
+                "cache_key": cache_key,
+                "lang": lang,
+                "version": version,
+                "player_name": name,
+                "player_payload": json.dumps(player_payload, ensure_ascii=False, default=str),
+                "content": generated["content"],
+                "content_json": json.dumps(generated["content_json"], ensure_ascii=False, default=str),
+            },
+        )
+        db.commit()
+        return {
+            "favorite_player_id": cache_key,
+            "status": "ready",
+            "content": generated["content"],
+            "content_json": generated["content_json"],
+            "language": lang,
+            "version": version,
+        }
+    except Exception as exc:
+        db.rollback()
+        print(f"[enterprise_player_pool_report] event=failed user_id={user_id} player={name!r} error={exc}", flush=True)
+        try:
+            db.execute(
+                text("""
+                INSERT INTO enterprise_player_pool_scouting_reports (
+                    id, user_id, cache_key, status, language, version,
+                    player_name, player_payload, error, created_at, updated_at
+                )
+                VALUES (
+                    :id, :user_id, :cache_key, 'failed', :lang, :version,
+                    :player_name, CAST(:player_payload AS jsonb), :error, NOW(), NOW()
+                )
+                ON CONFLICT (user_id, cache_key, language, version)
+                DO UPDATE SET
+                    status = 'failed',
+                    player_name = EXCLUDED.player_name,
+                    player_payload = EXCLUDED.player_payload,
+                    error = EXCLUDED.error,
+                    updated_at = NOW()
+                """),
+                {
+                    "id": report_id,
+                    "user_id": user_id,
+                    "cache_key": cache_key,
+                    "lang": lang,
+                    "version": version,
+                    "player_name": name,
+                    "player_payload": json.dumps(player_payload, ensure_ascii=False, default=str),
+                    "error": str(exc),
+                },
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        raise HTTPException(status_code=500, detail="Report generation failed") from exc
 
 
 @app.post("/favorite-players/{favorite_id}/report", response_model=EnterpriseScoutingReportOut)
