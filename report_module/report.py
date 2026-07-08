@@ -480,7 +480,7 @@ def generate_report_content(
         if identity.get(role_key):
             player_card[role_key] = identity[role_key]
     for score_key in ("potential", "form"):
-        if score_key not in player_card and identity.get(score_key) is not None:
+        if player_card.get(score_key) in (None, "") and identity.get(score_key) is not None:
             player_card[score_key] = identity[score_key]
 
     report_text = (report_chain.invoke({"input_text": _build_llm_input(player_card, docs), "lang": lang}) or "").strip()

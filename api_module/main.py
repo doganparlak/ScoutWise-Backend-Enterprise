@@ -1614,6 +1614,29 @@ def _enterprise_player_pool_report_cache_key(player_payload: Dict[str, Any]) -> 
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"scoutwise:enterprise-player-pool-report:{raw}"))
 
 
+def _ensure_enterprise_player_pool_report_scores(
+    db: Session,
+    player_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    next_payload = dict(player_payload)
+    score_player_id = next_payload.get("club_player_id") or next_payload.get("clubPlayerId") or next_payload.get("playerId") or next_payload.get("player_id")
+    if score_player_id is None:
+        return next_payload
+
+    try:
+        if next_payload.get("potential") is None:
+            next_payload["potential"] = reveal_player_potential(db, score_player_id, False).get("potential")
+        if next_payload.get("form") is None:
+            next_payload["form"] = reveal_player_form(db, score_player_id, False).get("form")
+    except Exception as exc:
+        print(
+            "[enterprise_player_pool_report] "
+            f"event=score_ensure_failed player_id={score_player_id!r} error={exc}",
+            flush=True,
+        )
+    return next_payload
+
+
 @app.post("/player-pool/report", response_model=EnterpriseScoutingReportOut)
 def create_enterprise_player_pool_report(
     payload: EnterpriseScoutingReportIn,
@@ -1632,6 +1655,7 @@ def create_enterprise_player_pool_report(
         player_payload = _apply_enterprise_club_row_to_report_payload(db, player_payload, club_row)
     elif player_payload.get("worldCupMode"):
         raise HTTPException(status_code=404, detail="Matching club player not found")
+    player_payload = _ensure_enterprise_player_pool_report_scores(db, player_payload)
 
     name = str(player_payload.get("name") or "").strip()
     if not name:
