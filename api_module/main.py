@@ -1577,12 +1577,20 @@ def _apply_enterprise_club_row_to_report_payload(
         next_payload["primary_position_code"] = primary_position_code
         next_payload["primaryPositionCode"] = primary_position_code
 
-    if player_payload.get("worldCupMode"):
-        try:
-            next_payload["potential"] = reveal_player_potential(db, club_row["id"], False).get("potential")
-            next_payload["form"] = reveal_player_form(db, club_row["id"], False).get("form")
-        except Exception as exc:
-            print(f"[enterprise_player_pool_report] event=club_score_resolve_failed club_player_id={club_row['id']} error={exc}", flush=True)
+    try:
+        club_potential = reveal_player_potential(db, club_row["id"], False).get("potential")
+        club_form = reveal_player_form(db, club_row["id"], False).get("form")
+        next_payload["potential"] = club_potential
+        next_payload["form"] = club_form
+        if player_payload.get("worldCupMode") or player_payload.get("world_cup_mode"):
+            print(
+                "[enterprise_player_pool_report] "
+                f"event=club_score_override club_player_id={club_row['id']} "
+                f"potential={club_potential!r} form={club_form!r}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[enterprise_player_pool_report] event=club_score_resolve_failed club_player_id={club_row['id']} error={exc}", flush=True)
 
     return next_payload
 
