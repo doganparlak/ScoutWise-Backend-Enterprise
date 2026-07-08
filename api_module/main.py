@@ -1685,7 +1685,7 @@ def create_enterprise_player_pool_report(
             player_card = content_json.get("player_card") if isinstance(content_json, dict) else {}
             player_card = player_card if isinstance(player_card, dict) else {}
             missing_requested_score = any(
-                player_payload.get(score_key) is not None and player_card.get(score_key) is None
+                player_payload.get(score_key) is not None and player_card.get(score_key) in (None, "")
                 for score_key in ("potential", "form")
             )
             if missing_requested_score:
