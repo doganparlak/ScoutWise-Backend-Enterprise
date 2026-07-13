@@ -199,6 +199,21 @@ CATEGORY_PERSPECTIVE_METRICS: Dict[str, List[str]] = {
         "Last Man Tackle",
         "Clearance Offline",
     ],
+    "Goalkeeping": [
+        "Saves",
+        "Saves Insidebox",
+        "Penalties Saved",
+        "Punches",
+        "Good High Claim",
+        "Goalkeeper Goals Conceded",
+        "Goals Conceded",
+        "Long Balls",
+        "Long Balls Won",
+        "Long Balls Won (%)",
+        "Accurate Passes",
+        "Accurate Passes (%)",
+        "Possession Lost",
+    ],
     "Errors & Discipline": [
         "Goals Conceded",
         "Penalties Committed",
@@ -219,6 +234,99 @@ CATEGORY_PERSPECTIVE_METRICS: Dict[str, List[str]] = {
         "Yellow Cards",
         "Yellow & Red Cards",
         "Red Cards",
+    ],
+}
+
+PHASE_FIT_METRICS: Dict[str, List[str]] = {
+    "Build-up": [
+        "Passes",
+        "Accurate Passes",
+        "Accurate Passes (%)",
+        "Backward Passes",
+        "Touches",
+        "Possession Lost",
+        "Turn Over",
+    ],
+    "Progression": [
+        "Passes In Final Third",
+        "Through Balls",
+        "Through Balls Won",
+        "Long Balls",
+        "Long Balls Won",
+        "Long Balls Won (%)",
+        "Dribble Attempts",
+        "Successful Dribbles",
+        "Fouls Drawn",
+    ],
+    "Final Third": [
+        "Assists",
+        "Key Passes",
+        "Big Chances Created",
+        "Total Crosses",
+        "Accurate Crosses",
+        "Successful Crosses (%)",
+        "Shots Total",
+        "Shots On Target",
+        "Goals",
+    ],
+    "High Block": [
+        "Tackles",
+        "Tackles Won",
+        "Tackles Won (%)",
+        "Interceptions",
+        "Ball Recovery",
+        "Fouls",
+        "Dribbled Past",
+        "Duels Won",
+        "Duels Lost",
+    ],
+    "Mid Block": [
+        "Interceptions",
+        "Ball Recovery",
+        "Duels Won",
+        "Duels Won (%)",
+        "Total Duels",
+        "Tackles",
+        "Tackles Won",
+        "Clearances",
+    ],
+    "Low Block": [
+        "Clearances",
+        "Blocked Shots",
+        "Shots Blocked",
+        "Aerials",
+        "Aerials Won",
+        "Aerials Won (%)",
+        "Last Man Tackle",
+        "Clearance Offline",
+        "Error Lead To Shot",
+        "Error Lead To Goal",
+    ],
+}
+
+GK_PHASE_FIT_METRICS: Dict[str, List[str]] = {
+    "Build-up": [
+        "Passes",
+        "Accurate Passes",
+        "Accurate Passes (%)",
+        "Backward Passes",
+        "Touches",
+        "Long Balls",
+        "Long Balls Won",
+        "Long Balls Won (%)",
+        "Possession Lost",
+        "Turn Over",
+    ],
+    "Low Block": [
+        "Saves",
+        "Saves Insidebox",
+        "Penalties Saved",
+        "Punches",
+        "Good High Claim",
+        "Goalkeeper Goals Conceded",
+        "Goals Conceded",
+        "Error Lead To Shot",
+        "Error Lead To Goal",
     ],
 }
 
@@ -250,6 +358,25 @@ def _normalized_position_counts(value: Any) -> Dict[str, int]:
         if count > 0:
             counts[short] = counts.get(short, 0) + count
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _is_goalkeeper_card(player_card: Dict[str, Any]) -> bool:
+    counts = _normalized_position_counts(
+        (player_card or {}).get("position_counts") or (player_card or {}).get("positionCounts")
+    )
+    raw_roles: List[Any] = list(counts.keys())
+    roles_value = (player_card or {}).get("roles")
+    if isinstance(roles_value, list):
+        raw_roles.extend(roles_value)
+    raw_roles.extend(
+        [
+            (player_card or {}).get("primary_position_code"),
+            (player_card or {}).get("role"),
+            (player_card or {}).get("position_name"),
+            (player_card or {}).get("position"),
+        ]
+    )
+    return any(_role_short(role) == "GK" for role in raw_roles)
 
 
 def _normalized_position_names(value: Any) -> List[str]:
@@ -506,6 +633,47 @@ def _build_category_metric_context(player_card: Dict[str, Any], metric_docs: Lis
     return "\n".join(lines)
 
 
+def _build_phase_fit_context(player_card: Dict[str, Any], metric_docs: List[Dict[str, Any]]) -> str:
+    position_counts = _normalized_position_counts(
+        (player_card or {}).get("position_counts") or (player_card or {}).get("positionCounts")
+    )
+    is_goalkeeper = _is_goalkeeper_card(player_card or {})
+    phase_metrics = GK_PHASE_FIT_METRICS if is_goalkeeper else PHASE_FIT_METRICS
+    required_phases = "Build-up, Low Block" if is_goalkeeper else "Build-up, Progression, Final Third, High Block, Mid Block, Low Block"
+    role_distribution = "None"
+    if position_counts:
+        total = sum(position_counts.values())
+        role_distribution = ", ".join(
+            f"{role}={count} appearances / {round((count / total) * 100) if total else 0}%"
+            for role, count in position_counts.items()
+        )
+    lines = [
+        "\nPHASE_FIT_CONTEXT:",
+        f"Required PHASE FIT bullets: {required_phases}.",
+        "If this player is a goalkeeper, write ONLY Build-up and Low Block; do not write Progression, Final Third, Mid Block, or High Block.",
+        "For a goalkeeper, Build-up means the scenario where the goalkeeper's team has the ball and uses the goalkeeper in first-phase possession, distribution, security, and pressure release.",
+        "For a goalkeeper, Low Block means the scenario where the opponent has the ball and the goalkeeper protects the goal, box, aerial space, and last defensive line.",
+        "Use phase metrics as reasoning signals, but do not repeat raw metric names or values.",
+        f"Observed role distribution to consider in every phase: {role_distribution}.",
+        "Phase interpretation must connect the player's observed role distribution with their statistical style and likely tactical behavior in that phase.",
+        "If a phase has sparse metrics, infer cautiously from player role distribution, role constraints, team role, and available adjacent phase metrics. Do not mention missing data.",
+        "The UI will show each phase with a vertical pitch and highlighted zone, so each explanation should focus on how the player fits that phase tactically.",
+        "Available phase metrics:",
+    ]
+    for phase, metrics in phase_metrics.items():
+        values: List[str] = []
+        for metric in metrics:
+            selected: Optional[Any] = None
+            for doc in metric_docs or []:
+                selected = _metric_value_from_metadata(doc.get("metadata") or {}, metric)
+                if selected not in (None, ""):
+                    break
+            if selected not in (None, ""):
+                values.append(f"{metric}={selected}")
+        lines.append(f"- {phase}: {', '.join(values) if values else 'No direct phase metrics; use role/context only.'}")
+    return "\n".join(lines)
+
+
 def fetch_docs_for_favorite(
     db,
     player_identity: Dict[str, Any],
@@ -683,6 +851,7 @@ def _build_llm_input(player_card: Dict[str, Any], metric_docs: List[Dict[str, An
     parts.insert(0, _role_constraint_block(player_card))
     parts.insert(1, _build_metric_significance_block(metric_docs))
     parts.insert(2, _build_category_metric_context(player_card, metric_docs))
+    parts.insert(3, _build_phase_fit_context(player_card, metric_docs))
 
     if not metric_docs:
         parts.append("[]")
