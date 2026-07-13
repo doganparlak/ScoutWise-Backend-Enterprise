@@ -142,6 +142,86 @@ NEGATIVE_METRIC_RANGES: Dict[str, Tuple[float, float]] = {
 CONCERN_RISK_THRESHOLD = 0.33
 WATCH_RISK_THRESHOLD = 0.66
 
+CATEGORY_PERSPECTIVE_METRICS: Dict[str, List[str]] = {
+    "Contribution & Impact": [
+        "Minutes Played",
+        "Penalties Won",
+        "Touches",
+        "Big Chances Created",
+        "Dribble Attempts",
+        "Successful Dribbles",
+        "Man Of Match",
+        "Rating",
+        "Captain",
+        "Fouls Drawn",
+        "Offsides Provoked",
+    ],
+    "Shooting & Finishing": [
+        "Shots Total",
+        "Shots On Target",
+        "Shots On Target (%)",
+        "Goals",
+        "Hit Woodwork",
+        "Penalties Scored",
+    ],
+    "Passing & Distribution": [
+        "Assists",
+        "Long Balls",
+        "Long Balls Won",
+        "Long Balls Won (%)",
+        "Total Crosses",
+        "Accurate Crosses",
+        "Successful Crosses (%)",
+        "Passes",
+        "Accurate Passes",
+        "Accurate Passes (%)",
+        "Backward Passes",
+        "Key Passes",
+        "Passes In Final Third",
+        "Through Balls",
+        "Through Balls Won",
+    ],
+    "Defending": [
+        "Interceptions",
+        "Tackles",
+        "Tackles Won",
+        "Tackles Won (%)",
+        "Ball Recovery",
+        "Duels Won",
+        "Duels Won (%)",
+        "Total Duels",
+        "Aerials",
+        "Aerials Won",
+        "Aerials Won (%)",
+        "Clearances",
+        "Blocked Shots",
+        "Shots Blocked",
+        "Last Man Tackle",
+        "Clearance Offline",
+    ],
+    "Errors & Discipline": [
+        "Goals Conceded",
+        "Penalties Committed",
+        "Penalties Missed",
+        "Shots Off Target",
+        "Big Chances Missed",
+        "Aerials Lost",
+        "Duels Lost",
+        "Fouls",
+        "Dispossessed",
+        "Dribbled Past",
+        "Turn Over",
+        "Possession Lost",
+        "Offsides",
+        "Own Goals",
+        "Error Lead To Goal",
+        "Error Lead To Shot",
+        "Yellow Cards",
+        "Yellow & Red Cards",
+        "Red Cards",
+    ],
+}
+
 
 def _role_short(value: Any) -> Optional[str]:
     if value is None:
@@ -155,8 +235,54 @@ def _role_short(value: Any) -> Optional[str]:
     return ROLE_LONG_TO_SHORT.get(raw.lower())
 
 
+def _normalized_position_counts(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    counts: Dict[str, int] = {}
+    for raw_role, raw_count in value.items():
+        short = _role_short(raw_role)
+        if not short:
+            continue
+        try:
+            count = int(float(raw_count))
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            counts[short] = counts.get(short, 0) + count
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _normalized_position_names(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    names: List[str] = []
+    for raw_role in value:
+        short = _role_short(raw_role)
+        if short and short not in names:
+            names.append(short)
+    return names
+
+
 def _role_constraint_block(player_card: Dict[str, Any]) -> str:
     raw_roles: List[Any] = []
+    position_counts = _normalized_position_counts(
+        player_card.get("position_counts") or player_card.get("positionCounts")
+    )
+    raw_roles.extend(position_counts.keys())
+
+    position_names = _normalized_position_names(
+        player_card.get("position_names_seen") or player_card.get("positionNamesSeen")
+    )
+    raw_roles.extend(position_names)
+
+    raw_roles.extend(
+        value for value in (
+            player_card.get("primary_position_code"),
+            player_card.get("primaryPositionCode"),
+        )
+        if value
+    )
+
     roles = player_card.get("roles")
     if isinstance(roles, list):
         raw_roles.extend(roles)
@@ -184,22 +310,36 @@ def _role_constraint_block(player_card: Dict[str, Any]) -> str:
         )
 
     primary = mapped[0]
-    constraint = ROLE_USAGE_CONSTRAINTS.get(primary, {})
-    allowed = constraint.get("allowed", ROLE_SHORT_TO_LONG.get(primary, primary))
-    forbidden = constraint.get("forbidden", "any unrelated role family")
+    allowed_parts: List[str] = []
+    forbidden_parts: List[str] = []
+    for role in mapped:
+        constraint = ROLE_USAGE_CONSTRAINTS.get(role, {})
+        allowed = constraint.get("allowed", ROLE_SHORT_TO_LONG.get(role, role))
+        forbidden = constraint.get("forbidden")
+        if allowed and allowed not in allowed_parts:
+            allowed_parts.append(allowed)
+        if forbidden and forbidden not in forbidden_parts:
+            forbidden_parts.append(forbidden)
     mapped_labels = ", ".join(f"{short} ({ROLE_SHORT_TO_LONG.get(short, short)})" for short in mapped)
+    counts_label = ", ".join(f"{role}: {count}" for role, count in position_counts.items())
 
-    return "\n".join(
+    lines = [
+        "ROLE_CONSTRAINTS:",
+        f"- Source roles mapped from the player data: {mapped_labels}.",
+    ]
+    if counts_label:
+        lines.append(f"- Observed role distribution from position_counts, ordered by usage: {counts_label}.")
+    lines.extend(
         [
-            "ROLE_CONSTRAINTS:",
-            f"- Source roles mapped from the player data: {mapped_labels}.",
-            f"- Primary role for Role & Usage recommendations: {primary} ({ROLE_SHORT_TO_LONG.get(primary, primary)}).",
-            f"- Allowed recommendation space: {allowed}.",
-            f"- Forbidden recommendation space: {forbidden}.",
-            "- In CONCLUSION / Role & Usage, every role, system, in-possession, and out-of-possession recommendation MUST stay inside the allowed recommendation space.",
-            "- If metrics suggest a different role family, ignore that temptation and explain how those metrics help the mapped primary role instead.",
+            f"- Primary role for Role & Usage recommendations: {primary} ({ROLE_SHORT_TO_LONG.get(primary, primary)}), selected from the most frequent observed role when position_counts is available.",
+            f"- Allowed recommendation space: {'; '.join(allowed_parts) or ROLE_SHORT_TO_LONG.get(primary, primary)}.",
+            f"- Forbidden recommendation space: {'; '.join(forbidden_parts) or 'any unrelated role family'}.",
+            "- In CONCLUSION / Role & Usage, every role, system, in-possession, and out-of-possession recommendation MUST stay inside the observed role set when position_counts exists.",
+            "- If multiple observed roles exist, interpret the player as a multi-role profile weighted by the role distribution, with the most frequent role as the main reference.",
+            "- If metrics suggest a different role family, ignore that temptation and explain how those metrics help the mapped observed role set instead.",
         ]
     )
+    return "\n".join(lines)
 
 
 def _metric_key(value: Any) -> str:
@@ -292,6 +432,77 @@ def _build_metric_significance_block(metric_docs: List[Dict[str, Any]]) -> str:
     lines.extend(concern_lines or ["- None"])
     lines.append("LOW_RISK_NEGATIVES:")
     lines.extend(low_risk_lines or ["- None"])
+    return "\n".join(lines)
+
+
+def _metric_value_from_metadata(metadata: Dict[str, Any], metric_name: str) -> Optional[Any]:
+    if not isinstance(metadata, dict):
+        return None
+
+    target_key = _metric_key(metric_name)
+    for raw_metric, raw_value in metadata.items():
+        if _metric_key(raw_metric) == target_key:
+            return raw_value
+
+    for container_key in ("stats", "statistics", "metrics"):
+        raw_stats = metadata.get(container_key)
+        if not isinstance(raw_stats, list):
+            continue
+        for stat in raw_stats:
+            if not isinstance(stat, dict):
+                continue
+            raw_name = stat.get("metric") or stat.get("stat") or stat.get("label") or stat.get("name")
+            if _metric_key(raw_name) != target_key:
+                continue
+            return stat.get("value") or stat.get("amount") or stat.get("score")
+
+    return None
+
+
+def _build_category_metric_context(player_card: Dict[str, Any], metric_docs: List[Dict[str, Any]]) -> str:
+    category_values: Dict[str, List[str]] = {}
+    position_counts = _normalized_position_counts(
+        (player_card or {}).get("position_counts") or (player_card or {}).get("positionCounts")
+    )
+    if position_counts:
+        total = sum(position_counts.values())
+        values = []
+        for role, count in position_counts.items():
+            percent = round((count / total) * 100) if total else 0
+            values.append(f"{role}={count} appearances / {percent}%")
+        category_values["Pitch Map"] = values
+
+    for category, metrics in CATEGORY_PERSPECTIVE_METRICS.items():
+        values: List[str] = []
+        for metric in metrics:
+            selected: Optional[Any] = None
+            for doc in metric_docs or []:
+                selected = _metric_value_from_metadata(doc.get("metadata") or {}, metric)
+                if selected not in (None, ""):
+                    break
+            if selected not in (None, ""):
+                values.append(f"{metric}={selected}")
+        if values:
+            category_values[category] = values
+
+    lines = [
+        "\nCATEGORY_METRIC_CONTEXT:",
+        "Use this block to write CATEGORY PERSPECTIVES. Each listed category maps to one report metric page in the UI.",
+        f"REQUIRED_CATEGORY_PERSPECTIVES: {', '.join(category_values.keys()) if category_values else 'None'}.",
+        "You must output exactly one CATEGORY PERSPECTIVES bullet for every category in REQUIRED_CATEGORY_PERSPECTIVES. Missing any required category is invalid.",
+        "Do not repeat the raw metric names or values in the perspective text; use them only to reason.",
+        "Write a deeper scouting interpretation: first frame the general profile, then add one sharp, confident takeaway.",
+        "For Pitch Map, interpret the player's observed zones and role relationships. Do not mention raw role counts, percentages, or phrases such as all matches / 100%. Use the distribution only as background reasoning.",
+        "For Pitch Map, if multiple connected positions exist, explain the player's ability to move between related zones; if the profile is role-specialized, describe the tactical meaning without quoting the percentage.",
+        "For Errors & Discipline, lower values are generally better. Interpret it as a risk-control / discipline profile, not as a positive-volume category.",
+        "Use the player's name naturally when it helps the sentence. Name usage is allowed in every category, including Defending and Errors & Discipline.",
+        "Available category metrics:",
+    ]
+    if not category_values:
+        lines.append("- None")
+    else:
+        for category, values in category_values.items():
+            lines.append(f"- {category}: {', '.join(values)}")
     return "\n".join(lines)
 
 
@@ -414,6 +625,7 @@ def build_player_card_from_docs(metric_docs: List[Dict[str, Any]]) -> Dict[str, 
         fields = {
             "name": _first_non_empty(meta.get("player_name"), meta.get("name"), meta.get("player")),
             "team": _first_non_empty(meta.get("team"), meta.get("team_name"), meta.get("club")),
+            "league": _first_non_empty(meta.get("league"), meta.get("league_name")),
             "nationality": _first_non_empty(meta.get("nationality"), meta.get("nationality_name"), meta.get("country")),
             "gender": _first_non_empty(meta.get("gender")),
             "age": _first_non_empty(meta.get("age")),
@@ -427,8 +639,34 @@ def build_player_card_from_docs(metric_docs: List[Dict[str, Any]]) -> Dict[str, 
             if key not in card and value is not None:
                 card[key] = value
 
+        position_counts = _normalized_position_counts(meta.get("position_counts"))
+        if position_counts and "position_counts" not in card:
+            card["position_counts"] = position_counts
+
+        position_names_seen = _normalized_position_names(meta.get("position_names_seen"))
+        if position_names_seen and "position_names_seen" not in card:
+            card["position_names_seen"] = position_names_seen
+
+        if "position_count_total" not in card:
+            total = _first_non_empty(meta.get("position_count_total"))
+            if total is None and position_counts:
+                total = sum(position_counts.values())
+            if total is not None:
+                card["position_count_total"] = total
+
+        if "primary_position_code" not in card:
+            primary = _role_short(_first_non_empty(meta.get("primary_position_code")))
+            if not primary and position_counts:
+                primary = next(iter(position_counts.keys()), None)
+            if primary:
+                card["primary_position_code"] = primary
+
         if "roles" not in card:
-            if card.get("position_name"):
+            if card.get("position_counts"):
+                card["roles"] = list(card["position_counts"].keys())
+            elif card.get("position_names_seen"):
+                card["roles"] = card["position_names_seen"]
+            elif card.get("position_name"):
                 card["roles"] = [str(card["position_name"])]
             else:
                 roles_raw = _first_non_empty(meta.get("roles"), meta.get("roles_json"), meta.get("position"), meta.get("position_name"))
@@ -444,6 +682,7 @@ def _build_llm_input(player_card: Dict[str, Any], metric_docs: List[Dict[str, An
     parts: List[str] = ["PLAYER_CARD_JSON:", str(player_card or {}), "\nMETRIC_DOCUMENTS (newest first):"]
     parts.insert(0, _role_constraint_block(player_card))
     parts.insert(1, _build_metric_significance_block(metric_docs))
+    parts.insert(2, _build_category_metric_context(player_card, metric_docs))
 
     if not metric_docs:
         parts.append("[]")
@@ -476,6 +715,20 @@ def generate_report_content(
             player_card[key] = value
     if identity.get("roles"):
         player_card["roles"] = identity["roles"]
+    identity_counts = _normalized_position_counts(identity.get("position_counts") or identity.get("positionCounts"))
+    if identity_counts:
+        player_card["position_counts"] = identity_counts
+        player_card["roles"] = list(identity_counts.keys())
+        if not player_card.get("position_count_total"):
+            player_card["position_count_total"] = sum(identity_counts.values())
+        player_card["primary_position_code"] = next(iter(identity_counts.keys()), None)
+    identity_names = _normalized_position_names(identity.get("position_names_seen") or identity.get("positionNamesSeen"))
+    if identity_names and not player_card.get("position_names_seen"):
+        player_card["position_names_seen"] = identity_names
+    if identity.get("position_count_total") or identity.get("positionCountTotal"):
+        player_card["position_count_total"] = identity.get("position_count_total") or identity.get("positionCountTotal")
+    if identity.get("primary_position_code") or identity.get("primaryPositionCode"):
+        player_card["primary_position_code"] = identity.get("primary_position_code") or identity.get("primaryPositionCode")
     for role_key in ("position_name", "position", "role"):
         if identity.get(role_key):
             player_card[role_key] = identity[role_key]

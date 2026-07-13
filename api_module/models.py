@@ -173,6 +173,11 @@ class EnterpriseScoutingReportIn(BaseModel):
     weight: Optional[str] = None
     potential: Optional[int] = Field(default=None, ge=0, le=100)
     form: Optional[int] = Field(default=None, ge=0, le=100)
+    roles: List[str] = Field(default_factory=list)
+    positionCounts: Dict[str, int] = Field(default_factory=dict)
+    positionCountTotal: int = 0
+    positionNamesSeen: List[str] = Field(default_factory=list)
+    primaryPositionCode: Optional[str] = None
 
 
 class EnterpriseScoutingReportOut(BaseModel):
