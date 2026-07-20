@@ -17,6 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from api_module.database import SessionLocal
+from constants_module.constants import ROLE_SHORT_TO_LONG
 
 PASSWORD_ITERATIONS = int(os.getenv("PASSWORD_ITERATIONS", "210000"))
 CODE_EXPIRY_MINUTES = int(os.getenv("EMAIL_CODE_EXPIRY_MINUTES", "10"))
@@ -33,34 +34,6 @@ settings: Dict[str, Any] = {
 
 IMG_TAG = re.compile(r'<img[^>]+src="([^"]+)"[^>]*>', re.IGNORECASE)
 HTMLY_RE = re.compile(r'</?(table|thead|tbody|tr|td|th|ul|ol|li|div|p|h[1-6]|span)\b', re.IGNORECASE)
-
-ROLE_SHORT_TO_LONG = {
-    "GK": "Goal Keeper",
-    "LWB": "Left Wing Back",
-    "LB": "Left Back",
-    "LCB": "Left Center Back",
-    "CB": "Center Back",
-    "RCB": "Right Center Back",
-    "RB": "Right Back",
-    "RWB": "Right Wing Back",
-    "LM": "Left Midfield",
-    "LDM": "Left Defensive Midfield",
-    "LCM": "Left Center Midfield",
-    "LAM": "Left Attacking Midfield",
-    "CM": "Center Midfield",
-    "CAM": "Center Attacking Midfield",
-    "CDM": "Center Defensive Midfield",
-    "RCM": "Right Center Midfield",
-    "RM": "Right Midfield",
-    "RDM": "Right Defensive Midfield",
-    "RAM": "Right Attacking Midfield",
-    "CF": "Center Forward",
-    "RCF": "Right Center Forward",
-    "LCF": "Left Center Forward",
-    "LW": "Left Wing",
-    "RW": "Right Wing",
-}
-
 
 def normalize_lang(value: Optional[str]) -> Optional[str]:
     if not value:
