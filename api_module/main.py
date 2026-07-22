@@ -3,6 +3,7 @@ import json
 import os
 import re
 import secrets
+import unicodedata
 import uuid
 from typing import Any, Dict
 
@@ -1019,17 +1020,32 @@ def _resolve_club_player_row(db: Session, player_id: str, world_cup_mode: bool) 
         if not rows:
             continue
 
-        best = rows[0]
-        club_row = db.execute(
-            text("""
-            SELECT id, metadata
-            FROM player_data
-            WHERE id = :player_id
-            LIMIT 1
-            """),
-            {"player_id": best["id"]},
-        ).mappings().first()
-        if club_row:
+        source_payload = {
+            "name": player_name,
+            "nationality": nationality,
+            "gender": gender,
+            "age": age,
+        }
+        for best in rows:
+            club_row = db.execute(
+                text("""
+                SELECT id, metadata
+                FROM player_data
+                WHERE id = :player_id
+                LIMIT 1
+                """),
+                {"player_id": best["id"]},
+            ).mappings().first()
+            if not club_row:
+                continue
+            if not _is_safe_enterprise_club_candidate(dict(club_row["metadata"] or {}), source_payload, stage):
+                print(
+                    "[enterprise_club_resolve] "
+                    f"event=rejected_candidate stage={stage} wc_player_id={player_id!r} "
+                    f"candidate_id={club_row['id']!r} name={player_name!r}",
+                    flush=True,
+                )
+                continue
             print(
                 "[enterprise_club_resolve] "
                 f"event=resolved stage={stage} wc_player_id={player_id!r} club_player_id={club_row['id']!r} "
@@ -1039,6 +1055,77 @@ def _resolve_club_player_row(db: Session, player_id: str, world_cup_mode: bool) 
             return club_row
 
     raise HTTPException(status_code=404, detail="Matching club player not found")
+
+
+def _fold_identity_text(value: Any) -> str:
+    text_value = str(value or "").strip().lower()
+    text_value = unicodedata.normalize("NFKD", text_value)
+    text_value = "".join(char for char in text_value if not unicodedata.combining(char))
+    text_value = re.sub(r"[^a-z0-9]+", " ", text_value)
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def _token_set(value: Any) -> set[str]:
+    return {token for token in _fold_identity_text(value).split() if token}
+
+
+def _is_safe_enterprise_club_candidate(
+    candidate_metadata: Dict[str, Any],
+    source_payload: Dict[str, Any],
+    stage: str,
+) -> bool:
+    source_name = source_payload.get("name")
+    candidate_name = _metadata_text(candidate_metadata, "player_name", "name")
+    source_tokens = _token_set(source_name)
+    candidate_tokens = _token_set(candidate_name)
+    if not source_tokens or not candidate_tokens:
+        return False
+
+    source_name_folded = _fold_identity_text(source_name)
+    candidate_name_folded = _fold_identity_text(candidate_name)
+    full_name_match = source_name_folded == candidate_name_folded
+    token_covered = source_tokens.issubset(candidate_tokens) or candidate_tokens.issubset(source_tokens)
+    if stage.startswith("last_name") and not full_name_match:
+        source_last = next(reversed(source_name_folded.split()), "")
+        candidate_last = next(reversed(candidate_name_folded.split()), "")
+        if not source_last or source_last != candidate_last:
+            return False
+        if len(source_tokens) > 1 and len(source_tokens.intersection(candidate_tokens)) < 2:
+            return False
+    elif not (full_name_match or token_covered):
+        return False
+
+    source_team = _fold_identity_text(source_payload.get("team"))
+    candidate_team = _fold_identity_text(_metadata_text(candidate_metadata, "team_name", "team", "club"))
+    if source_team and candidate_team and source_team != candidate_team:
+        return False
+
+    source_nationality = _fold_identity_text(source_payload.get("nationality"))
+    candidate_nationality = _fold_identity_text(_metadata_text(candidate_metadata, "nationality_name", "nationality"))
+    nationality_aliases = {
+        "turkey": {"turkey", "turkiye", "turkiye"},
+        "turkiye": {"turkey", "turkiye", "turkiye"},
+    }
+    if source_nationality and candidate_nationality:
+        accepted = nationality_aliases.get(source_nationality, {source_nationality})
+        if candidate_nationality not in accepted:
+            return False
+
+    source_gender = _fold_identity_text(source_payload.get("gender"))
+    candidate_gender = _fold_identity_text(_metadata_text(candidate_metadata, "gender"))
+    if source_gender and candidate_gender and source_gender != candidate_gender:
+        return False
+
+    source_age = source_payload.get("age")
+    candidate_age = _metadata_int(candidate_metadata, "age")
+    if source_age is not None and candidate_age is not None:
+        try:
+            if abs(int(source_age) - int(candidate_age)) > 1:
+                return False
+        except (TypeError, ValueError):
+            pass
+
+    return True
 
 
 def _resolve_club_player_row_from_favorite_payload(
@@ -1075,7 +1162,30 @@ def _resolve_club_player_row_from_favorite_payload(
     if not rows:
         return None
 
-    best = rows[0]
+    source_payload = {
+        "name": payload.name,
+        "team": payload.team,
+        "nationality": payload.nationality,
+        "gender": payload.gender,
+        "age": payload.age,
+    }
+    best = next(
+        (
+            row
+            for row in rows
+            if _is_safe_enterprise_club_candidate(row.get("content") or {}, source_payload, winning_stage)
+        ),
+        None,
+    )
+    if not best:
+        print(
+            "[enterprise_favorite_save] "
+            f"event=snapshot_resolve_rejected_all stage={winning_stage} name={payload.name!r} "
+            f"team={payload.team!r} nationality={payload.nationality!r}",
+            flush=True,
+        )
+        return None
+
     player_id = str(best["id"])
     print(
         "[enterprise_favorite_save] "
@@ -1529,16 +1639,26 @@ def _resolve_enterprise_player_pool_report_club_row(db: Session, player_payload:
         if not rows:
             continue
 
-        row = db.execute(
-            text("""
-            SELECT id, metadata
-            FROM player_data
-            WHERE id = :player_id
-            LIMIT 1
-            """),
-            {"player_id": rows[0]["id"]},
-        ).mappings().first()
-        if row:
+        for candidate in rows:
+            row = db.execute(
+                text("""
+                SELECT id, metadata
+                FROM player_data
+                WHERE id = :player_id
+                LIMIT 1
+                """),
+                {"player_id": candidate["id"]},
+            ).mappings().first()
+            if not row:
+                continue
+            if not _is_safe_enterprise_club_candidate(dict(row["metadata"] or {}), player_payload, stage):
+                print(
+                    "[enterprise_player_pool_report] "
+                    f"event=club_resolve_rejected_candidate stage={stage} name={player_name!r} "
+                    f"candidate_id={row['id']!r}",
+                    flush=True,
+                )
+                continue
             return row
 
     return None
@@ -1644,16 +1764,15 @@ def _ensure_enterprise_player_pool_report_scores(
     return next_payload
 
 
-@app.post("/player-pool/report", response_model=EnterpriseScoutingReportOut)
-def create_enterprise_player_pool_report(
-    payload: EnterpriseScoutingReportIn,
-    user_id: str = Depends(require_auth),
-    accept_language: str | None = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    lang = normalize_lang(accept_language) or "en"
-    version = 7
-    player_payload = payload.model_dump(exclude_none=True)
+def _get_or_create_enterprise_player_pool_report_from_payload(
+    db: Session,
+    *,
+    user_id: str,
+    lang: str,
+    version: int,
+    player_payload: Dict[str, Any],
+    response_favorite_id: str | None = None,
+) -> EnterpriseScoutingReportOut:
     if player_payload.get("clubPlayerId") is not None:
         player_payload["club_player_id"] = player_payload.pop("clubPlayerId")
 
@@ -1669,6 +1788,7 @@ def create_enterprise_player_pool_report(
         raise HTTPException(status_code=400, detail="Player name is required")
 
     cache_key = _enterprise_player_pool_report_cache_key(player_payload)
+    outward_favorite_id = response_favorite_id or cache_key
     row = db.execute(
         text("""
         SELECT id, status, content, content_json, language, version, player_payload
@@ -1701,7 +1821,7 @@ def create_enterprise_player_pool_report(
                 row = None
             else:
                 return {
-                    "favorite_player_id": cache_key,
+                    "favorite_player_id": outward_favorite_id,
                     "status": row["status"],
                     "content": row["content"],
                     "content_json": row["content_json"],
@@ -1710,7 +1830,7 @@ def create_enterprise_player_pool_report(
                 }
         else:
             return {
-                "favorite_player_id": cache_key,
+                "favorite_player_id": outward_favorite_id,
                 "status": row["status"],
                 "content": row["content"],
                 "content_json": row["content_json"],
@@ -1764,7 +1884,7 @@ def create_enterprise_player_pool_report(
         )
         db.commit()
         return {
-            "favorite_player_id": cache_key,
+            "favorite_player_id": outward_favorite_id,
             "status": "ready",
             "content": generated["content"],
             "content_json": generated["content_json"],
@@ -1808,6 +1928,25 @@ def create_enterprise_player_pool_report(
         except Exception:
             db.rollback()
         raise HTTPException(status_code=500, detail="Report generation failed") from exc
+
+
+@app.post("/player-pool/report", response_model=EnterpriseScoutingReportOut)
+def create_enterprise_player_pool_report(
+    payload: EnterpriseScoutingReportIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    lang = normalize_lang(accept_language) or "en"
+    version = 7
+    player_payload = payload.model_dump(exclude_none=True)
+    return _get_or_create_enterprise_player_pool_report_from_payload(
+        db,
+        user_id=user_id,
+        lang=lang,
+        version=version,
+        player_payload=player_payload,
+    )
 
 
 @app.post("/favorite-players/{favorite_id}/report", response_model=EnterpriseScoutingReportOut)
@@ -1888,89 +2027,14 @@ def get_or_create_enterprise_scouting_report(
     else:
         player_payload = _ensure_enterprise_player_pool_report_scores(db, player_payload)
 
-    row = db.execute(
-        text(
-            """
-            SELECT id, status, content, content_json, language, version
-            FROM enterprise_scouting_reports
-            WHERE user_id = :user_id
-              AND favorite_player_id = :favorite_id
-              AND COALESCE(language, 'en') = :lang
-              AND version = :version
-            LIMIT 1
-            """
-        ),
-        {"user_id": user_id, "favorite_id": favorite_id, "lang": lang, "version": version},
-    ).mappings().first()
-
-    if row:
-        if row["status"] == "failed":
-            db.execute(text("DELETE FROM enterprise_scouting_reports WHERE id = :id"), {"id": row["id"]})
-            db.commit()
-            row = None
-        elif row["status"] == "ready":
-            content_json = row["content_json"] if isinstance(row["content_json"], dict) else {}
-            player_card = content_json.get("player_card") if isinstance(content_json, dict) else {}
-            player_card = player_card if isinstance(player_card, dict) else {}
-            missing_requested_score = any(
-                player_payload.get(score_key) is not None and player_card.get(score_key) is None
-                for score_key in ("potential", "form")
-            )
-            if missing_requested_score:
-                db.execute(text("DELETE FROM enterprise_scouting_reports WHERE id = :id"), {"id": row["id"]})
-                db.commit()
-                row = None
-            else:
-                return {
-                    "favorite_player_id": favorite_id,
-                    "status": row["status"],
-                    "content": row["content"],
-                    "content_json": row["content_json"],
-                    "language": row["language"],
-                    "version": row["version"],
-                }
-        else:
-            return {
-                "favorite_player_id": favorite_id,
-                "status": row["status"],
-                "content": row["content"],
-                "content_json": row["content_json"],
-                "language": row["language"],
-                "version": row["version"],
-            }
-
-    report_id = str(uuid.uuid4())
-    db.execute(
-        text(
-            """
-            INSERT INTO enterprise_scouting_reports (
-                id, user_id, favorite_player_id, status, language, version, created_at, updated_at
-            )
-            VALUES (:id, :user_id, :favorite_id, 'processing', :lang, :version, NOW(), NOW())
-            """
-        ),
-        {"id": report_id, "user_id": user_id, "favorite_id": favorite_id, "lang": lang, "version": version},
+    return _get_or_create_enterprise_player_pool_report_from_payload(
+        db,
+        user_id=user_id,
+        lang=lang,
+        version=version,
+        player_payload=player_payload,
+        response_favorite_id=favorite_id,
     )
-    db.commit()
-
-    background_tasks.add_task(
-        _generate_enterprise_report_background,
-        report_id,
-        favorite_id,
-        user_id,
-        lang,
-        version,
-        player_payload,
-    )
-
-    return {
-        "favorite_player_id": favorite_id,
-        "status": "processing",
-        "content": None,
-        "content_json": None,
-        "language": lang,
-        "version": version,
-    }
 
 
 @app.delete("/favorite-players/{favorite_id}", status_code=status.HTTP_204_NO_CONTENT)
