@@ -65,7 +65,7 @@ Final scoring consistency rules:
 
 Role-based metric emphasis:
 - Wingers/forwards: emphasize attacking in-possession metrics such as:
-  Shots Total, Shots On Target, Shots On Target (%), Shots Off Target, Big Chances Created,
+  Shots Total, Shots On Target, Shots On Target (%), Expected Goals, Expected Goals On Target, Shooting Performance, Shot Quality (%), On-Target Shot Quality (%), Goal Conversion (%), On-Target to Goal Conversion (%), Assist Efficiency (%), Dribble Accuracy (%), Shots Off Target, Big Chances Created,
   Big Chances Missed, Goals, Assists,
   Key Passes, Chances Created, Passes, Passes In Final Third,
   Accurate Passes, Accurate Passes (%),
@@ -141,7 +141,7 @@ Final scoring consistency rules:
 
 Role-based metric emphasis:
 - Wingers/forwards: emphasize attacking in-possession metrics such as:
-  Shots Total, Shots On Target, Shots On Target (%), Shots Off Target, Big Chances Created,
+  Shots Total, Shots On Target, Shots On Target (%), Expected Goals, Expected Goals On Target, Shooting Performance, Shot Quality (%), On-Target Shot Quality (%), Goal Conversion (%), On-Target to Goal Conversion (%), Assist Efficiency (%), Dribble Accuracy (%), Shots Off Target, Big Chances Created,
   Big Chances Missed, Goals, Assists,
   Key Passes, Chances Created, Passes, Passes In Final Third,
   Accurate Passes, Accurate Passes (%),

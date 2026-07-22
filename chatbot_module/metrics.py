@@ -1,11 +1,11 @@
 ALLOWED_METRICS = {
     "Duels Won", "Clearances", "Chances Created", "Accurate Crosses", "Clearance Offline",
     "Ball Recovery", "Saves Insidebox", "Man Of Match", "Penalties Committed",
-    "Dispossessed", "Fouls", "Goals Conceded", "Shots On Target", "Shots On Target (%)",
+    "Dispossessed", "Fouls", "Goals Conceded", "Shots On Target", "Shots On Target (%)", "Expected Goals", "Expected Goals On Target", "Shooting Performance", "Shot Quality (%)", "On-Target Shot Quality (%)", "Goal Conversion (%)", "On-Target to Goal Conversion (%)",
     "Accurate Passes", "Penalties Scored", "Tackles Won", "Aerials Won (%)",
     "Through Balls", "Offsides Provoked", "Penalties Missed", "Good High Claim",
     "Big Chances Created", "Penalties Won", "Dribbled Past", "Punches", "Yellow Cards",
-    "Assists", "Blocked Shots", "Backward Passes", "Hit Woodwork", "Shots Total",
+    "Assists", "Assist Efficiency (%)", "Blocked Shots", "Backward Passes", "Hit Woodwork", "Shots Total",
     "Shots Blocked", "Dribble Attempts", "Penalties Saved", "Long Balls Won (%)",
     "Long Balls Won", "Long Balls", "Tackles", "Aerials", "Offsides", "Possession Lost",
     "Successful Dribbles", "Goalkeeper Goals Conceded", "Total Crosses", "Total Duels",
@@ -15,19 +15,19 @@ ALLOWED_METRICS = {
     "Last Man Tackle", "Shots Off Target", "Interceptions", "Turn Over",
     "Tackles Won (%)", "Aerials Lost", "Duels Won (%)", "Red Cards", "Captain",
     "Passes In Final Third", "Rating", "Fouls Drawn", "Error Lead To Shot",
-    "Through Balls Won",
+    "Through Balls Won", "Dribble Accuracy (%)",
 }
 
 POSITIVE_METRICS = {
     "Duels Won", "Clearances", "Chances Created", "Accurate Crosses", "Ball Recovery",
-    "Saves Insidebox", "Man Of Match", "Shots On Target", "Shots On Target (%)",
+    "Saves Insidebox", "Man Of Match", "Shots On Target", "Shots On Target (%)", "Expected Goals", "Expected Goals On Target", "Shooting Performance", "Shot Quality (%)", "On-Target Shot Quality (%)", "Goal Conversion (%)", "On-Target to Goal Conversion (%)",
     "Accurate Passes", "Penalties Scored", "Tackles Won", "Aerials Won (%)",
     "Through Balls", "Offsides Provoked", "Good High Claim", "Big Chances Created", "Penalties Won",
-    "Assists", "Blocked Shots", "Hit Woodwork", "Shots Total", "Dribble Attempts",
+    "Assists", "Assist Efficiency (%)", "Blocked Shots", "Hit Woodwork", "Shots Total", "Dribble Attempts",
     "Penalties Saved", "Punches", "Long Balls Won (%)", "Long Balls Won", "Long Balls", "Tackles",
     "Aerials", "Successful Dribbles", "Total Crosses", "Total Duels", "Saves",
     "Successful Crosses (%)", "Key Passes", "Minutes Played", "Accurate Passes (%)",
     "Aerials Won", "Goals", "Touches", "Passes", "Last Man Tackle",
     "Interceptions", "Tackles Won (%)", "Duels Won (%)", "Passes In Final Third",
-    "Rating", "Fouls Drawn", "Clearance Offline", "Through Balls Won",
+    "Rating", "Fouls Drawn", "Clearance Offline", "Through Balls Won", "Dribble Accuracy (%)",
 }

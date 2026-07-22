@@ -1469,7 +1469,13 @@ def _resolve_enterprise_player_pool_report_club_row(db: Session, player_payload:
             """),
             {"player_id": club_player_id},
         ).mappings().first()
-        return row
+        if row:
+            return row
+        print(
+            "[enterprise_player_pool_report] "
+            f"event=club_id_stale club_player_id={club_player_id!r} name={player_payload.get('name')!r}",
+            flush=True,
+        )
 
     player_id = player_payload.get("playerId") or player_payload.get("player_id")
     world_cup_mode = bool(player_payload.get("worldCupMode") or player_payload.get("world_cup_mode"))
@@ -1480,10 +1486,11 @@ def _resolve_enterprise_player_pool_report_club_row(db: Session, player_payload:
         except HTTPException:
             if world_cup_mode:
                 raise
-            return None
-
-    if not world_cup_mode:
-        return None
+            print(
+                "[enterprise_player_pool_report] "
+                f"event=player_id_stale player_id={player_id!r} name={player_payload.get('name')!r}",
+                flush=True,
+            )
 
     player_name = str(player_payload.get("name") or "").strip()
     if not player_name:
@@ -1645,7 +1652,7 @@ def create_enterprise_player_pool_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 6
+    version = 7
     player_payload = payload.model_dump(exclude_none=True)
     if player_payload.get("clubPlayerId") is not None:
         player_payload["club_player_id"] = player_payload.pop("clubPlayerId")
@@ -1813,7 +1820,7 @@ def get_or_create_enterprise_scouting_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 6
+    version = 7
 
     favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
     player_payload = _enterprise_favorite_identity(favorite_row)
@@ -1821,6 +1828,65 @@ def get_or_create_enterprise_scouting_report(
     if incoming_payload.get("clubPlayerId") is not None:
         incoming_payload["club_player_id"] = incoming_payload.pop("clubPlayerId")
     player_payload.update(incoming_payload)
+
+    club_row = _resolve_enterprise_player_pool_report_club_row(db, player_payload)
+    if club_row is not None:
+        player_payload = _apply_enterprise_club_row_to_report_payload(db, player_payload, club_row)
+        try:
+            favorite_values = _favorite_values_from_club_row(
+                club_row,
+                player_payload.get("potential"),
+                player_payload.get("form"),
+            )
+            db.execute(
+                text("""
+                UPDATE enterprise_favorite_players
+                SET player_id = :player_id,
+                    player_name = :player_name,
+                    club_player_id = :club_player_id,
+                    name = :name,
+                    nationality = :nationality,
+                    age = :age,
+                    potential = :potential,
+                    form = :form,
+                    gender = :gender,
+                    height = :height,
+                    weight = :weight,
+                    team = :team,
+                    league = :league,
+                    roles_json = CAST(:roles_json AS jsonb)
+                WHERE id = :id
+                  AND user_id = :user_id
+                """),
+                {
+                    "id": favorite_id,
+                    "user_id": user_id,
+                    "player_id": str(favorite_values["club_player_id"]) if favorite_values["club_player_id"] is not None else None,
+                    "player_name": favorite_values["name"],
+                    "club_player_id": favorite_values["club_player_id"],
+                    "name": favorite_values["name"],
+                    "nationality": favorite_values["nationality"],
+                    "age": favorite_values["age"],
+                    "potential": favorite_values["potential"],
+                    "form": favorite_values["form"],
+                    "gender": favorite_values["gender"],
+                    "height": favorite_values["height"],
+                    "weight": favorite_values["weight"],
+                    "team": favorite_values["team"],
+                    "league": favorite_values["league"],
+                    "roles_json": json.dumps(favorite_values["roles"], ensure_ascii=False),
+                },
+            )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            print(
+                "[enterprise_report] "
+                f"event=favorite_refresh_failed favorite_id={favorite_id} error={exc}",
+                flush=True,
+            )
+    else:
+        player_payload = _ensure_enterprise_player_pool_report_scores(db, player_payload)
 
     row = db.execute(
         text(

@@ -126,11 +126,11 @@ NEGATIVE_METRICS = {
 
 ROLE_METRICS = {
     "attacker": {
-        "Shots Total", "Shots On Target", "Shots On Target (%)", "Shots Off Target",
+        "Shots Total", "Shots On Target", "Shots On Target (%)", "Expected Goals", "Expected Goals On Target", "Shooting Performance", "Shot Quality (%)", "On-Target Shot Quality (%)", "Goal Conversion (%)", "On-Target to Goal Conversion (%)", "Shots Off Target",
         "Big Chances Created", "Goals", "Assists", "Key Passes", "Chances Created",
         "Passes In Final Third", "Accurate Passes", "Accurate Passes (%)",
         "Total Crosses", "Accurate Crosses", "Successful Crosses (%)",
-        "Dribble Attempts", "Successful Dribbles", "Hit Woodwork",
+        "Dribble Attempts", "Successful Dribbles", "Dribble Accuracy (%)", "Hit Woodwork",
     },
     "midfielder": {
         "Passes", "Key Passes", "Chances Created", "Dribble Attempts",
@@ -805,9 +805,9 @@ def infer_excluded_constraints_from_text(*texts: Optional[str]) -> Dict[str, Lis
 
 STAT_PREFERENCE_PATTERNS: List[Tuple[str, List[str]]] = [
     (r"\b(pass|passing|build.?up|distribution|playmaker|tempo)\b", ["Passes", "Accurate Passes", "Key Passes", "Passes In Final Third"]),
-    (r"\b(creativ|chance|vision|final ball)\b", ["Chances Created", "Big Chances Created", "Key Passes", "Assists"]),
-    (r"\b(shoot|shot|finishing|finish|scor|goal)\b", ["Goals", "Shots On Target", "Shots Total", "Big Chances Created"]),
-    (r"\b(dribbl|carry|take.?on|1v1)\b", ["Successful Dribbles", "Dribble Attempts", "Dispossessed"]),
+    (r"\b(creativ|chance|vision|final ball|assist)\b", ["Chances Created", "Big Chances Created", "Key Passes", "Assists", "Assist Efficiency (%)"]),
+    (r"\b(shoot|shot|finishing|finish|scor|goal|xg|expected)\b", ["Goals", "Expected Goals", "Expected Goals On Target", "Shooting Performance", "Shot Quality (%)", "On-Target Shot Quality (%)", "Goal Conversion (%)", "On-Target to Goal Conversion (%)", "Shots On Target", "Shots Total", "Big Chances Created"]),
+    (r"\b(dribbl|carry|take.?on|1v1)\b", ["Successful Dribbles", "Dribble Attempts", "Dribble Accuracy (%)", "Dispossessed"]),
     (r"\b(cross|crossing|wide delivery)\b", ["Accurate Crosses", "Total Crosses", "Successful Crosses (%)"]),
     (r"\b(defend|tackl|ball.?win|press|intercept)\b", ["Tackles", "Tackles Won", "Interceptions", "Ball Recovery"]),
     (r"\b(aerial|header|duel|physical)\b", ["Aerials Won", "Aerials Won (%)", "Duels Won", "Total Duels"]),
@@ -2010,10 +2010,34 @@ def _num(value: Any) -> Optional[float]:
         return None
 
 
+DERIVED_STAT_FORMULAS = {
+    "Shot Quality (%)": ("Expected Goals", "Shots Total"),
+    "On-Target Shot Quality (%)": ("Expected Goals On Target", "Shots On Target"),
+    "Goal Conversion (%)": ("Goals", "Shots Total"),
+    "On-Target to Goal Conversion (%)": ("Goals", "Shots On Target"),
+    "Assist Efficiency (%)": ("Assists", "Key Passes"),
+    "Dribble Accuracy (%)": ("Successful Dribbles", "Dribble Attempts"),
+}
+
+
+def _derived_stat_value(metric: str, metadata: Dict[str, Any]) -> Optional[float]:
+    formula = DERIVED_STAT_FORMULAS.get(metric)
+    if not formula:
+        return None
+    numerator_key, denominator_key = formula
+    numerator = _num((metadata or {}).get(numerator_key))
+    denominator = _num((metadata or {}).get(denominator_key))
+    if numerator is None or denominator is None or abs(denominator) <= 1e-9:
+        return None
+    return round((numerator / denominator) * 100.0, 2)
+
+
 def extract_allowed_stats_from_metadata(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
     stats = []
     for metric in ALLOWED_METRICS:
         value = _num((metadata or {}).get(metric))
+        if value is None:
+            value = _derived_stat_value(metric, metadata or {})
         if value is None:
             continue
         if abs(value) <= 0.05:
