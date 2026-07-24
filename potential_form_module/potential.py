@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 import json
+import os
 
 from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
@@ -20,7 +21,7 @@ from potential_form_module.tools import (
 load_dotenv()
 
 CHAT_LLM = ChatDeepSeek(
-    model="deepseek-chat",
+    model=os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-v4-flash"),
     temperature=0.3,
 )
 
