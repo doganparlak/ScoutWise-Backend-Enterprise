@@ -499,6 +499,21 @@ def verify_signup_code(
     return {"token": token, "user": user_row_to_dict(row)}
 
 
+
+
+@app.get("/auth/me", response_model=LoginOut)
+def auth_me(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text("SELECT * FROM enterprise_users WHERE id = :id"),
+        {"id": user_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return {"token": "", "user": user_row_to_dict(row)}
+
 @app.post("/auth/request_reset")
 def request_reset(
     body: PasswordResetRequestIn,

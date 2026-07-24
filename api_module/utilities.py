@@ -35,6 +35,16 @@ settings: Dict[str, Any] = {
 IMG_TAG = re.compile(r'<img[^>]+src="([^"]+)"[^>]*>', re.IGNORECASE)
 HTMLY_RE = re.compile(r'</?(table|thead|tbody|tr|td|th|ul|ol|li|div|p|h[1-6]|span)\b', re.IGNORECASE)
 
+REPORT_PARTNER_LOGOS_BY_EMAIL = {
+    "saltfutbol90@gmail.com": "/saltfutbol-logo.png",
+}
+
+
+def get_report_partner_logo(email: Optional[str]) -> Optional[str]:
+    if not email:
+        return None
+    return REPORT_PARTNER_LOGOS_BY_EMAIL.get(email.strip().lower())
+
 def normalize_lang(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -183,11 +193,13 @@ def verify_pw(password: str, password_hash: str) -> bool:
 
 def user_row_to_dict(row: Any) -> dict:
     data = row._mapping if hasattr(row, "_mapping") else row
+    email = data["email"]
     return {
         "id": str(data["id"]),
-        "email": data["email"],
+        "email": email,
         "uiLanguage": data.get("ui_language") or "tr",
         "isEmailVerified": bool(data.get("is_email_verified")),
+        "reportPartnerLogo": get_report_partner_logo(email),
         "createdAt": data.get("created_at").isoformat()
         if data.get("created_at") is not None
         else None,
