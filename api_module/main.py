@@ -319,9 +319,70 @@ def _dashboard_note_out(row: Any) -> EnterpriseDashboardNoteOut:
 
 def _dashboard_report_out(row: Any) -> EnterpriseDashboardReportOut:
     data = row._mapping if hasattr(row, "_mapping") else row
+    player_payload = data.get("player_payload") if hasattr(data, "get") else None
+    if isinstance(player_payload, str):
+        try:
+            player_payload = json.loads(player_payload)
+        except Exception:
+            player_payload = {}
+    player_payload = player_payload if isinstance(player_payload, dict) else {}
+    content_json = data.get("content_json") if hasattr(data, "get") else None
+    if isinstance(content_json, str):
+        try:
+            content_json = json.loads(content_json)
+        except Exception:
+            content_json = {}
+    content_json = content_json if isinstance(content_json, dict) else {}
+    player_card = content_json.get("player_card")
+    player_card = player_card if isinstance(player_card, dict) else {}
+
+    position_counts = (
+        player_payload.get("positionCounts")
+        or player_payload.get("position_counts")
+        or player_card.get("position_counts")
+        or player_card.get("positionCounts")
+        or {}
+    )
+    position_counts = position_counts if isinstance(position_counts, dict) else {}
+    position_names_seen = (
+        player_payload.get("positionNamesSeen")
+        or player_payload.get("position_names_seen")
+        or player_card.get("position_names_seen")
+        or player_card.get("positionNamesSeen")
+        or []
+    )
+    position_names_seen = position_names_seen if isinstance(position_names_seen, list) else []
+    roles = player_payload.get("roles") or player_card.get("roles") or []
+    roles = roles if isinstance(roles, list) else []
     return EnterpriseDashboardReportOut(
         id=str(data["id"]),
-        playerName=data.get("player_name"),
+        playerName=data.get("player_name") or player_payload.get("name") or player_card.get("name"),
+        playerTeam=player_payload.get("team") or player_card.get("team"),
+        team=player_payload.get("team") or player_card.get("team"),
+        league=player_payload.get("league") or player_card.get("league"),
+        nationality=player_payload.get("nationality") or player_card.get("nationality") or player_card.get("country"),
+        age=player_payload.get("age") or player_card.get("age"),
+        gender=player_payload.get("gender") or player_card.get("gender"),
+        height=player_payload.get("height") or player_card.get("height"),
+        weight=player_payload.get("weight") or player_card.get("weight"),
+        potential=player_payload.get("potential") or player_card.get("potential"),
+        form=player_payload.get("form") or player_card.get("form"),
+        roles=roles,
+        positionCounts=position_counts,
+        positionCountTotal=(
+            player_payload.get("positionCountTotal")
+            or player_payload.get("position_count_total")
+            or player_card.get("position_count_total")
+            or player_card.get("positionCountTotal")
+            or 0
+        ),
+        positionNamesSeen=position_names_seen,
+        primaryPositionCode=(
+            player_payload.get("primaryPositionCode")
+            or player_payload.get("primary_position_code")
+            or player_card.get("primary_position_code")
+            or player_card.get("primaryPositionCode")
+        ),
         status=data["status"],
         language=data.get("language") or "en",
         version=int(data.get("version") or 1),
@@ -436,7 +497,7 @@ def list_enterprise_dashboard_reports(
     rows = db.execute(
         text(
             """
-            SELECT id, player_name, status, language, version, ready_at, created_at, updated_at
+            SELECT id, player_name, player_payload, content_json, status, language, version, ready_at, created_at, updated_at
             FROM enterprise_player_pool_scouting_reports
             WHERE user_id = :user_id
             ORDER BY updated_at DESC
@@ -446,6 +507,36 @@ def list_enterprise_dashboard_reports(
         {"user_id": user_id, "limit": limit},
     ).fetchall()
     return [_dashboard_report_out(row) for row in rows]
+
+
+@app.get("/dashboard/reports/{report_id}", response_model=EnterpriseScoutingReportOut)
+def get_enterprise_dashboard_report(
+    report_id: str,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT id, cache_key, status, content, content_json, language, version
+            FROM enterprise_player_pool_scouting_reports
+            WHERE id = :report_id
+              AND user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"report_id": report_id, "user_id": user_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {
+        "favorite_player_id": str(row.get("cache_key") or row["id"]),
+        "status": row["status"],
+        "content": row["content"],
+        "content_json": row["content_json"],
+        "language": row.get("language") or "en",
+        "version": int(row.get("version") or 1),
+    }
 
 
 @app.get("/pro/strategy", response_model=EnterpriseProStrategyOut)

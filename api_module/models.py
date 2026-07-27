@@ -259,6 +259,21 @@ class EnterpriseDashboardNoteOut(BaseModel):
 class EnterpriseDashboardReportOut(BaseModel):
     id: str
     playerName: Optional[str] = None
+    playerTeam: Optional[str] = None
+    team: Optional[str] = None
+    league: Optional[str] = None
+    nationality: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    potential: Optional[int] = None
+    form: Optional[int] = None
+    roles: List[str] = Field(default_factory=list)
+    positionCounts: Dict[str, int] = Field(default_factory=dict)
+    positionCountTotal: int = 0
+    positionNamesSeen: List[str] = Field(default_factory=list)
+    primaryPositionCode: Optional[str] = None
     status: str
     language: str
     version: int
