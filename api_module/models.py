@@ -239,12 +239,50 @@ class EnterpriseTacticBoardOut(EnterpriseTacticBoardIn):
     updatedAt: str
 
 
+class EnterpriseDashboardNoteIn(BaseModel):
+    text: str = Field(min_length=1, max_length=600)
+
+
+class EnterpriseDashboardNotePatchIn(BaseModel):
+    text: Optional[str] = Field(default=None, min_length=1, max_length=600)
+    isDone: Optional[bool] = None
+
+
+class EnterpriseDashboardNoteOut(BaseModel):
+    id: str
+    text: str
+    isDone: bool
+    createdAt: str
+    updatedAt: str
+
+
+class EnterpriseDashboardReportOut(BaseModel):
+    id: str
+    playerName: Optional[str] = None
+    status: str
+    language: str
+    version: int
+    createdAt: str
+    updatedAt: str
+    readyAt: Optional[str] = None
+
+
 class EnterpriseProStrategyIn(BaseModel):
     strategy: str = Field(default="", max_length=6000)
 
 
 class EnterpriseProStrategyOut(EnterpriseProStrategyIn):
     updatedAt: Optional[str] = None
+
+
+class EnterpriseProStrategySavedIn(EnterpriseProStrategyIn):
+    strategyName: str = Field(default="Default Strategy", min_length=1, max_length=120)
+
+
+class EnterpriseProStrategySavedOut(EnterpriseProStrategySavedIn):
+    id: str
+    createdAt: str
+    updatedAt: str
 
 
 class EnterpriseProChatIn(BaseModel):

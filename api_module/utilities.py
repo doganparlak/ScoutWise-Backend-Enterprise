@@ -37,6 +37,8 @@ HTMLY_RE = re.compile(r'</?(table|thead|tbody|tr|td|th|ul|ol|li|div|p|h[1-6]|spa
 
 REPORT_PARTNER_LOGOS_BY_EMAIL = {
     "saltfutbol90@gmail.com": "/saltfutbol-logo.png",
+    "berkbekgoz1@gmail.com": "/berk_bekgoz_logo.png",
+    "dgnprlk@gmail.com": "/berk_bekgoz_logo.png",
 }
 
 

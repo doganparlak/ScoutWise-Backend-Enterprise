@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api_module.models import EnterpriseProChatIn, EnterpriseProStrategyIn, EnterpriseProStrategyOut
+from api_module.models import EnterpriseProChatIn, EnterpriseProStrategyIn, EnterpriseProStrategyOut, EnterpriseProStrategySavedIn, EnterpriseProStrategySavedOut
 from api_module.utilities import (
     delete_chat_messages,
     normalize_lang,
@@ -38,7 +38,7 @@ def get_strategy(db: Session, user_id: str) -> EnterpriseProStrategyOut:
         text(
             """
             SELECT strategy, updated_at
-            FROM enterprise_pro_strategies
+            FROM enterprise_pro_active_strategies
             WHERE user_id = :user_id
             LIMIT 1
             """
@@ -57,7 +57,7 @@ def save_strategy(db: Session, user_id: str, payload: EnterpriseProStrategyIn) -
     row = db.execute(
         text(
             """
-            INSERT INTO enterprise_pro_strategies (user_id, strategy, created_at, updated_at)
+            INSERT INTO enterprise_pro_active_strategies (user_id, strategy, created_at, updated_at)
             VALUES (:user_id, :strategy, NOW(), NOW())
             ON CONFLICT (user_id) DO UPDATE
             SET strategy = EXCLUDED.strategy,
@@ -72,6 +72,68 @@ def save_strategy(db: Session, user_id: str, payload: EnterpriseProStrategyIn) -
         strategy=row["strategy"] or "",
         updatedAt=row["updated_at"].isoformat() if row["updated_at"] else None,
     )
+
+
+def _strategy_saved_out(row: Dict[str, Any]) -> EnterpriseProStrategySavedOut:
+    return EnterpriseProStrategySavedOut(
+        id=str(row["id"]),
+        strategyName=row["strategy_name"] or "Default Strategy",
+        strategy=row["strategy"] or "",
+        createdAt=row["created_at"].isoformat() if row["created_at"] else "",
+        updatedAt=row["updated_at"].isoformat() if row["updated_at"] else "",
+    )
+
+
+def list_strategies(db: Session, user_id: str) -> list[EnterpriseProStrategySavedOut]:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, strategy_name, strategy, created_at, updated_at
+            FROM enterprise_pro_strategies
+            WHERE user_id = :user_id
+            ORDER BY updated_at DESC
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().all()
+    return [_strategy_saved_out(row) for row in rows]
+
+
+def save_named_strategy(db: Session, user_id: str, payload: EnterpriseProStrategySavedIn) -> EnterpriseProStrategySavedOut:
+    row = db.execute(
+        text(
+            """
+            INSERT INTO enterprise_pro_strategies (user_id, strategy_name, strategy, created_at, updated_at)
+            VALUES (:user_id, :strategy_name, :strategy, NOW(), NOW())
+            ON CONFLICT (user_id, lower(strategy_name)) DO UPDATE
+            SET strategy = EXCLUDED.strategy,
+                updated_at = NOW()
+            RETURNING id, strategy_name, strategy, created_at, updated_at
+            """
+        ),
+        {
+            "user_id": user_id,
+            "strategy_name": payload.strategyName.strip() or "Default Strategy",
+            "strategy": payload.strategy.strip(),
+        },
+    ).mappings().first()
+    db.commit()
+    return _strategy_saved_out(row)
+
+
+def delete_named_strategy(db: Session, user_id: str, strategy_id: str) -> None:
+    result = db.execute(
+        text(
+            """
+            DELETE FROM enterprise_pro_strategies
+            WHERE user_id = :user_id AND id = :strategy_id
+            """
+        ),
+        {"user_id": user_id, "strategy_id": strategy_id},
+    )
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Strategy not found")
 
 
 def ensure_chat_session(db: Session, *, token: str, user_id: str, lang: str) -> None:

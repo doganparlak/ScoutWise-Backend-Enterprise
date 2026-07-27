@@ -24,6 +24,10 @@ from api_module.models import (
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
     EnterpriseAllowlistEmailIn,
+    EnterpriseDashboardNoteIn,
+    EnterpriseDashboardNoteOut,
+    EnterpriseDashboardNotePatchIn,
+    EnterpriseDashboardReportOut,
     EnterpriseLineupIn,
     EnterpriseLineupOut,
     EnterpriseTacticBoardIn,
@@ -31,6 +35,8 @@ from api_module.models import (
     EnterpriseProChatIn,
     EnterpriseProStrategyIn,
     EnterpriseProStrategyOut,
+    EnterpriseProStrategySavedIn,
+    EnterpriseProStrategySavedOut,
     EnterpriseScoutingReportIn,
     EnterpriseScoutingReportOut,
     PasswordResetRequestIn,
@@ -68,8 +74,11 @@ from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 from report_module.report import generate_report_content
 from scoutwise_pro_module.pro import (
+    delete_named_strategy,
     get_strategy,
+    list_strategies,
     reset_chat_session,
+    save_named_strategy,
     save_strategy,
     send_chat,
     user_session_token,
@@ -265,6 +274,28 @@ def ensure_enterprise_sessions_table() -> None:
                 """
             )
         )
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS public.enterprise_dashboard_notes (
+                  id UUID PRIMARY KEY,
+                  user_id UUID NOT NULL REFERENCES public.enterprise_users(id) ON DELETE CASCADE,
+                  text TEXT NOT NULL,
+                  is_done BOOLEAN NOT NULL DEFAULT FALSE,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        )
+        db.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_enterprise_dashboard_notes_user
+                ON public.enterprise_dashboard_notes (user_id, created_at DESC)
+                """
+            )
+        )
         db.commit()
     finally:
         db.close()
@@ -273,6 +304,148 @@ def ensure_enterprise_sessions_table() -> None:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {"ok": True}
+
+
+def _dashboard_note_out(row: Any) -> EnterpriseDashboardNoteOut:
+    data = row._mapping if hasattr(row, "_mapping") else row
+    return EnterpriseDashboardNoteOut(
+        id=str(data["id"]),
+        text=data["text"],
+        isDone=bool(data["is_done"]),
+        createdAt=data["created_at"].isoformat() if hasattr(data["created_at"], "isoformat") else str(data["created_at"]),
+        updatedAt=data["updated_at"].isoformat() if hasattr(data["updated_at"], "isoformat") else str(data["updated_at"]),
+    )
+
+
+def _dashboard_report_out(row: Any) -> EnterpriseDashboardReportOut:
+    data = row._mapping if hasattr(row, "_mapping") else row
+    return EnterpriseDashboardReportOut(
+        id=str(data["id"]),
+        playerName=data.get("player_name"),
+        status=data["status"],
+        language=data.get("language") or "en",
+        version=int(data.get("version") or 1),
+        createdAt=data["created_at"].isoformat() if hasattr(data["created_at"], "isoformat") else str(data["created_at"]),
+        updatedAt=data["updated_at"].isoformat() if hasattr(data["updated_at"], "isoformat") else str(data["updated_at"]),
+        readyAt=(data["ready_at"].isoformat() if data.get("ready_at") is not None and hasattr(data["ready_at"], "isoformat") else (str(data["ready_at"]) if data.get("ready_at") is not None else None)),
+    )
+
+
+@app.get("/dashboard/notes", response_model=list[EnterpriseDashboardNoteOut])
+def list_enterprise_dashboard_notes(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, text, is_done, created_at, updated_at
+            FROM enterprise_dashboard_notes
+            WHERE user_id = :user_id
+            ORDER BY created_at DESC
+            """
+        ),
+        {"user_id": user_id},
+    ).fetchall()
+    return [_dashboard_note_out(row) for row in rows]
+
+
+@app.post("/dashboard/notes", response_model=EnterpriseDashboardNoteOut)
+def create_enterprise_dashboard_note(
+    payload: EnterpriseDashboardNoteIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    note_id = str(uuid.uuid4())
+    row = db.execute(
+        text(
+            """
+            INSERT INTO enterprise_dashboard_notes (id, user_id, text)
+            VALUES (:id, :user_id, :text)
+            RETURNING id, text, is_done, created_at, updated_at
+            """
+        ),
+        {"id": note_id, "user_id": user_id, "text": payload.text.strip()},
+    ).fetchone()
+    db.commit()
+    return _dashboard_note_out(row)
+
+
+@app.patch("/dashboard/notes/{note_id}", response_model=EnterpriseDashboardNoteOut)
+def update_enterprise_dashboard_note(
+    note_id: str,
+    payload: EnterpriseDashboardNotePatchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    existing = db.execute(
+        text("SELECT id FROM enterprise_dashboard_notes WHERE id = :id AND user_id = :user_id"),
+        {"id": note_id, "user_id": user_id},
+    ).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    updates: Dict[str, Any] = {}
+    if payload.text is not None:
+        updates["text"] = payload.text.strip()
+    if payload.isDone is not None:
+        updates["is_done"] = payload.isDone
+    if not updates:
+        row = db.execute(
+            text("SELECT id, text, is_done, created_at, updated_at FROM enterprise_dashboard_notes WHERE id = :id"),
+            {"id": note_id},
+        ).fetchone()
+        return _dashboard_note_out(row)
+
+    set_sql = ", ".join(f"{key} = :{key}" for key in updates)
+    row = db.execute(
+        text(
+            f"""
+            UPDATE enterprise_dashboard_notes
+            SET {set_sql}, updated_at = NOW()
+            WHERE id = :id AND user_id = :user_id
+            RETURNING id, text, is_done, created_at, updated_at
+            """
+        ),
+        {**updates, "id": note_id, "user_id": user_id},
+    ).fetchone()
+    db.commit()
+    return _dashboard_note_out(row)
+
+
+@app.delete("/dashboard/notes/{note_id}", status_code=204)
+def delete_enterprise_dashboard_note(
+    note_id: str,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    db.execute(
+        text("DELETE FROM enterprise_dashboard_notes WHERE id = :id AND user_id = :user_id"),
+        {"id": note_id, "user_id": user_id},
+    )
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.get("/dashboard/reports", response_model=list[EnterpriseDashboardReportOut])
+def list_enterprise_dashboard_reports(
+    limit: int = FastAPIQuery(default=12, ge=1, le=50),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, player_name, status, language, version, ready_at, created_at, updated_at
+            FROM enterprise_player_pool_scouting_reports
+            WHERE user_id = :user_id
+            ORDER BY updated_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"user_id": user_id, "limit": limit},
+    ).fetchall()
+    return [_dashboard_report_out(row) for row in rows]
 
 
 @app.get("/pro/strategy", response_model=EnterpriseProStrategyOut)
@@ -290,6 +463,33 @@ def pro_strategy_put(
     db: Session = Depends(get_db),
 ):
     return save_strategy(db, user_id, payload)
+
+
+@app.get("/pro/strategies", response_model=list[EnterpriseProStrategySavedOut])
+def pro_strategies_list(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return list_strategies(db, user_id)
+
+
+@app.post("/pro/strategies", response_model=EnterpriseProStrategySavedOut)
+def pro_strategies_save(
+    payload: EnterpriseProStrategySavedIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return save_named_strategy(db, user_id, payload)
+
+
+@app.delete("/pro/strategies/{strategy_id}")
+def pro_strategies_delete(
+    strategy_id: str,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    delete_named_strategy(db, user_id, strategy_id)
+    return Response(status_code=204)
 
 
 @app.post("/pro/chat")
