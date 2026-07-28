@@ -28,8 +28,6 @@ from api_module.models import (
     EnterpriseDashboardNoteOut,
     EnterpriseDashboardNotePatchIn,
     EnterpriseDashboardReportOut,
-    EnterpriseLineupIn,
-    EnterpriseLineupOut,
     EnterpriseTacticBoardIn,
     EnterpriseTacticBoardOut,
     EnterpriseProChatIn,
@@ -68,7 +66,6 @@ from api_module.utilities import (
 from player_pool_module.player_pool import get_player_pool_filter_options, search_players
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison
-from lineup_module.lineup import create_lineup, delete_lineup, list_lineups, update_lineup
 from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
@@ -1668,42 +1665,6 @@ def player_pool_options(
 ):
     del user_id
     return get_player_pool_filter_options(db, worldCupMode)
-
-
-@app.get("/lineups", response_model=list[EnterpriseLineupOut])
-def list_enterprise_lineups(
-    user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    return list_lineups(db, user_id)
-
-
-@app.post("/lineups", response_model=EnterpriseLineupOut)
-def create_enterprise_lineup(
-    payload: EnterpriseLineupIn,
-    user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    return create_lineup(db, user_id, payload)
-
-
-@app.patch("/lineups/{lineup_id}", response_model=EnterpriseLineupOut)
-def update_enterprise_lineup(
-    lineup_id: str,
-    payload: EnterpriseLineupIn,
-    user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    return update_lineup(db, user_id, lineup_id, payload)
-
-
-@app.delete("/lineups/{lineup_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_enterprise_lineup(
-    lineup_id: str,
-    user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    return delete_lineup(db, user_id, lineup_id)
 
 
 @app.get("/tactic-boards", response_model=list[EnterpriseTacticBoardOut])
