@@ -1099,6 +1099,35 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
     )
 
 
+FAVORITE_PLAYER_DATA_IDENTITY_JOIN = """
+LEFT JOIN LATERAL (
+  SELECT current_pd.id, current_pd.metadata
+  FROM player_data current_pd
+  WHERE
+    lower(COALESCE(current_pd.metadata->>'player_name', current_pd.metadata->>'name', '')) = lower(COALESCE(efp.name, ''))
+    AND (
+         COALESCE(efp.nationality, '') = ''
+         OR lower(COALESCE(current_pd.metadata->>'nationality_name', current_pd.metadata->>'nationality', '')) = lower(COALESCE(efp.nationality, ''))
+    )
+    AND (
+      current_pd.id = efp.club_player_id
+      OR (
+        (
+          COALESCE(efp.team, '') = ''
+          OR lower(COALESCE(current_pd.metadata->>'team_name', current_pd.metadata->>'team', '')) = lower(COALESCE(efp.team, ''))
+        )
+        AND (
+          COALESCE(efp.league, '') = ''
+          OR lower(COALESCE(current_pd.metadata->>'league_name', current_pd.metadata->>'league', '')) = lower(COALESCE(efp.league, ''))
+        )
+      )
+    )
+  ORDER BY CASE WHEN current_pd.id = efp.club_player_id THEN 0 ELSE 1 END
+  LIMIT 1
+) pd ON TRUE
+"""
+
+
 def _enterprise_favorite_identity(row: Any) -> Dict[str, Any]:
     data = row._mapping if hasattr(row, "_mapping") else row
     roles_raw = data.get("roles_json") or []
@@ -1155,11 +1184,11 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
                    pd.metadata->'position_names_seen' AS position_names_seen,
                    pd.metadata->>'primary_position_code' AS primary_position_code
             FROM enterprise_favorite_players efp
-            LEFT JOIN player_data pd ON pd.id = efp.club_player_id
+            {favorite_join}
             WHERE efp.id = :favorite_id
               AND efp.user_id = :user_id
             LIMIT 1
-            """
+            """.format(favorite_join=FAVORITE_PLAYER_DATA_IDENTITY_JOIN)
         ),
         {"favorite_id": favorite_id, "user_id": user_id},
     ).mappings().first()
@@ -1727,10 +1756,10 @@ def list_enterprise_favorite_players(
                pd.metadata->'position_names_seen' AS position_names_seen,
                pd.metadata->>'primary_position_code' AS primary_position_code
         FROM enterprise_favorite_players efp
-        LEFT JOIN player_data pd ON pd.id = efp.club_player_id
+        {favorite_join}
         WHERE efp.user_id = :user_id
         ORDER BY efp.created_at DESC
-        """),
+        """.format(favorite_join=FAVORITE_PLAYER_DATA_IDENTITY_JOIN)),
         {"user_id": user_id},
     ).mappings().all()
     return [_favorite_out(row) for row in rows]
@@ -1863,10 +1892,10 @@ def save_enterprise_favorite_player(
                pd.metadata->'position_names_seen' AS position_names_seen,
                pd.metadata->>'primary_position_code' AS primary_position_code
         FROM enterprise_favorite_players efp
-        LEFT JOIN player_data pd ON pd.id = efp.club_player_id
+        {favorite_join}
         WHERE efp.id = :id
           AND efp.user_id = :user_id
-        """),
+        """.format(favorite_join=FAVORITE_PLAYER_DATA_IDENTITY_JOIN)),
         {"id": favorite_id, "user_id": user_id},
     ).mappings().first()
     return _favorite_out(row)
