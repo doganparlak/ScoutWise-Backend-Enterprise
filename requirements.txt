@@ -5,7 +5,6 @@ psycopg2-binary
 python-dotenv
 pydantic[email]
 langchain-core
-langchain-deepseek
 langchain-classic
 langchain-openai
 langchain-community

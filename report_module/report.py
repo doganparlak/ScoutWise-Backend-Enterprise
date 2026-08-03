@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from sqlalchemy import text
 
 from constants_module.constants import ROLE_LONG_TO_SHORT, ROLE_SHORT_TO_LONG
@@ -16,8 +16,9 @@ from report_module.utilities import _first_non_empty, _normalize_roles, _score_c
 
 load_dotenv()
 
-CHAT_LLM = ChatDeepSeek(
-    model=os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-v4-flash"),
+CHAT_LLM = ChatOpenAI(
+    model=os.getenv("OPENAI_REPORT_MODEL", "gpt-5-mini"),
+    api_key=os.environ["OPENAI_API_KEY"],
     temperature=0.3,
 )
 
