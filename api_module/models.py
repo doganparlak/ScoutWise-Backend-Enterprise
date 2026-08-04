@@ -92,6 +92,27 @@ class PlayerPoolFilterOptionsOut(BaseModel):
     positions: List[str]
 
 
+class LeaguePoolFilterIn(BaseModel):
+    leagues: List[str] = Field(default_factory=list)
+    countries: List[str] = Field(default_factory=list)
+
+
+class LeaguePoolSearchIn(LeaguePoolFilterIn):
+    positions: List[str] = Field(default_factory=list)
+    limit: int = Field(default=100, ge=1, le=200)
+
+
+class LeaguePoolFilterOptionsOut(BaseModel):
+    leagues: List[str]
+    countries: List[str]
+    positions: List[str]
+
+
+class LeaguePoolSearchRow(BaseModel):
+    id: str
+    content: Dict[str, Any]
+
+
 class PlayerPoolPotentialOut(BaseModel):
     player_id: str
     status: str
@@ -110,6 +131,17 @@ class MatchupComparisonIn(BaseModel):
     player1Id: str
     player2Id: str
     worldCupMode: Optional[bool] = False
+    player1Sources: List[str] = Field(default_factory=list)
+    player2Sources: List[str] = Field(default_factory=list)
+
+
+class MatchupComparisonSourceOut(BaseModel):
+    key: str
+    country: str
+    leagueShortCode: str
+    team: str
+    competition: str
+    matchCount: float = 0
 
 
 class MatchupComparisonPlayer(BaseModel):

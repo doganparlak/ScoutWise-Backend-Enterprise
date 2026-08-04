@@ -21,6 +21,11 @@ from api_module.models import (
     LoginOut,
     MatchupComparisonIn,
     MatchupComparisonOut,
+    MatchupComparisonSourceOut,
+    LeaguePoolFilterIn,
+    LeaguePoolFilterOptionsOut,
+    LeaguePoolSearchIn,
+    LeaguePoolSearchRow,
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
     EnterpriseAllowlistEmailIn,
@@ -65,7 +70,8 @@ from api_module.utilities import (
 )
 from player_pool_module.player_pool import get_player_pool_filter_options, search_players
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
-from matchup_module.comparison import get_matchup_comparison
+from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
+from league_pool_module.league_pool import get_league_pool_options, search_league_pool
 from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
@@ -1652,7 +1658,30 @@ def player_pool_matchup_comparison(
 ):
     del user_id
     try:
-        return get_matchup_comparison(db, payload.player1Id, payload.player2Id, bool(payload.worldCupMode))
+        return get_matchup_comparison(
+            db,
+            payload.player1Id,
+            payload.player2Id,
+            bool(payload.worldCupMode),
+            payload.player1Sources,
+            payload.player2Sources,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/player-pool/{player_id}/matchup/sources",
+    response_model=list[MatchupComparisonSourceOut],
+)
+def player_pool_matchup_sources(
+    player_id: str,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    try:
+        return get_player_comparison_sources(db, player_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1665,6 +1694,26 @@ def player_pool_options(
 ):
     del user_id
     return get_player_pool_filter_options(db, worldCupMode)
+
+
+@app.post("/league-pool/options", response_model=LeaguePoolFilterOptionsOut)
+def league_pool_options(
+    payload: LeaguePoolFilterIn = Body(default=LeaguePoolFilterIn()),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return get_league_pool_options(db, payload.leagues, payload.countries)
+
+
+@app.post("/league-pool/search", response_model=list[LeaguePoolSearchRow])
+def league_pool_search(
+    payload: LeaguePoolSearchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return search_league_pool(db, payload.model_dump())
 
 
 @app.get("/tactic-boards", response_model=list[EnterpriseTacticBoardOut])
