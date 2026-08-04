@@ -38,7 +38,19 @@ HTMLY_RE = re.compile(r'</?(table|thead|tbody|tr|td|th|ul|ol|li|div|p|h[1-6]|spa
 REPORT_PARTNER_LOGOS_BY_EMAIL = {
     "saltfutbol90@gmail.com": "/saltfutbol-logo.png",
     "berkbekgoz1@gmail.com": "/berk_bekgoz_logo.png",
-    "dgnprlk@gmail.com": "/berk_bekgoz_logo.png",
+    "aselcuk@htspor": "/HT_SPOR_LOGO_BEYAZ.png",
+    "cemzengin@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
+    "dgnprlk@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
+    "iergulen@haberturk.com": "/HT_SPOR_LOGO_BEYAZ.png",
+}
+
+REPORT_PARTNER_KEYS_BY_EMAIL = {
+    "saltfutbol90@gmail.com": "saltfutbol",
+    "berkbekgoz1@gmail.com": "berk_bekgoz",
+    "aselcuk@htspor": "htspor",
+    "cemzengin@gmail.com": "htspor",
+    "dgnprlk@gmail.com": "htspor",
+    "iergulen@haberturk.com": "htspor",
 }
 
 
@@ -46,6 +58,12 @@ def get_report_partner_logo(email: Optional[str]) -> Optional[str]:
     if not email:
         return None
     return REPORT_PARTNER_LOGOS_BY_EMAIL.get(email.strip().lower())
+
+
+def get_report_partner_key(email: Optional[str]) -> Optional[str]:
+    if not email:
+        return None
+    return REPORT_PARTNER_KEYS_BY_EMAIL.get(email.strip().lower())
 
 def normalize_lang(value: Optional[str]) -> Optional[str]:
     if not value:
@@ -202,6 +220,7 @@ def user_row_to_dict(row: Any) -> dict:
         "uiLanguage": data.get("ui_language") or "tr",
         "isEmailVerified": bool(data.get("is_email_verified")),
         "reportPartnerLogo": get_report_partner_logo(email),
+        "reportPartnerKey": get_report_partner_key(email),
         "createdAt": data.get("created_at").isoformat()
         if data.get("created_at") is not None
         else None,
