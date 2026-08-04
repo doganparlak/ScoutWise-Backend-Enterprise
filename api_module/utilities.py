@@ -38,7 +38,7 @@ HTMLY_RE = re.compile(r'</?(table|thead|tbody|tr|td|th|ul|ol|li|div|p|h[1-6]|spa
 REPORT_PARTNER_LOGOS_BY_EMAIL = {
     "saltfutbol90@gmail.com": "/saltfutbol-logo.png",
     "berkbekgoz1@gmail.com": "/berk_bekgoz_logo.png",
-    "aselcuk@htspor": "/HT_SPOR_LOGO_BEYAZ.png",
+    "aselcuk@htspor.com": "/HT_SPOR_LOGO_BEYAZ.png",
     "cemzengin@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
     "dgnprlk@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
     "iergulen@haberturk.com": "/HT_SPOR_LOGO_BEYAZ.png",
@@ -47,7 +47,7 @@ REPORT_PARTNER_LOGOS_BY_EMAIL = {
 REPORT_PARTNER_KEYS_BY_EMAIL = {
     "saltfutbol90@gmail.com": "saltfutbol",
     "berkbekgoz1@gmail.com": "berk_bekgoz",
-    "aselcuk@htspor": "htspor",
+    "aselcuk@htspor.com": "htspor",
     "cemzengin@gmail.com": "htspor",
     "dgnprlk@gmail.com": "htspor",
     "iergulen@haberturk.com": "htspor",
