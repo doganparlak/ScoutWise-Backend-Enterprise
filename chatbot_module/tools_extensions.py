@@ -343,6 +343,7 @@ def fetch_player_nonzero_stats(
     # resolved identity from winning row (authoritative when present)
     resolved_raw = {
         "team": doc_meta.get("team_name") or doc_meta.get("team"),
+        "player_id": _num(doc_meta.get("player_id")),
         "age": _num(doc_meta.get("age")),
         "height": _num(doc_meta.get("height")),
         "weight": _num(doc_meta.get("weight")),
@@ -353,6 +354,11 @@ def fetch_player_nonzero_stats(
         "position_name": doc_meta.get("position_name"),
         "league_name": doc_meta.get("league_name") or doc_meta.get("league"),
         "match_count": _num(doc_meta.get("match_count")),
+        "is_on_loan": doc_meta.get("is_on_loan"),
+        "contract_team_id": _num(doc_meta.get("contract_team_id")),
+        "contract_team_name": doc_meta.get("contract_team_name"),
+        "loan_end_date": doc_meta.get("loan_end_date"),
+        "contract_end_date": doc_meta.get("contract_end_date"),
         "id": doc.get("id"),
     }
     # Remove None (and empty-string) fields so caller never overwrites with blanks
@@ -411,6 +417,7 @@ def build_player_payload_new(meta: Dict[str, Any]) -> Dict[str, Any]:
             match_count_final= resolved.get("match_count", m.get("match_count"))
             pos_final = resolved.get("position_name", m.get("position_name"))
             league_final = resolved.get("league_name", m.get("league_name"))
+            player_id_final = resolved.get("player_id", m.get("player_id"))
 
             # Prefer DB position -> roles (frontend consumes roles)
             roles_final = m.get("roles") or []
@@ -425,6 +432,7 @@ def build_player_payload_new(meta: Dict[str, Any]) -> Dict[str, Any]:
                 "name": name,
                 "meta": {
                     "gender": gender_final,
+                    "playerId": player_id_final,
                     "height": height_final,
                     "weight": weight_final,
                     "nationality": nat_final,
@@ -437,6 +445,11 @@ def build_player_payload_new(meta: Dict[str, Any]) -> Dict[str, Any]:
                     "roles": roles_final,
                     "potential": m.get("potential"),
                     "form": m.get("form"),
+                    "is_on_loan": resolved.get("is_on_loan", m.get("is_on_loan")),
+                    "contract_team_id": resolved.get("contract_team_id", m.get("contract_team_id")),
+                    "contract_team_name": resolved.get("contract_team_name", m.get("contract_team_name")),
+                    "loan_end_date": resolved.get("loan_end_date", m.get("loan_end_date")),
+                    "contract_end_date": resolved.get("contract_end_date", m.get("contract_end_date")),
                 },
                 "stats": stats or []
             })

@@ -159,6 +159,7 @@ class MatchupComparisonOut(BaseModel):
 
 class EnterpriseFavoritePlayerIn(BaseModel):
     playerId: Optional[str] = None
+    sportmonksPlayerId: Optional[int] = None
     name: Optional[str] = None
     nationality: Optional[str] = None
     age: Optional[int] = None
@@ -175,6 +176,7 @@ class EnterpriseFavoritePlayerIn(BaseModel):
 
 class EnterpriseFavoritePlayerOut(BaseModel):
     id: str
+    playerId: Optional[int] = None
     clubPlayerId: Optional[int] = None
     name: str
     nationality: Optional[str] = None

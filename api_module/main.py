@@ -1098,6 +1098,7 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
 
     return EnterpriseFavoritePlayerOut(
         id=str(data["id"]),
+        playerId=_metadata_int({"player_id": data.get("player_id")}, "player_id"),
         clubPlayerId=data.get("club_player_id"),
         name=data["name"],
         nationality=data.get("nationality"),
@@ -1133,7 +1134,12 @@ LEFT JOIN LATERAL (
          OR lower(COALESCE(current_pd.metadata->>'nationality_name', current_pd.metadata->>'nationality', '')) = lower(COALESCE(efp.nationality, ''))
     )
     AND (
-      current_pd.id = efp.club_player_id
+      (
+        COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
+        AND COALESCE(current_pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+        AND (current_pd.metadata->>'player_id')::numeric::bigint = efp.player_id::numeric::bigint
+      )
+      OR current_pd.id = efp.club_player_id
       OR (
         (
           COALESCE(efp.team, '') = ''
@@ -1145,7 +1151,15 @@ LEFT JOIN LATERAL (
         )
       )
     )
-  ORDER BY CASE WHEN current_pd.id = efp.club_player_id THEN 0 ELSE 1 END
+  ORDER BY
+    CASE
+      WHEN COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
+       AND COALESCE(current_pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+       AND (current_pd.metadata->>'player_id')::numeric::bigint = efp.player_id::numeric::bigint
+      THEN 0
+      WHEN current_pd.id = efp.club_player_id THEN 1
+      ELSE 2
+    END
   LIMIT 1
 ) pd ON TRUE
 """
@@ -1200,7 +1214,7 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
     row = db.execute(
         text(
             """
-            SELECT efp.id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
+            SELECT efp.id, efp.player_id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
                    efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json,
                    pd.metadata->'position_counts' AS position_counts,
                    pd.metadata->>'position_count_total' AS position_count_total,
@@ -1573,6 +1587,7 @@ def _favorite_values_from_club_row(
 ) -> Dict[str, Any]:
     metadata = dict(club_row["metadata"] or {})
     return {
+        "player_id": _metadata_int(metadata, "player_id"),
         "club_player_id": int(club_row["id"]),
         "name": _metadata_text(metadata, "player_name", "name") or "",
         "nationality": _metadata_text(metadata, "nationality_name", "nationality"),
@@ -1590,6 +1605,7 @@ def _favorite_values_from_club_row(
 
 def _favorite_values_from_payload(payload: EnterpriseFavoritePlayerIn) -> Dict[str, Any]:
     return {
+        "player_id": payload.sportmonksPlayerId,
         "club_player_id": None,
         "name": (payload.name or "").strip(),
         "nationality": (payload.nationality or "").strip() or None,
@@ -1792,7 +1808,7 @@ def list_enterprise_favorite_players(
 ):
     rows = db.execute(
         text("""
-        SELECT efp.id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
+        SELECT efp.id, efp.player_id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
                efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json, efp.created_at,
                pd.metadata->'position_counts' AS position_counts,
                pd.metadata->>'position_count_total' AS position_count_total,
@@ -1830,10 +1846,25 @@ def save_enterprise_favorite_player(
     print(
         "[enterprise_favorite_save] "
         f"event=request has_player_id={bool(payload.playerId)} "
-        f"player_id={payload.playerId!r} name={payload.name!r} team={payload.team!r}",
+        f"player_id={payload.playerId!r} sportmonks_player_id={payload.sportmonksPlayerId!r} "
+        f"name={payload.name!r} team={payload.team!r}",
         flush=True,
     )
-    if payload.playerId:
+    club_row = None
+    if payload.sportmonksPlayerId is not None:
+        club_row = db.execute(
+            text("""
+            SELECT id, metadata
+            FROM player_data
+            WHERE COALESCE(metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+              AND (metadata->>'player_id')::numeric::bigint = :player_id
+            LIMIT 1
+            """),
+            {"player_id": payload.sportmonksPlayerId},
+        ).mappings().first()
+    if club_row is not None:
+        payload.playerId = str(club_row["id"])
+    elif payload.playerId and (payload.sportmonksPlayerId is None or bool(payload.worldCupMode)):
         club_row = _resolve_club_player_row(db, payload.playerId, bool(payload.worldCupMode))
     else:
         club_row = _resolve_club_player_row_from_favorite_payload(db, payload)
@@ -1861,12 +1892,19 @@ def save_enterprise_favorite_player(
         SELECT id
         FROM enterprise_favorite_players
         WHERE user_id = :user_id
-          AND lower(name) = lower(:name)
-          AND lower(COALESCE(nationality, '')) = lower(COALESCE(:nationality, ''))
+          AND (
+            (:player_id IS NOT NULL AND player_id = :player_id)
+            OR (
+              lower(name) = lower(:name)
+              AND lower(COALESCE(nationality, '')) = lower(COALESCE(:nationality, ''))
+            )
+          )
+        ORDER BY CASE WHEN :player_id IS NOT NULL AND player_id = :player_id THEN 0 ELSE 1 END
         LIMIT 1
         """),
         {
             "user_id": user_id,
+            "player_id": str(favorite_values["player_id"]) if favorite_values["player_id"] is not None else None,
             "name": favorite_values["name"],
             "nationality": favorite_values["nationality"],
         },
@@ -1876,7 +1914,7 @@ def save_enterprise_favorite_player(
     params = {
         "id": favorite_id,
         "user_id": user_id,
-        "player_id": str(favorite_values["club_player_id"]) if favorite_values["club_player_id"] is not None else None,
+        "player_id": str(favorite_values["player_id"]) if favorite_values["player_id"] is not None else None,
         "player_name": favorite_values["name"],
         "club_player_id": favorite_values["club_player_id"],
         "name": favorite_values["name"],
@@ -1941,7 +1979,7 @@ def save_enterprise_favorite_player(
     db.commit()
     row = db.execute(
         text("""
-        SELECT efp.id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
+        SELECT efp.id, efp.player_id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
                efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json,
                pd.metadata->'position_counts' AS position_counts,
                pd.metadata->>'position_count_total' AS position_count_total,
@@ -2412,7 +2450,7 @@ def get_or_create_enterprise_scouting_report(
                 {
                     "id": favorite_id,
                     "user_id": user_id,
-                    "player_id": str(favorite_values["club_player_id"]) if favorite_values["club_player_id"] is not None else None,
+                    "player_id": str(favorite_values["player_id"]) if favorite_values["player_id"] is not None else None,
                     "player_name": favorite_values["name"],
                     "club_player_id": favorite_values["club_player_id"],
                     "name": favorite_values["name"],
