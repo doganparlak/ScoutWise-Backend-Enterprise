@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -30,6 +31,77 @@ _report_prompt = ChatPromptTemplate.from_messages(
 )
 
 report_chain = _report_prompt | CHAT_LLM | StrOutputParser()
+
+
+_CONCLUSION_TITLES: Dict[str, Tuple[str, ...]] = {
+    "en": (
+        "Role & System",
+        "Development Focus",
+        "Usage Recommendation",
+        "In-Game Adaptability",
+        "In Possession",
+        "Out of Possession",
+    ),
+    "tr": (
+        "Rol & Sistem",
+        "Gelişim Odağı",
+        "Kullanım Önerisi",
+        "Maç İçi Esneklik",
+        "Toplu Oyunda",
+        "Topsuz Oyunda",
+    ),
+}
+
+_CONCLUSION_TITLE_ALIASES = tuple(
+    title for titles in _CONCLUSION_TITLES.values() for title in titles
+)
+_CONCLUSION_ALIAS_PREFIX = re.compile(
+    rf"^(?:{'|'.join(re.escape(title) for title in _CONCLUSION_TITLE_ALIASES)})\s*[:：]\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_report_narrative_titles(report_text: str, lang: str) -> str:
+    """Make machine-owned conclusion labels deterministic before persistence.
+
+    The LLM owns the narrative, but it must not own UI terminology. Replacing the
+    six ordered labels here also protects clients that do not translate report
+    labels themselves. Removing aliases from the body prevents output such as
+    ``Topsuz Oyunda: Topsuz Oyunda: ...`` when the model repeats a label.
+    """
+    titles = _CONCLUSION_TITLES.get(lang)
+    if not titles or not report_text:
+        return report_text
+
+    lines = report_text.splitlines()
+    in_conclusion = False
+    bullet_index = 0
+    normalized: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "CONCLUSION":
+            in_conclusion = True
+            bullet_index = 0
+            normalized.append(line)
+            continue
+        if in_conclusion and stripped and not stripped.startswith("-"):
+            in_conclusion = False
+
+        if in_conclusion and re.match(r"^\s*-\s+", line) and bullet_index < len(titles):
+            item = re.sub(r"^\s*-\s+", "", line).strip()
+            match = re.match(r"^[^:：]{2,60}[:：]\s*(.*)$", item)
+            body = match.group(1).strip() if match else item
+            while True:
+                cleaned = _CONCLUSION_ALIAS_PREFIX.sub("", body, count=1).strip()
+                if cleaned == body:
+                    break
+                body = cleaned
+            normalized.append(f"- {titles[bullet_index]}: {body}")
+            bullet_index += 1
+            continue
+        normalized.append(line)
+
+    return "\n".join(normalized)
 
 ROLE_USAGE_CONSTRAINTS: Dict[str, Dict[str, Any]] = {
     "GK": {
@@ -1646,6 +1718,7 @@ def generate_report_content(
             player_card[score_key] = identity[score_key]
 
     report_text = (report_chain.invoke({"input_text": _build_llm_input(player_card, docs), "lang": lang}) or "").strip()
+    report_text = _normalize_report_narrative_titles(report_text, lang)
     content_json = {
         "favorite_player_id": favorite_id,
         "language": lang,
