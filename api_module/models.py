@@ -66,6 +66,9 @@ class PlayerPoolSearchIn(BaseModel):
     teamExact: Optional[bool] = False
     minAge: Optional[float] = Field(default=None, ge=0)
     maxAge: Optional[float] = Field(default=None, ge=0)
+    contractStatus: Optional[Literal["loan", "permanent"]] = None
+    loanEndDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    contractEndDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     minHeight: Optional[float] = Field(default=None, ge=0)
     maxHeight: Optional[float] = Field(default=None, ge=0)
     minWeight: Optional[float] = Field(default=None, ge=0)

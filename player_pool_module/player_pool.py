@@ -111,6 +111,9 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
     league = None if world_cup_mode else clean_str(filters.get("league"))
     team = clean_str(filters.get("team"))
     position = clean_str(filters.get("position"))
+    contract_status = None if world_cup_mode else clean_str(filters.get("contractStatus"))
+    loan_end_date = None if world_cup_mode else clean_str(filters.get("loanEndDate"))
+    contract_end_date = None if world_cup_mode else clean_str(filters.get("contractEndDate"))
     position_short = position.upper() if position and position.upper() in ROLE_SHORT_TO_LONG else None
     position_short = ROLE_SEARCH_SHORT_ALIASES.get(position_short, position_short)
     position_search = None if position_short else position
@@ -189,6 +192,31 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
           AND {numeric_filter_sql("height", "max_height", "<=")}
           AND {numeric_filter_sql("weight", "min_weight", ">=")}
           AND {numeric_filter_sql("weight", "max_weight", "<=")}
+          AND (
+                :contract_status IS NULL
+                OR (
+                    :contract_status = 'loan'
+                    AND LOWER(COALESCE(metadata->>'is_on_loan', '')) IN ('true', '1', 'yes')
+                )
+                OR (
+                    :contract_status = 'permanent'
+                    AND LOWER(COALESCE(metadata->>'is_on_loan', '')) IN ('false', '0', 'no')
+                )
+              )
+          AND (
+                :loan_end_date IS NULL
+                OR (
+                    COALESCE(metadata->>'loan_end_date', '') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                    AND SUBSTRING(metadata->>'loan_end_date' FROM 1 FOR 10)::date <= CAST(:loan_end_date AS date)
+                )
+              )
+          AND (
+                :contract_end_date IS NULL
+                OR (
+                    COALESCE(metadata->>'contract_end_date', '') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                    AND SUBSTRING(metadata->>'contract_end_date' FROM 1 FOR 10)::date <= CAST(:contract_end_date AS date)
+                )
+              )
         ORDER BY
             CASE
                 WHEN :position_short IS NOT NULL THEN COALESCE((
@@ -241,6 +269,9 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
             "max_height": filters.get("maxHeight"),
             "min_weight": filters.get("minWeight"),
             "max_weight": filters.get("maxWeight"),
+            "contract_status": contract_status,
+            "loan_end_date": loan_end_date,
+            "contract_end_date": contract_end_date,
             "limit": int(filters.get("limit") or SEARCH_LIMIT),
         },
     ).mappings().all()

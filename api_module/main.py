@@ -1021,6 +1021,21 @@ def _metadata_int(metadata: Dict[str, Any], *keys: str) -> int | None:
     return None
 
 
+def _metadata_bool(metadata: Dict[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return None
+
+
 def _metadata_roles(metadata: Dict[str, Any]) -> list[str]:
     roles: list[str] = []
 
@@ -2072,6 +2087,14 @@ def _apply_enterprise_club_row_to_report_payload(
     next_payload["height"] = _metadata_text(metadata, "height") or next_payload.get("height")
     next_payload["weight"] = _metadata_text(metadata, "weight") or next_payload.get("weight")
 
+    # Contract details are part of the immutable saved-report snapshot so a
+    # dashboard reopen never needs to query the current player_data row.
+    next_payload["is_on_loan"] = _metadata_bool(metadata, "is_on_loan")
+    next_payload["contract_team_id"] = _metadata_int(metadata, "contract_team_id")
+    next_payload["contract_team_name"] = _metadata_text(metadata, "contract_team_name")
+    next_payload["loan_end_date"] = _metadata_text(metadata, "loan_end_date")
+    next_payload["contract_end_date"] = _metadata_text(metadata, "contract_end_date")
+
     roles = _metadata_roles(metadata)
     if roles:
         next_payload["roles"] = roles
@@ -2327,7 +2350,7 @@ def create_enterprise_player_pool_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 7
+    version = 8
     player_payload = payload.model_dump(exclude_none=True)
     return _get_or_create_enterprise_player_pool_report_from_payload(
         db,
@@ -2348,7 +2371,7 @@ def get_or_create_enterprise_scouting_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 7
+    version = 8
 
     favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
     player_payload = _enterprise_favorite_identity(favorite_row)
