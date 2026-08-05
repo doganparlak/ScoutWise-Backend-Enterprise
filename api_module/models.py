@@ -61,6 +61,7 @@ class PlayerPoolSearchIn(BaseModel):
     nationality: Optional[str] = None
     nationalityExact: Optional[bool] = False
     league: Optional[str] = None
+    leagueCountry: Optional[str] = None
     leagueExact: Optional[bool] = False
     team: Optional[str] = None
     teamExact: Optional[bool] = False
