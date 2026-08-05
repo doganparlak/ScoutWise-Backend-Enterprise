@@ -188,6 +188,11 @@ class EnterpriseFavoritePlayerOut(BaseModel):
     positionCountTotal: int = 0
     positionNamesSeen: List[str] = Field(default_factory=list)
     primaryPositionCode: Optional[str] = None
+    isOnLoan: Optional[bool] = None
+    contractTeamId: Optional[int] = None
+    contractTeamName: Optional[str] = None
+    loanEndDate: Optional[str] = None
+    contractEndDate: Optional[str] = None
 
 
 class EnterpriseScoutingReportIn(BaseModel):

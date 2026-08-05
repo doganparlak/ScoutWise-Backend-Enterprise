@@ -1099,6 +1099,11 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
         positionCountTotal=int(position_count_total or 0),
         positionNamesSeen=position_names_seen,
         primaryPositionCode=data.get("primary_position_code") or (position_names_seen[0] if position_names_seen else None),
+        isOnLoan=data.get("is_on_loan"),
+        contractTeamId=data.get("contract_team_id"),
+        contractTeamName=data.get("contract_team_name"),
+        loanEndDate=data.get("loan_end_date"),
+        contractEndDate=data.get("contract_end_date"),
     )
 
 
@@ -1185,7 +1190,20 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
                    pd.metadata->'position_counts' AS position_counts,
                    pd.metadata->>'position_count_total' AS position_count_total,
                    pd.metadata->'position_names_seen' AS position_names_seen,
-                   pd.metadata->>'primary_position_code' AS primary_position_code
+                   pd.metadata->>'primary_position_code' AS primary_position_code,
+                   CASE
+                     WHEN lower(pd.metadata->>'is_on_loan') IN ('true', '1', 'yes') THEN TRUE
+                     WHEN lower(pd.metadata->>'is_on_loan') IN ('false', '0', 'no') THEN FALSE
+                     ELSE NULL
+                   END AS is_on_loan,
+                   CASE
+                     WHEN COALESCE(pd.metadata->>'contract_team_id', '') ~ '^[0-9]+([.]0+)?$'
+                     THEN (pd.metadata->>'contract_team_id')::numeric::bigint
+                     ELSE NULL
+                   END AS contract_team_id,
+                   pd.metadata->>'contract_team_name' AS contract_team_name,
+                   pd.metadata->>'loan_end_date' AS loan_end_date,
+                   pd.metadata->>'contract_end_date' AS contract_end_date
             FROM enterprise_favorite_players efp
             {favorite_join}
             WHERE efp.id = :favorite_id
@@ -1764,7 +1782,20 @@ def list_enterprise_favorite_players(
                pd.metadata->'position_counts' AS position_counts,
                pd.metadata->>'position_count_total' AS position_count_total,
                pd.metadata->'position_names_seen' AS position_names_seen,
-               pd.metadata->>'primary_position_code' AS primary_position_code
+               pd.metadata->>'primary_position_code' AS primary_position_code,
+               CASE
+                 WHEN lower(pd.metadata->>'is_on_loan') IN ('true', '1', 'yes') THEN TRUE
+                 WHEN lower(pd.metadata->>'is_on_loan') IN ('false', '0', 'no') THEN FALSE
+                 ELSE NULL
+               END AS is_on_loan,
+               CASE
+                 WHEN COALESCE(pd.metadata->>'contract_team_id', '') ~ '^[0-9]+([.]0+)?$'
+                 THEN (pd.metadata->>'contract_team_id')::numeric::bigint
+                 ELSE NULL
+               END AS contract_team_id,
+               pd.metadata->>'contract_team_name' AS contract_team_name,
+               pd.metadata->>'loan_end_date' AS loan_end_date,
+               pd.metadata->>'contract_end_date' AS contract_end_date
         FROM enterprise_favorite_players efp
         {favorite_join}
         WHERE efp.user_id = :user_id
@@ -1900,7 +1931,20 @@ def save_enterprise_favorite_player(
                pd.metadata->'position_counts' AS position_counts,
                pd.metadata->>'position_count_total' AS position_count_total,
                pd.metadata->'position_names_seen' AS position_names_seen,
-               pd.metadata->>'primary_position_code' AS primary_position_code
+               pd.metadata->>'primary_position_code' AS primary_position_code,
+               CASE
+                 WHEN lower(pd.metadata->>'is_on_loan') IN ('true', '1', 'yes') THEN TRUE
+                 WHEN lower(pd.metadata->>'is_on_loan') IN ('false', '0', 'no') THEN FALSE
+                 ELSE NULL
+               END AS is_on_loan,
+               CASE
+                 WHEN COALESCE(pd.metadata->>'contract_team_id', '') ~ '^[0-9]+([.]0+)?$'
+                 THEN (pd.metadata->>'contract_team_id')::numeric::bigint
+                 ELSE NULL
+               END AS contract_team_id,
+               pd.metadata->>'contract_team_name' AS contract_team_name,
+               pd.metadata->>'loan_end_date' AS loan_end_date,
+               pd.metadata->>'contract_end_date' AS contract_end_date
         FROM enterprise_favorite_players efp
         {favorite_join}
         WHERE efp.id = :id
