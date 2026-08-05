@@ -59,6 +59,19 @@ _CONCLUSION_ALIAS_PREFIX = re.compile(
     rf"^(?:{'|'.join(re.escape(title) for title in _CONCLUSION_TITLE_ALIASES)})\s*[:：]\s*",
     flags=re.IGNORECASE,
 )
+_NARRATIVE_SECTIONS = {
+    "STRENGTHS",
+    "POTENTIAL WEAKNESSES / CONCERNS",
+    "CONCLUSION",
+}
+
+
+def _normalize_turkish_narrative_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", title).strip()
+    without_english_suffix = re.sub(
+        r"\s*\([^()]*[A-Za-z][^()]*\)\s*$", "", title
+    ).strip()
+    return without_english_suffix or title
 
 
 def _normalize_report_narrative_titles(report_text: str, lang: str) -> str:
@@ -75,10 +88,15 @@ def _normalize_report_narrative_titles(report_text: str, lang: str) -> str:
 
     lines = report_text.splitlines()
     in_conclusion = False
+    narrative_section: Optional[str] = None
     bullet_index = 0
     normalized: List[str] = []
     for line in lines:
         stripped = line.strip()
+        if stripped in _NARRATIVE_SECTIONS:
+            narrative_section = stripped
+        elif stripped and not stripped.startswith("-") and stripped.isupper():
+            narrative_section = None
         if stripped == "CONCLUSION":
             in_conclusion = True
             bullet_index = 0
@@ -99,6 +117,13 @@ def _normalize_report_narrative_titles(report_text: str, lang: str) -> str:
             normalized.append(f"- {titles[bullet_index]}: {body}")
             bullet_index += 1
             continue
+        if lang == "tr" and narrative_section and re.match(r"^\s*-\s+", line):
+            item = re.sub(r"^\s*-\s+", "", line).strip()
+            match = re.match(r"^([^:：]+)[:：]\s*(.+)$", item)
+            if match:
+                title = _normalize_turkish_narrative_title(match.group(1))
+                normalized.append(f"- {title}: {match.group(2).strip()}")
+                continue
         normalized.append(line)
 
     return "\n".join(normalized)

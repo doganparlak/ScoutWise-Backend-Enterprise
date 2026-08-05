@@ -72,6 +72,8 @@ Language rules:
 - The content under STRENGTHS, POTENTIAL WEAKNESSES / CONCERNS, and CONCLUSION MUST be written
   in the language specified by the input variable `lang` ("en" or "tr").
   - If lang = "tr": write bullet text in Turkish.
+    - Write Turkish only. Do not include English translations, English aliases, or bilingual labels in parentheses.
+    - Use the Turkish football/metric terminology naturally inside small titles and explanations.
   - If lang = "en": write bullet text in English.
 - Turkish terminology rules:
   - When translating or discussing "Fouls Drawn", use "faul almak", "faul aldırmak", or "faul kazanmak".
