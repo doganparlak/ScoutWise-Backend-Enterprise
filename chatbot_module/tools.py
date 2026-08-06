@@ -545,6 +545,11 @@ def is_generic_alternative_request(question: Optional[str]) -> bool:
         r"\bother\b",
         r"\bnext player\b",
         r"\bnext\b",
+        r"\bbaska(?:si)?\b",
+        r"\bbaska kim\b",
+        r"\bkim olabilir\b",
+        r"\balternatif\b",
+        r"\bdiger(?:i)?\b",
     ]
     return any(re.search(pattern, text) for pattern in patterns)
 
@@ -811,7 +816,7 @@ def get_requested_position_groups(question: Optional[str]) -> Optional[set[str]]
         ([r"\bcenter back\b", r"\bcentre back\b", r"\bcenter half\b", r"\bcentre half\b", r"\bcb\b"], {"center_back"}),
         ([r"\bright winger\b"], {"right_wing", "right_midfield"}),
         ([r"\bleft winger\b"], {"left_wing", "left_midfield"}),
-        ([r"\bwinger\b", r"\bwing\b"], {"left_wing", "right_wing"}),
+        ([r"\bwinger\b", r"\bwing\b", r"\bkanat\b"], {"left_wing", "left_midfield", "right_midfield", "right_wing"}),
         ([r"\bcenter forward\b", r"\bcentre forward\b", r"\bcenterforward\b", r"\bcentreforward\b", r"\bstriker\b", r"\bforward\b", r"\bsantrafor\b", r"\bst\b", r"\bcf\b"], {"center_forward"}),
         ([r"\bmidfielder\b", r"\bmidfield\b"], {"defensive_midfield", "central_midfield", "attacking_midfield"}),
     ]

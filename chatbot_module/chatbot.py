@@ -77,19 +77,19 @@ OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5-mini")
 CHAT_LLM = ChatOpenAI(
     model=OPENAI_CHAT_MODEL,
     api_key=os.environ["OPENAI_API_KEY"],
-    temperature=0.3,
+    reasoning_effort="low",
 )
 
 PARSER_LLM = ChatOpenAI(
     model=OPENAI_CHAT_MODEL,
     api_key=os.environ["OPENAI_API_KEY"],
-    temperature=0,   # keep it deterministic for JSON-style parsing
+    reasoning_effort="low",
 )
 
 TRANSLATE_LLM = ChatOpenAI(
     model=OPENAI_CHAT_MODEL,
     api_key=os.environ["OPENAI_API_KEY"],
-    temperature=0,
+    reasoning_effort="low",
 )
 
 SHARED_RETRIEVER = get_retriever(k=12, filter=None)

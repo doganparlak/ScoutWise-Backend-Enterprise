@@ -76,6 +76,7 @@ from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 from report_module.report import generate_report_content
+from chatbot_module.tools_agentic import ensure_player_position_label_cache
 from scoutwise_pro_module.pro import (
     delete_named_strategy,
     get_strategy,
@@ -299,6 +300,7 @@ def ensure_enterprise_sessions_table() -> None:
                 """
             )
         )
+        ensure_player_position_label_cache(db)
         db.commit()
     finally:
         db.close()

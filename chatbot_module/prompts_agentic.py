@@ -207,6 +207,8 @@ Comparison mode:
 AGENTIC_CONTROLLER_PROMPT = (
     CURRENT_YEAR_POLICY
     + INTENT_AND_MEMORY_POLICY
+    + TRANSFER_AND_ENTITY_POLICY
+    + ROLE_METRIC_POLICY
     + """
 
 CONTROLLER TASK:
@@ -219,11 +221,40 @@ Return strict JSON only, with this schema:
   "comparison_players": ["Name A", "Name B"],
   "carry_recent_constraints": true,
   "mentions_seen_players": ["Name"],
-  "needs_new_player": true
+  "needs_new_player": true,
+  "target_team": null,
+  "source_team": null,
+  "constraints": {
+    "gender": null,
+    "position": null,
+    "age_min": null,
+    "age_max": null,
+    "nationality": null,
+    "excluded_nationalities": [],
+    "league": null,
+    "excluded_leagues": [],
+    "team": null,
+    "excluded_teams": [],
+    "excluded_positions": [],
+    "height_min": null,
+    "height_max": null,
+    "weight_min": null,
+    "weight_max": null,
+    "preferred_stats": [],
+    "stat_requirements": [],
+    "notes": ""
+  }
 }
 
 Rules:
-- Use the current user question, translated English question, recent chat memory, seen player names, and strategy.
+- Use the current user question, translated English question, recent chat memory, seen player names, and strategy together.
+- Extract intent, team roles, and constraints together in this single response.
+- "for/to CLUB" means target_team. "playing at/from/currently with CLUB" means source_team and constraints.team.
+- Never put a target team in source_team or constraints.team.
+- Set constraints.league only when the current translated user question explicitly asks for players from/in a league. Do not infer a positive league from a target club, strategy, club level, or phrases such as "league-ready" and "adaptable to".
+- Do not add hard constraints merely to improve or expand the retrieval query.
+- Keep preferred_stats to at most four allowed metric names, and use stat_requirements only for explicit numeric thresholds.
+- Use null or an empty list for absent constraints.
 - For comparison questions, fill comparison_players with exactly the named players when the question names them.
 - Examples of comparison questions: "Icardi or Osimhen who is better", "compare Icardi and Osimhen", "Icardi vs Osimhen".
 - Do not invent players. Do not answer the user. JSON only.
@@ -308,7 +339,7 @@ Return strict JSON only:
 Selection requirements:
 - Apply every selector policy before choosing.
 - Prefer candidates satisfying the extracted constraints. If constraints were relaxed by the tool layer, choose the best remaining fit and mention the relaxation only in risk_flags.
-- Prefer candidates with stronger role-relevant metrics, correct position, age fit, and high potential/form outlook.
+- Prefer candidates with stronger role-relevant metrics, correct position, age fit, match volume, and rating.
 - Respect target-team exclusion, Turkish exclusion, premium restrictions, squad-level restrictions, seen-player exclusion, explicit age constraints, and stat requirements.
 - If an invalid candidate appears attractive, skip it and choose a valid one.
 - The selected_index is one-based and must match the candidate list.

@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from api_module.utilities import get_db
 from chatbot_module.tools import (
@@ -24,6 +25,7 @@ from chatbot_module.tools import (
     is_premium_request,
     is_same_club,
     is_turkish,
+    get_requested_position_groups,
     player_matches_requested_position,
     request_allows_non_senior_squads,
     request_allows_turkish_entities,
@@ -45,6 +47,7 @@ from constants_module.constants import (
     POSITION_NEGATION_ALIASES,
     ROLE_SHORT_TO_LONG,
 )
+from player_pool_module.player_pool import role_value_short_sql
 
 
 SQL_FOLD_FROM = "ÁÀÂÃÄÅĀĂĄáàâãäåāăąÉÈÊËĒĖĘĚéèêëēėęěÍÌÎÏĪİıíìîïīÓÒÔÕÖØŌóòôõöøōÚÙÛÜŪúùûüūÇĆČçćčÑñĞğŞŠşšÝŸýÿŽŹŻžźżÐð"
@@ -54,7 +57,126 @@ SQL_FOLD_TO = "AAAAAAAAAaaaaaaaaaEEEEEEEEeeeeeeeeIIIIIIiiiiiiOOOOOOOoooooooUUUUU
 AGENTIC_LOOKUP_DEBUG = os.getenv("AGENTIC_LOOKUP_DEBUG", "1").lower() not in {"0", "false", "no", "off"}
 AGENTIC_LOOKUP_VERBOSE = os.getenv("AGENTIC_LOOKUP_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
 AGENTIC_QUALITY_DEBUG = os.getenv("AGENTIC_QUALITY_DEBUG", "0").lower() not in {"0", "false", "no", "off"}
-SELECTOR_CANDIDATE_LIMIT = 24
+SELECTOR_CANDIDATE_LIMIT = 10
+
+POSITION_CODES_BY_GROUP = {
+    "goalkeeper": ["GK"],
+    "left_wing_back": ["LWB"],
+    "left_back": ["LB"],
+    "center_back": ["LCB", "CB", "RCB"],
+    "right_back": ["RB"],
+    "right_wing_back": ["RWB"],
+    "defensive_midfield": ["LDM", "CDM", "RDM"],
+    "central_midfield": ["LCM", "CM", "RCM"],
+    "attacking_midfield": ["LAM", "CAM", "RAM"],
+    "left_midfield": ["LM"],
+    "right_midfield": ["RM"],
+    "left_wing": ["LW"],
+    "right_wing": ["RW"],
+    "center_forward": ["LCF", "CF", "RCF"],
+}
+
+
+def ensure_player_position_label_cache(db: Session) -> None:
+    counted_role_sql = role_value_short_sql("counted_position.role_value")
+    fallback_primary_sql = role_value_short_sql("changed.metadata->>'primary_position_code'")
+    fallback_name_sql = role_value_short_sql("changed.metadata->>'position_name'")
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS public.enterprise_player_position_labels (
+            player_data_id TEXT PRIMARY KEY,
+            source_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            position_codes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """))
+    db.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_enterprise_player_position_labels_codes
+        ON public.enterprise_player_position_labels
+        USING GIN (position_codes)
+    """))
+    db.execute(text(f"""
+        WITH changed AS (
+            SELECT
+                pd.id::text AS player_data_id,
+                pd.metadata,
+                CASE
+                    WHEN jsonb_typeof(pd.metadata->'position_counts') = 'object'
+                    THEN pd.metadata->'position_counts'
+                    ELSE '{{}}'::jsonb
+                END AS source_counts
+            FROM player_data pd
+            LEFT JOIN enterprise_player_position_labels cached
+              ON cached.player_data_id = pd.id::text
+            WHERE cached.player_data_id IS NULL
+               OR cached.source_counts IS DISTINCT FROM CASE
+                    WHEN jsonb_typeof(pd.metadata->'position_counts') = 'object'
+                    THEN pd.metadata->'position_counts'
+                    ELSE '{{}}'::jsonb
+                  END
+        ),
+        role_counts AS (
+            SELECT
+                changed.player_data_id,
+                {counted_role_sql} AS role_code,
+                SUM(
+                    CASE
+                        WHEN counted_position.count_value ~ '^-?[0-9]+([.][0-9]+)?$'
+                        THEN counted_position.count_value::numeric
+                        ELSE 0
+                    END
+                ) AS role_count
+            FROM changed
+            CROSS JOIN LATERAL jsonb_each_text(changed.source_counts)
+                AS counted_position(role_value, count_value)
+            GROUP BY changed.player_data_id, 2
+        ),
+        ranked AS (
+            SELECT
+                player_data_id,
+                role_code,
+                role_count,
+                ROW_NUMBER() OVER (PARTITION BY player_data_id ORDER BY role_count DESC, role_code) AS role_rank,
+                role_count * 100.0 / NULLIF(SUM(role_count) OVER (PARTITION BY player_data_id), 0) AS role_share
+            FROM role_counts
+            WHERE role_code IS NOT NULL AND role_count > 0
+        ),
+        scored AS (
+            SELECT
+                ranked.*,
+                MAX(role_share) FILTER (WHERE role_rank = 1) OVER (PARTITION BY player_data_id) AS primary_share
+            FROM ranked
+        ),
+        labels AS (
+            SELECT
+                player_data_id,
+                ARRAY_AGG(role_code ORDER BY role_rank) FILTER (
+                    WHERE role_rank = 1 OR (role_rank = 2 AND primary_share - role_share <= 10.0)
+                ) AS position_codes
+            FROM scored
+            GROUP BY player_data_id
+        )
+        INSERT INTO enterprise_player_position_labels (
+            player_data_id, source_counts, position_codes, updated_at
+        )
+        SELECT
+            changed.player_data_id,
+            changed.source_counts,
+            COALESCE(
+                labels.position_codes,
+                ARRAY_REMOVE(ARRAY[
+                    {fallback_primary_sql},
+                    {fallback_name_sql}
+                ]::TEXT[], NULL),
+                ARRAY[]::TEXT[]
+            ),
+            NOW()
+        FROM changed
+        LEFT JOIN labels USING (player_data_id)
+        ON CONFLICT (player_data_id) DO UPDATE
+        SET source_counts = EXCLUDED.source_counts,
+            position_codes = EXCLUDED.position_codes,
+            updated_at = NOW()
+    """))
 
 
 def _lookup_debug(event: str, payload: Dict[str, Any]) -> None:
@@ -1235,7 +1357,7 @@ def build_agentic_context(
     if named_lookup_query:
         direct_lookup = True
 
-    target_team = extract_target_team_from_question(translated)
+    target_team = canonical_source_team(planner_data.get("target_team")) or extract_target_team_from_question(translated)
     if target_team and (
         _looks_like_invalid_source_team_text(target_team)
         or bool(infer_position_from_text(target_team))
@@ -1316,10 +1438,7 @@ def build_agentic_context(
         if values:
             cleaned_constraints[key] = _unique_list([*(cleaned_constraints.get(key) or []), *values])
     cleaned_constraints = clean_constraints(cleaned_constraints)
-    explicit_source_team = (
-        extract_source_team_from_question(original_question)
-        or extract_source_team_from_question(translated)
-    )
+    explicit_source_team = canonical_source_team(planner_data.get("source_team")) or extract_source_team_from_question(translated)
     source_team_phrase = bool(
         explicit_source_team
         or (
@@ -1636,6 +1755,7 @@ def fetch_selection_suggestion_docs_from_db(
     constraints = clean_constraints(ctx.constraints)
     relaxation_level = int(ctx.constraint_relaxation_level or 0)
     where_parts = ["TRUE"]
+    join_parts: List[str] = []
     params: Dict[str, Any] = {"lim": 1200}
     sql_filters_applied: List[str] = []
 
@@ -1712,10 +1832,35 @@ def fetch_selection_suggestion_docs_from_db(
         params[param] = numeric_value
         sql_filters_applied.append(param)
 
+    def add_position_filter() -> None:
+        if relaxation_level >= 6 or not constraints.get("position"):
+            return
+        requested_groups = get_requested_position_groups(
+            f"{constraints.get('position') or ''} {ctx.effective_query or ''}"
+        ) or set()
+        position_codes = sorted({
+            code
+            for group in requested_groups
+            for code in POSITION_CODES_BY_GROUP.get(group, [])
+        })
+        if not position_codes:
+            return
+        params["position_codes"] = position_codes
+        params["lim"] = 300
+        join_parts.append("""
+            JOIN enterprise_player_position_labels position_labels
+              ON position_labels.player_data_id = player_data.id::text
+        """)
+        where_parts.append(
+            "position_labels.position_codes && CAST(:position_codes AS text[])"
+        )
+        sql_filters_applied.append("position")
+
     if relaxation_level < 8:
         add_text_filter("gender", "gender", constraints.get("gender"))
     if relaxation_level < 5:
         add_nationality_filter(constraints.get("nationality"))
+    add_position_filter()
     add_text_filter("league_name", "league", constraints.get("league"))
     if relaxation_level < 7 or getattr(ctx, "hard_team_constraint", False):
         add_team_filter(constraints.get("team"))
@@ -1730,11 +1875,13 @@ def fetch_selection_suggestion_docs_from_db(
         add_numeric_max("weight", "weight_max", constraints.get("weight_max"))
 
     where_sql = "\n                AND ".join(where_parts)
+    join_sql = "\n".join(join_parts)
     db = get_db()
     try:
         rows = db.execute(text(f"""
             SELECT id, metadata, content
             FROM player_data
+            {join_sql}
             WHERE
                 {where_sql}
             ORDER BY COALESCE((metadata->>'Rating')::numeric, 0) DESC
@@ -1912,8 +2059,24 @@ def build_filtered_retriever_agentic(
 ) -> Tuple[BaseRetriever, List[Document]]:
     docs: List[Document] = []
     diversify_teams = not bool(clean_constraints(ctx.constraints).get("team"))
+    constraints = clean_constraints(ctx.constraints)
+    relaxation_levels = [0]
+    for level, active in (
+        (1, bool(constraints.get("preferred_stats") or constraints.get("stat_requirements"))),
+        (2, constraints.get("weight_min") is not None or constraints.get("weight_max") is not None),
+        (3, constraints.get("height_min") is not None or constraints.get("height_max") is not None),
+        (4, constraints.get("age_min") is not None or constraints.get("age_max") is not None),
+        (5, bool(constraints.get("nationality"))),
+        (6, bool(constraints.get("position"))),
+        (7, bool(constraints.get("team")) and not ctx.hard_team_constraint),
+        (8, bool(constraints.get("gender"))),
+    ):
+        if active:
+            relaxation_levels.append(level)
+    relaxation_levels = sorted(set(level for level in relaxation_levels if level >= int(ctx.constraint_relaxation_level or 0)))
+    if not relaxation_levels:
+        relaxation_levels = [int(ctx.constraint_relaxation_level or 0)]
     if ctx.discovery_mode and not ctx.direct_player_lookup:
-        original_level = int(ctx.constraint_relaxation_level or 0)
         if ctx.quality_discovery_mode:
             docs = fetch_quality_suggestion_docs_from_db(ctx)
             if not docs:
@@ -1924,7 +2087,7 @@ def build_filtered_retriever_agentic(
                     "returned_count": 0,
                     "top_rejections": [("quality_docs_empty", 1)],
                 })
-                for level in range(original_level, 9):
+                for level in relaxation_levels:
                     ctx.constraint_relaxation_level = level
                     db_docs = fetch_selection_suggestion_docs_from_db(ctx, enforce_allowed_leagues=True)
                     docs = _merge_docs(docs, db_docs)
@@ -1933,7 +2096,7 @@ def build_filtered_retriever_agentic(
                         break
             if not docs:
                 ctx.allow_all_selection_leagues = True
-                for level in range(original_level, 9):
+                for level in relaxation_levels:
                     ctx.constraint_relaxation_level = level
                     db_docs = fetch_selection_suggestion_docs_from_db(ctx, enforce_allowed_leagues=False)
                     docs = _merge_docs(docs, db_docs)
@@ -1946,7 +2109,7 @@ def build_filtered_retriever_agentic(
                 docs = _merge_docs(docs, db_docs)
                 docs = _diverse_doc_cap(docs, limit=SELECTOR_CANDIDATE_LIMIT, diversify_teams=diversify_teams)
         else:
-            for level in range(original_level, 9):
+            for level in relaxation_levels:
                 ctx.constraint_relaxation_level = level
                 db_docs = fetch_selection_suggestion_docs_from_db(ctx, enforce_allowed_leagues=True)
                 docs = _merge_docs(docs, db_docs)
@@ -1955,7 +2118,7 @@ def build_filtered_retriever_agentic(
                     break
             if not docs:
                 ctx.allow_all_selection_leagues = True
-                for level in range(original_level, 9):
+                for level in relaxation_levels:
                     ctx.constraint_relaxation_level = level
                     db_docs = fetch_selection_suggestion_docs_from_db(ctx, enforce_allowed_leagues=False)
                     docs = _merge_docs(docs, db_docs)
@@ -2524,8 +2687,6 @@ def format_candidates_for_selector(candidates: List[Dict[str, Any]], *, max_stat
 def validate_candidate(candidate: Dict[str, Any], ctx: AgenticContext) -> Optional[str]:
     if not candidate.get("name"):
         return "missing player name"
-    if not ctx.direct_player_lookup and (candidate.get("potential") is None or candidate.get("form") is None):
-        return "missing AI scoring"
     reason = get_candidate_rejection_reason(
         candidate.get("name"),
         candidate.get("team"),
@@ -2544,10 +2705,6 @@ def validate_candidate(candidate: Dict[str, Any], ctx: AgenticContext) -> Option
             return "premium age restriction"
         if candidate.get("rating") is None or float(candidate["rating"]) <= 7:
             return "premium rating restriction"
-        if candidate.get("form") is None or int(candidate["form"]) <= 80:
-            return "premium form restriction"
-        if candidate.get("potential") is None or int(candidate["potential"]) <= 80:
-            return "premium potential restriction"
     if ctx.discovery_mode:
         missing_discovery = _missing_discovery_rejection(candidate.get("team"), candidate.get("position_name"), ctx)
         if missing_discovery:
@@ -2611,8 +2768,6 @@ def candidate_to_meta(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "position_count_total": candidate.get("position_count_total"),
             "position_names_seen": candidate.get("position_names_seen"),
             "primary_position_code": candidate.get("primary_position_code"),
-            "potential": candidate.get("potential"),
-            "form": candidate.get("form"),
         }]
     }
 
@@ -2624,8 +2779,6 @@ def build_payload_from_candidate(candidate: Dict[str, Any], seen_players: set[st
     if payload.get("players"):
         payload["players"][0].setdefault("id", candidate.get("id"))
         payload_meta = payload["players"][0].setdefault("meta", {})
-        payload_meta["potential"] = candidate.get("potential")
-        payload_meta["form"] = candidate.get("form")
         for key in ("position_counts", "position_count_total", "position_names_seen", "primary_position_code"):
             if candidate.get(key) is not None:
                 payload_meta[key] = candidate.get(key)

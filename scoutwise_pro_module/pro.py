@@ -227,4 +227,5 @@ def send_chat(
         "response": answer_text,
         "data": data,
         "response_parts": split_response_parts(answer_text),
+        "timing": result.get("timing"),
     }

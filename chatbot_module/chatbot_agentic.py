@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import time
 import warnings
 
 from dotenv import load_dotenv
@@ -24,32 +25,26 @@ from chatbot_module.chatbot import (
     SHARED_RETRIEVER,
     answer_question as legacy_answer_question,
     get_session_state,
-    output_tr_translate_chain,
     translate_to_english_if_needed,
 )
 from chatbot_module.prompts_agentic import (
     AGENTIC_COMPARISON_PROMPT,
-    AGENTIC_CONSTRAINT_PROMPT,
     AGENTIC_CONTROLLER_PROMPT,
     AGENTIC_FOLLOWUP_PROMPT,
     AGENTIC_IDENTITY_RESOLVER_PROMPT,
     AGENTIC_NAMED_COMPARISON_PROMPT,
     AGENTIC_NARRATIVE_PROMPT,
-    AGENTIC_SCORING_PROMPT,
     AGENTIC_SELECTOR_PROMPT,
 )
-from chatbot_module.prompts import (
-    translate_en_to_tr_system_message,
-    translate_tr_to_en_system_message,
-)
+from chatbot_module.prompts import translate_tr_to_en_system_message
 from chatbot_module.tools import (
     collect_recent_human_constraints,
     get_seen_players_from_history,
     is_generic_alternative_request,
     is_turkish,
 )
+from constants_module.constants import ROLE_LONG_TO_SHORT
 from chatbot_module.tools_agentic import (
-    apply_ai_scores_to_candidate,
     build_agentic_context,
     build_filtered_retriever_agentic,
     build_payload_from_candidate,
@@ -71,8 +66,6 @@ from chatbot_module.tools_agentic import (
     short_offtopic_response,
     validate_candidate,
 )
-from potential_form_module.form import reveal_player_form
-from potential_form_module.potential import reveal_player_potential
 
 
 controller_prompt = ChatPromptTemplate.from_messages([
@@ -85,19 +78,7 @@ controller_prompt = ChatPromptTemplate.from_messages([
      "Recent chat memory:\n{recent_memory}\n\n"
      "Return JSON only.")
 ])
-controller_chain = controller_prompt | CHAT_LLM | StrOutputParser()
-
-
-constraint_prompt = ChatPromptTemplate.from_messages([
-    ("system", AGENTIC_CONSTRAINT_PROMPT),
-    ("human",
-     "Original question:\n{original_question}\n\n"
-     "Translated English question:\n{translated_question}\n\n"
-     "Strategy:\n{strategy}\n\n"
-     "Recent carried constraints:\n{recent_constraints}\n\n"
-     "Return JSON only.")
-])
-constraint_chain = constraint_prompt | CHAT_LLM | StrOutputParser()
+controller_chain = controller_prompt | CHAT_LLM.bind(reasoning_effort="medium") | StrOutputParser()
 
 
 selector_prompt = ChatPromptTemplate.from_messages([
@@ -125,17 +106,6 @@ identity_resolver_prompt = ChatPromptTemplate.from_messages([
 identity_resolver_chain = identity_resolver_prompt | CHAT_LLM | StrOutputParser()
 
 
-scoring_prompt = ChatPromptTemplate.from_messages([
-    ("system", AGENTIC_SCORING_PROMPT),
-    ("human",
-     "User request:\n{question}\n\n"
-     "Strategy:\n{strategy}\n\n"
-     "Candidate profile and stats:\n{candidate_json}\n\n"
-     "Return JSON only.")
-])
-scoring_chain = scoring_prompt | CHAT_LLM | StrOutputParser()
-
-
 comparison_prompt = ChatPromptTemplate.from_messages([
     ("system", AGENTIC_COMPARISON_PROMPT),
     ("human",
@@ -143,6 +113,8 @@ comparison_prompt = ChatPromptTemplate.from_messages([
      "Strategy:\n{strategy}\n\n"
      "Seen players:\n{seen_players}\n\n"
      "Relevant memory:\n{memory}\n\n"
+     "Translate football metric names naturally into {output_language}; do not mix English metric names into a non-English answer.\n\n"
+     "Write the final answer directly in {output_language}.\n\n"
      "Write exactly 3 sentences.")
 ])
 comparison_chain = comparison_prompt | CHAT_LLM | StrOutputParser()
@@ -155,6 +127,8 @@ named_comparison_prompt = ChatPromptTemplate.from_messages([
      "Strategy:\n{strategy}\n\n"
      "Player A:\n{player_a_json}\n\n"
      "Player B:\n{player_b_json}\n\n"
+     "Translate football metric names naturally into {output_language}; do not mix English metric names into a non-English answer.\n\n"
+     "Write the final answer directly in {output_language}.\n\n"
      "Write exactly 3 sentences.")
 ])
 named_comparison_chain = named_comparison_prompt | CHAT_LLM | StrOutputParser()
@@ -167,6 +141,8 @@ narrative_prompt = ChatPromptTemplate.from_messages([
      "Team strategy / philosophy (may be empty):\n{strategy}\n\n"
      "Player profile:\n{profile_json}\n\n"
      "Stats (metric/value pairs):\n{stats_json}\n\n"
+     "Translate football metric names naturally into {output_language}; do not mix English metric names into a non-English answer.\n\n"
+     "Write the final answer directly in {output_language}.\n\n"
      "Write exactly 3 sentences.")
 ])
 narrative_chain = narrative_prompt | CHAT_LLM | StrOutputParser()
@@ -179,6 +155,8 @@ followup_prompt = ChatPromptTemplate.from_messages([
      "Strategy:\n{strategy}\n\n"
      "Seen players:\n{seen_players}\n\n"
      "Relevant memory:\n{memory}\n\n"
+     "Translate football metric names naturally into {output_language}; do not mix English metric names into a non-English answer.\n\n"
+     "Write the final answer directly in {output_language}.\n\n"
      "Write exactly 3 sentences.")
 ])
 followup_chain = followup_prompt | CHAT_LLM | StrOutputParser()
@@ -188,6 +166,67 @@ DEEPSEEK_INPUT_PRICE_PER_M = float(os.getenv("DEEPSEEK_INPUT_PRICE_PER_M", "0.14
 DEEPSEEK_OUTPUT_PRICE_PER_M = float(os.getenv("DEEPSEEK_OUTPUT_PRICE_PER_M", "0.28"))
 AGENTIC_FLOW_LOG = os.getenv("AGENTIC_FLOW_LOG", "1").lower() in {"1", "true", "yes", "on"}
 PRO_LOOKUP_FLOW_LOG = os.getenv("PRO_LOOKUP_FLOW_LOG", "1").lower() in {"1", "true", "yes", "on"}
+
+NARRATIVE_CATEGORY_METRICS = {
+    "goalkeeping": [
+        "Saves", "Saves Insidebox", "Penalties Saved", "Punches", "Good High Claim",
+    ],
+    "impact": [
+        "Rating", "Successful Dribbles", "Touches",
+    ],
+    "passing": [
+        "Accurate Passes (%)", "Passes In Final Third", "Through Balls Won",
+    ],
+    "shooting": [
+        "Shots On Target (%)", "Goal Conversion (%)", "Shot Quality (%)",
+    ],
+    "defending": [
+        "Tackles Won (%)", "Duels Won (%)", "Aerials Won (%)",
+    ],
+}
+
+NARRATIVE_ROLE_CATEGORIES = {
+    "GK": ("goalkeeping", "passing", "defending"),
+    "LWB": ("passing", "defending"),
+    "LB": ("passing", "defending"),
+    "LCB": ("passing", "defending"),
+    "CB": ("passing", "defending"),
+    "RCB": ("passing", "defending"),
+    "RB": ("passing", "defending"),
+    "RWB": ("passing", "defending"),
+    "LDM": ("passing", "defending"),
+    "CDM": ("passing", "defending"),
+    "RDM": ("passing", "defending"),
+    "LCM": ("impact", "defending", "passing", "shooting"),
+    "CM": ("impact", "defending", "passing", "shooting"),
+    "RCM": ("impact", "defending", "passing", "shooting"),
+    "LM": ("impact", "passing", "shooting"),
+    "LAM": ("impact", "passing", "shooting"),
+    "CAM": ("impact", "passing", "shooting"),
+    "RAM": ("impact", "passing", "shooting"),
+    "RM": ("impact", "passing", "shooting"),
+    "LW": ("impact", "passing", "shooting"),
+    "LCF": ("impact", "passing", "shooting"),
+    "CF": ("impact", "passing", "shooting"),
+    "RCF": ("impact", "passing", "shooting"),
+    "RW": ("impact", "passing", "shooting"),
+}
+
+
+def _narrative_stats_for_candidate(candidate: Dict[str, Any], stats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    raw_position = str(candidate.get("position_name") or "").strip()
+    role_code = ROLE_LONG_TO_SHORT.get(raw_position.lower()) or raw_position.upper()
+    categories = NARRATIVE_ROLE_CATEGORIES.get(role_code, ("impact", "passing", "shooting", "defending"))
+    allowed_metrics = {
+        metric
+        for category in categories
+        for metric in NARRATIVE_CATEGORY_METRICS[category]
+    }
+    return [
+        stat
+        for stat in stats or []
+        if stat.get("metric") in allowed_metrics and stat.get("value") is not None
+    ]
 
 
 def _estimate_tokens(text: Any) -> int:
@@ -199,6 +238,8 @@ def _estimate_tokens(text: Any) -> int:
 
 def _new_trace() -> Dict[str, Any]:
     return {
+        "started_at": time.perf_counter(),
+        "step_timings": [],
         "agents": [],
         "tools": [],
         "flow": [],
@@ -215,10 +256,31 @@ def _new_trace() -> Dict[str, Any]:
 
 
 def _trace_step(trace: Dict[str, Any], kind: str, name: str) -> None:
+    trace["step_timings"].append({"step": f"{kind}:{name}", "started_at": time.perf_counter()})
     trace["flow"].append(f"{kind}:{name}")
     bucket = "agents" if kind == "agent" else "tools"
     if name not in trace[bucket]:
         trace[bucket].append(name)
+
+
+def _timing_report(trace: Dict[str, Any]) -> Dict[str, Any]:
+    finished_at = time.perf_counter()
+    points = trace.get("step_timings") or []
+    steps = []
+    first_started_at = points[0]["started_at"] if points else finished_at
+    startup_ms = max(0.0, (first_started_at - trace["started_at"]) * 1000)
+    if startup_ms >= 0.05:
+        steps.append({"step": "request_setup", "duration_ms": round(startup_ms, 1)})
+    for index, point in enumerate(points):
+        next_started_at = points[index + 1]["started_at"] if index + 1 < len(points) else finished_at
+        steps.append({
+            "step": point["step"],
+            "duration_ms": round(max(0.0, next_started_at - point["started_at"]) * 1000, 1),
+        })
+    return {
+        "total_ms": round(max(0.0, finished_at - trace["started_at"]) * 1000, 1),
+        "steps": steps,
+    }
 
 
 def _pro_lookup_log(event: str, payload: Dict[str, Any]) -> None:
@@ -268,11 +330,7 @@ def _trace_translation_cost(
 ) -> None:
     if trace is None:
         return
-    system_prompt = (
-        translate_tr_to_en_system_message
-        if direction == "to_english"
-        else translate_en_to_tr_system_message
-    )
+    system_prompt = translate_tr_to_en_system_message
     _trace_llm_cost(trace, system_prompt + (source_text or ""), translated_text or "")
 
 
@@ -507,22 +565,25 @@ def _merge_turn_constraints(previous: Dict[str, Any], current: Dict[str, Any], q
     return clean_constraints(merged)
 
 
-def _translate_output_if_needed(text: str, lang: str, trace: Optional[Dict[str, Any]] = None) -> str:
-    if not is_turkish(lang):
-        return text
-    try:
-        translated = output_tr_translate_chain.invoke({"text": text}).strip()
-        if trace is not None:
-            _trace_step(trace, "agent", "translate_to_user_language")
-            _trace_translation_cost(
-                trace,
-                source_text=text,
-                translated_text=translated or text,
-                direction="to_user_language",
-            )
-        return translated or text
-    except Exception:
-        return text
+def _output_language(lang: str) -> str:
+    return "Turkish" if is_turkish(lang) else "English"
+
+
+def _fallback_player_narrative(profile: Dict[str, Any], lang: str) -> str:
+    name = str(profile.get("name") or "The player")
+    team = str(profile.get("team") or profile.get("club") or "the current club")
+    position = str(profile.get("position_name") or profile.get("position") or "the requested role")
+    if is_turkish(lang):
+        return (
+            f"{name}, {team} takımında {position} pozisyonunda görev yapan bir oyuncudur. "
+            "Mevcut veri profili, uygulanan arama kriterleriyle eşleştiğini gösteriyor. "
+            "Ayrıntılı performans anlatımı model bağlantısındaki geçici sorun nedeniyle şu anda oluşturulamadı."
+        )
+    return (
+        f"{name} plays for {team} in the {position} role. "
+        "The available data profile matches the applied search criteria. "
+        "The detailed performance narrative could not be generated because of a temporary model connection issue."
+    )
 
 
 def _no_candidate_response(ctx, session_id: str, trace: Dict[str, Any]) -> Dict[str, Any]:
@@ -530,7 +591,12 @@ def _no_candidate_response(ctx, session_id: str, trace: Dict[str, Any]) -> Dict[
         "I could not find a player matching those exact filters in the current database. "
         "Try broadening the club, nationality, position, or league constraint."
     )
-    answer = _translate_output_if_needed(message, ctx.lang, trace)
+    answer = (
+        "Mevcut veritabanında bu filtrelerle eşleşen bir oyuncu bulamadım. "
+        "Kulüp, milliyet, pozisyon veya lig kriterini genişletmeyi deneyin."
+        if is_turkish(ctx.lang)
+        else message
+    )
     payload = {"players": []}
     _persist_turn(session_id, ctx.translated_question, message, payload)
     _trace_step(trace, "tool", "persist_memory")
@@ -564,81 +630,6 @@ def _controller_decision(
         return {}
 
 
-def _constraint_decision(
-    *,
-    original_question: str,
-    translated_question: str,
-    strategy: Optional[str],
-    recent_constraints: List[str],
-    trace: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    try:
-        payload = {
-            "original_question": original_question,
-            "translated_question": translated_question,
-            "strategy": strategy or "",
-            "recent_constraints": "\n".join(f"- {item}" for item in recent_constraints or []) or "None",
-        }
-        if trace is not None:
-            _trace_step(trace, "agent", "constraint_extractor")
-        raw = constraint_chain.invoke(payload)
-        if trace is not None:
-            _trace_llm_cost(trace, AGENTIC_CONSTRAINT_PROMPT + json.dumps(payload, ensure_ascii=False), raw)
-        return clean_constraints(extract_json_object(raw))
-    except Exception:
-        return {}
-
-
-def _score_candidate_with_ai(
-    candidate: Dict[str, Any],
-    *,
-    question: str,
-    strategy: Optional[str],
-    trace: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    player_id = candidate.get("id")
-    if player_id is not None:
-        if trace is not None:
-            _trace_step(trace, "agent", "scoring")
-        db = get_db()
-        try:
-            potential_result = reveal_player_potential(db, player_id)
-            form_result = reveal_player_form(db, player_id)
-            return apply_ai_scores_to_candidate(candidate, {
-                "potential": potential_result.get("potential"),
-                "form": form_result.get("form"),
-            })
-        except Exception:
-            pass
-        finally:
-            db.close()
-
-    compact_candidate = {
-        "name": candidate.get("name"),
-        "age": candidate.get("age"),
-        "height": candidate.get("height"),
-        "weight": candidate.get("weight"),
-        "nationality": candidate.get("nationality"),
-        "team": candidate.get("team"),
-        "league_name": candidate.get("league_name"),
-        "position_name": candidate.get("position_name"),
-        "match_count": candidate.get("match_count"),
-        "rating": candidate.get("rating"),
-        "stats": candidate.get("stats") or [],
-    }
-    payload = {
-        "question": question,
-        "strategy": strategy or "",
-        "candidate_json": json.dumps(compact_candidate, ensure_ascii=False),
-    }
-    if trace is not None:
-        _trace_step(trace, "agent", "scoring")
-    raw = scoring_chain.invoke(payload)
-    if trace is not None:
-        _trace_llm_cost(trace, AGENTIC_SCORING_PROMPT + json.dumps(payload, ensure_ascii=False), raw)
-    return apply_ai_scores_to_candidate(candidate, extract_json_object(raw))
-
-
 def _resolve_direct_identity_with_ai(
     *,
     question: str,
@@ -647,6 +638,8 @@ def _resolve_direct_identity_with_ai(
 ) -> Optional[Dict[str, Any]]:
     if not candidates:
         return None
+    if len(candidates) == 1:
+        return candidates[0]
     candidate_list = format_candidates_for_selector(candidates, max_stats=6)
     payload = {
         "question": question,
@@ -654,7 +647,10 @@ def _resolve_direct_identity_with_ai(
     }
     if trace is not None:
         _trace_step(trace, "agent", "identity_resolver")
-    raw = identity_resolver_chain.invoke(payload)
+    try:
+        raw = identity_resolver_chain.invoke(payload)
+    except Exception:
+        return candidates[0]
     if trace is not None:
         _trace_llm_cost(trace, AGENTIC_IDENTITY_RESOLVER_PROMPT + json.dumps(payload, ensure_ascii=False), raw)
     data = extract_json_object(raw)
@@ -738,15 +734,6 @@ def _answer_named_comparison(
         candidate = _resolve_named_player_for_comparison(name=name, trace=trace)
         if not candidate:
             return None
-        try:
-            candidate = _score_candidate_with_ai(
-                candidate,
-                question=translated_question,
-                strategy=strategy,
-                trace=trace,
-            )
-        except Exception:
-            pass
         resolved.append(candidate)
 
     payload = {
@@ -754,13 +741,14 @@ def _answer_named_comparison(
         "strategy": strategy or "",
         "player_a_json": json.dumps(_compact_comparison_player(resolved[0]), ensure_ascii=False),
         "player_b_json": json.dumps(_compact_comparison_player(resolved[1]), ensure_ascii=False),
+        "output_language": _output_language(lang),
     }
     if trace is not None:
         _trace_step(trace, "agent", "named_comparison")
     raw = named_comparison_chain.invoke(payload).strip()
     if trace is not None:
         _trace_llm_cost(trace, AGENTIC_NAMED_COMPARISON_PROMPT + json.dumps(payload, ensure_ascii=False), raw)
-    answer = _translate_output_if_needed(raw, lang, trace)
+    answer = raw
     _persist_turn(session_id, translated_question, raw, {"players": []})
     if trace is not None:
         _trace_step(trace, "tool", "persist_memory")
@@ -806,8 +794,6 @@ def _choose_scored_candidate(
 
     def quality_key(candidate: Dict[str, Any]) -> tuple:
         return (
-            candidate.get("potential") or 0,
-            candidate.get("form") or 0,
             len(candidate.get("stats") or []),
             candidate.get("match_count") or 0,
             candidate.get("rating") or 0,
@@ -815,16 +801,7 @@ def _choose_scored_candidate(
         )
 
     for candidate in ordered:
-        try:
-            scored = _score_candidate_with_ai(
-                candidate,
-                question=ctx.effective_query,
-                strategy=strategy,
-                trace=trace,
-            )
-        except Exception:
-            score_rejections["scoring_exception"] = score_rejections.get("scoring_exception", 0) + 1
-            continue
+        scored = candidate
         scored_candidates.append(scored)
         rejection = validate_candidate(scored, ctx)
         sample = {
@@ -964,13 +941,14 @@ def _answer_seen_or_comparison(
             "strategy": strategy or "",
             "seen_players": ", ".join(sorted(seen_players)),
             "memory": _recent_memory_text(history_rows, limit=12),
+            "output_language": _output_language(lang),
         }
         if trace is not None:
             _trace_step(trace, "agent", "comparison")
         raw = comparison_chain.invoke(payload).strip()
         if trace is not None:
             _trace_llm_cost(trace, AGENTIC_COMPARISON_PROMPT + json.dumps(payload, ensure_ascii=False), raw)
-        answer = _translate_output_if_needed(raw, lang, trace)
+        answer = raw
         _persist_turn(session_id, translated_question, raw, {"players": []})
         if trace is not None:
             _trace_step(trace, "tool", "persist_memory")
@@ -982,13 +960,14 @@ def _answer_seen_or_comparison(
         "strategy": strategy or "",
         "seen_players": ", ".join(sorted(seen_players)),
         "memory": _recent_memory_text(history_rows, limit=12),
+        "output_language": _output_language(lang),
     }
     if trace is not None:
         _trace_step(trace, "agent", "seen_player_followup")
     raw = followup_chain.invoke(payload).strip()
     if trace is not None:
         _trace_llm_cost(trace, AGENTIC_FOLLOWUP_PROMPT + json.dumps(payload, ensure_ascii=False), raw)
-    answer = _translate_output_if_needed(raw, lang, trace)
+    answer = raw
     _persist_turn(session_id, translated_question, raw, {"players": []})
     if trace is not None:
         _trace_step(trace, "tool", "persist_memory")
@@ -1002,8 +981,8 @@ def answer_question(
     strategy: Optional[str] = None,
 ) -> Dict[str, Any]:
     trace = _new_trace()
-    lang, history_rows = get_session_state(session_id)
     _trace_step(trace, "tool", "load_memory")
+    lang, history_rows = get_session_state(session_id)
     ai_msgs: List[AIMessage] = [
         AIMessage(content=row["content"])
         for row in history_rows
@@ -1013,9 +992,10 @@ def answer_question(
     _trace_step(trace, "tool", "seen_players")
 
     original_question = question or ""
-    translated_raw = translate_to_english_if_needed(original_question, lang)
     if is_turkish(lang):
         _trace_step(trace, "agent", "translate_to_english")
+    translated_raw = translate_to_english_if_needed(original_question, lang)
+    if is_turkish(lang):
         _trace_translation_cost(
             trace,
             source_text=original_question,
@@ -1055,9 +1035,14 @@ def answer_question(
         "comparison_players": planner_data.get("comparison_players"),
         "raw_keys": sorted(planner_data.keys()),
     })
-    continuation_request = planner_intent == "alternative_recommendation" or is_generic_alternative_request(
-        planner_data.get("effective_query") or translated_raw,
+    continuation_request = (
+        planner_intent == "alternative_recommendation"
+        or is_generic_alternative_request(planner_data.get("effective_query") or translated_raw)
+        or is_generic_alternative_request(original_question)
     )
+    if continuation_request and not planner_intent:
+        planner_data["intent"] = "alternative_recommendation"
+        planner_data["needs_new_player"] = True
     previous_constraints = _last_agentic_constraints(history_rows) if continuation_request else {}
     carried_constraints = (
         collect_recent_human_constraints(
@@ -1068,17 +1053,9 @@ def answer_question(
         if continuation_request
         else []
     )
-    constraints = _constraint_decision(
-        original_question=original_question,
-        translated_question=planner_data.get("effective_query") or translated_raw,
-        strategy=strategy,
-        recent_constraints=carried_constraints,
-        trace=trace,
-    )
+    constraints = clean_constraints(planner_data.get("constraints") or {})
     inferred_exclusions = infer_excluded_constraints_from_text(
-        original_question,
         translated_raw,
-        planner_data.get("effective_query") or "",
     )
     for key, values in inferred_exclusions.items():
         if values:
@@ -1086,10 +1063,7 @@ def answer_question(
     constraints = clean_constraints(constraints)
 
     inferred_nationality = infer_nationality_from_text(
-        original_question,
         translated_raw,
-        planner_data.get("effective_query") or "",
-        strategy or "",
     )
     if (
         inferred_nationality
@@ -1098,10 +1072,7 @@ def answer_question(
     ):
         constraints["nationality"] = inferred_nationality
     inferred_position = infer_position_from_text(
-        original_question,
         translated_raw,
-        planner_data.get("effective_query") or "",
-        strategy or "",
     )
     if (
         inferred_position
@@ -1110,18 +1081,15 @@ def answer_question(
     ):
         constraints["position"] = inferred_position
     inferred_league = infer_league_from_text(
-        original_question,
         translated_raw,
-        planner_data.get("effective_query") or "",
-        strategy or "",
     )
-    if inferred_league and not constraints.get("league") and inferred_league not in (constraints.get("excluded_leagues") or []):
-        constraints["league"] = inferred_league
+    constraints["league"] = (
+        inferred_league
+        if inferred_league and inferred_league not in (constraints.get("excluded_leagues") or [])
+        else None
+    )
     inferred_stats = infer_preferred_stats_from_text(
-        original_question,
         translated_raw,
-        planner_data.get("effective_query") or "",
-        strategy or "",
         "\n".join(carried_constraints),
     )
     if inferred_stats:
@@ -1132,7 +1100,7 @@ def answer_question(
             if len(merged_stats) >= 4:
                 break
         constraints["preferred_stats"] = merged_stats
-    constraints = _merge_turn_constraints(previous_constraints, constraints, original_question)
+    constraints = _merge_turn_constraints(previous_constraints, constraints, translated_raw)
     _pro_lookup_log("constraints", {
         "continuation_request": continuation_request,
         "carried_count": len(carried_constraints or []),
@@ -1461,10 +1429,32 @@ def answer_question(
             "seen_players": ", ".join(sorted(seen_players)) if seen_players else "None",
             "candidate_list": candidate_list,
         }
-        _trace_step(trace, "agent", "selector")
-        selector_raw = selector_chain.invoke(selector_payload)
-        _trace_llm_cost(trace, AGENTIC_SELECTOR_PROMPT + json.dumps(selector_payload, ensure_ascii=False), selector_raw)
-        selector_data = extract_json_object(selector_raw)
+        if ctx.direct_player_lookup and len(candidates) == 1:
+            selector_data = {
+                "selected_index": candidates[0].get("index") or 1,
+                "player_name": candidates[0].get("name"),
+                "confidence": 1.0,
+                "risk_flags": [],
+            }
+            trace["selection_mode"] = "direct_lookup_single_candidate"
+        else:
+            _trace_step(trace, "agent", "selector")
+            try:
+                selector_raw = selector_chain.invoke(selector_payload)
+                _trace_llm_cost(trace, AGENTIC_SELECTOR_PROMPT + json.dumps(selector_payload, ensure_ascii=False), selector_raw)
+                selector_data = extract_json_object(selector_raw)
+            except Exception as exc:
+                _pro_lookup_log("selector_fallback", {
+                    "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                    "candidate_count": len(candidates),
+                })
+                selector_data = {
+                    "selected_index": None,
+                    "player_name": None,
+                    "confidence": 0.0,
+                    "risk_flags": ["selector_unavailable"],
+                }
+                trace["selection_mode"] = "deterministic_selector_fallback"
         selected_index = selector_data.get("selected_index")
         try:
             selected_index = int(selected_index) if selected_index is not None else None
@@ -1521,7 +1511,10 @@ def answer_question(
 
         p0 = (payload.get("players") or [None])[0] or {}
         profile_meta = p0.get("meta") or {}
-        stats = p0.get("stats") or selected.get("stats") or []
+        stats = _narrative_stats_for_candidate(
+            selected,
+            p0.get("stats") or selected.get("stats") or [],
+        )
         profile_json = json.dumps({
             "name": p0.get("name") or selected.get("name"),
             "target_team_fit_context": ctx.target_team or None,
@@ -1534,15 +1527,26 @@ def answer_question(
             "strategy": strategy or "",
             "profile_json": profile_json,
             "stats_json": stats_json,
+            "output_language": _output_language(lang),
         }
         _trace_step(trace, "agent", "final_narrative")
-        memory_out = narrative_chain.invoke(narrative_payload).strip()
-        _trace_llm_cost(trace, AGENTIC_NARRATIVE_PROMPT + json.dumps(narrative_payload, ensure_ascii=False), memory_out)
-        answer = _translate_output_if_needed(memory_out, lang, trace)
-        _persist_turn(session_id, ctx.translated_question, memory_out, payload)
+        try:
+            memory_out = narrative_chain.invoke(narrative_payload).strip()
+            _trace_llm_cost(trace, AGENTIC_NARRATIVE_PROMPT + json.dumps(narrative_payload, ensure_ascii=False), memory_out)
+        except Exception as exc:
+            _pro_lookup_log("final_narrative_fallback", {
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                "player": profile_meta.get("name") or p0.get("name") or selected.get("name"),
+            })
+            memory_out = _fallback_player_narrative({
+                "name": p0.get("name") or selected.get("name"),
+                **profile_meta,
+            }, lang)
+        answer = memory_out
         _trace_step(trace, "tool", "persist_memory")
+        _persist_turn(session_id, ctx.translated_question, memory_out, payload)
         _log_trace(trace, session_id=session_id, outcome="agentic_success")
-        return {"answer": answer, "data": payload}
+        return {"answer": answer, "data": payload, "timing": _timing_report(trace)}
 
     except Exception as exc:
         _log_trace(trace, session_id=session_id, outcome=f"agentic_exception:{type(exc).__name__}:{str(exc)[:120]}")
