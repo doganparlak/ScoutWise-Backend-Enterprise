@@ -3,7 +3,6 @@ import json
 import os
 import random
 import re
-import time
 import warnings
 
 from dotenv import load_dotenv
@@ -238,8 +237,6 @@ def _estimate_tokens(text: Any) -> int:
 
 def _new_trace() -> Dict[str, Any]:
     return {
-        "started_at": time.perf_counter(),
-        "step_timings": [],
         "agents": [],
         "tools": [],
         "flow": [],
@@ -256,31 +253,10 @@ def _new_trace() -> Dict[str, Any]:
 
 
 def _trace_step(trace: Dict[str, Any], kind: str, name: str) -> None:
-    trace["step_timings"].append({"step": f"{kind}:{name}", "started_at": time.perf_counter()})
     trace["flow"].append(f"{kind}:{name}")
     bucket = "agents" if kind == "agent" else "tools"
     if name not in trace[bucket]:
         trace[bucket].append(name)
-
-
-def _timing_report(trace: Dict[str, Any]) -> Dict[str, Any]:
-    finished_at = time.perf_counter()
-    points = trace.get("step_timings") or []
-    steps = []
-    first_started_at = points[0]["started_at"] if points else finished_at
-    startup_ms = max(0.0, (first_started_at - trace["started_at"]) * 1000)
-    if startup_ms >= 0.05:
-        steps.append({"step": "request_setup", "duration_ms": round(startup_ms, 1)})
-    for index, point in enumerate(points):
-        next_started_at = points[index + 1]["started_at"] if index + 1 < len(points) else finished_at
-        steps.append({
-            "step": point["step"],
-            "duration_ms": round(max(0.0, next_started_at - point["started_at"]) * 1000, 1),
-        })
-    return {
-        "total_ms": round(max(0.0, finished_at - trace["started_at"]) * 1000, 1),
-        "steps": steps,
-    }
 
 
 def _pro_lookup_log(event: str, payload: Dict[str, Any]) -> None:
@@ -1546,7 +1522,7 @@ def answer_question(
         _trace_step(trace, "tool", "persist_memory")
         _persist_turn(session_id, ctx.translated_question, memory_out, payload)
         _log_trace(trace, session_id=session_id, outcome="agentic_success")
-        return {"answer": answer, "data": payload, "timing": _timing_report(trace)}
+        return {"answer": answer, "data": payload}
 
     except Exception as exc:
         _log_trace(trace, session_id=session_id, outcome=f"agentic_exception:{type(exc).__name__}:{str(exc)[:120]}")
