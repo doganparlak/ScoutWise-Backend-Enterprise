@@ -49,6 +49,12 @@ from api_module.models import (
     PlayerPoolSearchIn,
     PlayerPoolSearchRow,
     PlayerPoolWeeklyPopularIn,
+    PlayerCompSeasonAggregateIn,
+    PlayerCompSeasonAggregateOut,
+    PlayerCompSeasonCandidateOut,
+    PlayerCompSeasonOptionsOut,
+    PlayerCompSeasonRowsOut,
+    PlayerCompSeasonSearchIn,
     SetNewPasswordIn,
     SignupCodeRequestIn,
     SignUpIn,
@@ -72,6 +78,12 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
+from player_comp_season_module import (
+    aggregate_player_seasons,
+    get_player_season_rows,
+    get_season_player_nationalities,
+    search_season_players,
+)
 from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
@@ -1745,6 +1757,72 @@ def player_pool_options(
 ):
     del user_id
     return get_player_pool_filter_options(db, worldCupMode)
+
+
+@app.post(
+    "/player-comp-season/search",
+    response_model=list[PlayerCompSeasonCandidateOut],
+)
+def player_comp_season_search(
+    payload: PlayerCompSeasonSearchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return search_season_players(
+        db,
+        payload.query,
+        payload.limit,
+        payload.nationality,
+    )
+
+
+@app.get(
+    "/player-comp-season/options",
+    response_model=PlayerCompSeasonOptionsOut,
+)
+def player_comp_season_options(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return {"nationalities": get_season_player_nationalities(db)}
+
+
+@app.get(
+    "/player-comp-season/players/{player_id}/rows",
+    response_model=PlayerCompSeasonRowsOut,
+)
+def player_comp_season_rows(
+    player_id: int,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    try:
+        return get_player_season_rows(db, player_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/player-comp-season/aggregate",
+    response_model=PlayerCompSeasonAggregateOut,
+)
+def player_comp_season_aggregate(
+    payload: PlayerCompSeasonAggregateIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    try:
+        return aggregate_player_seasons(
+            db,
+            payload.playerId,
+            [source.model_dump() for source in payload.sources],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/league-pool/options", response_model=LeaguePoolFilterOptionsOut)
