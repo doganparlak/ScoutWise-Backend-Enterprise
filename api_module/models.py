@@ -138,7 +138,7 @@ class MatchAnalysisSearchIn(BaseModel):
     startDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     endDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     page: int = Field(default=1, ge=1)
-    limit: int = Field(default=20, ge=1, le=20)
+    limit: int = Field(default=50, ge=1, le=50)
 
 
 class MatchAnalysisSearchOut(BaseModel):

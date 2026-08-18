@@ -14,7 +14,8 @@ SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
 MAX_DATE_RANGE_DAYS = 100
-MAX_UPSTREAM_PAGES = 1
+MAX_UPSTREAM_PAGES = 5
+MAX_FIXTURE_RESULTS = 50
 
 
 class SportMonksError(RuntimeError):
@@ -168,12 +169,12 @@ def search_fixtures(filters: dict[str, Any]) -> dict[str, Any]:
 
     league_id = filters.get("leagueId")
     page = max(1, int(filters.get("page") or 1))
-    limit = min(max(1, int(filters.get("limit") or 20)), 20)
+    limit = min(max(1, int(filters.get("limit") or MAX_FIXTURE_RESULTS)), MAX_FIXTURE_RESULTS)
     params: dict[str, Any] = {
         "api_token": token,
         "include": "participants;league.country;state;scores",
         "order": "asc",
-        "per_page": 20,
+        "per_page": MAX_FIXTURE_RESULTS,
         "page": page,
     }
     upstream_filters: list[str] = []
