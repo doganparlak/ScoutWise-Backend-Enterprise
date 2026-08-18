@@ -566,6 +566,41 @@ def get_enterprise_dashboard_report(
     }
 
 
+@app.get("/dashboard/match-reports")
+def list_enterprise_dashboard_match_reports(
+    limit: int = FastAPIQuery(default=12, ge=1, le=50),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, fixture_id, fixture_payload, report_status,
+                   report_ready_at, created_at, updated_at
+            FROM enterprise_favorite_matches
+            WHERE user_id = :user_id
+              AND report_status = 'ready'
+              AND report_content IS NOT NULL
+            ORDER BY report_ready_at DESC NULLS LAST, updated_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"user_id": user_id, "limit": limit},
+    ).mappings().all()
+    return [
+        {
+            "favoriteId": str(row["id"]),
+            "fixtureId": int(row["fixture_id"]),
+            "fixture": dict(row["fixture_payload"] or {}),
+            "status": row["report_status"],
+            "readyAt": row["report_ready_at"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
 @app.get("/pro/strategy", response_model=EnterpriseProStrategyOut)
 def pro_strategy_get(
     user_id: str = Depends(require_auth),
@@ -1909,6 +1944,31 @@ def list_enterprise_favorite_matches(
     ]
 
 
+def _is_completed_enterprise_fixture(fixture: dict[str, Any]) -> bool:
+    state = fixture.get("state") or {}
+    code = str(
+        state.get("code")
+        or state.get("short_name")
+        or state.get("state")
+        or ""
+    ).strip().upper().replace(" ", "_")
+    if code in {"FT", "AET", "PEN", "WO", "AWARDED"}:
+        return True
+    name = str(state.get("name") or "").strip().casefold()
+    return any(
+        marker in name
+        for marker in (
+            "full time",
+            "finished",
+            "completed",
+            "after extra time",
+            "after penalties",
+            "walkover",
+            "awarded",
+        )
+    )
+
+
 @app.post("/favorite-matches", response_model=EnterpriseFavoriteMatchOut)
 def save_enterprise_favorite_match(
     payload: EnterpriseFavoriteMatchIn,
@@ -1916,6 +1976,11 @@ def save_enterprise_favorite_match(
     db: Session = Depends(get_db),
 ):
     fixture = payload.fixture
+    if not _is_completed_enterprise_fixture(fixture):
+        raise HTTPException(
+            status_code=409,
+            detail="Only completed matches can be saved",
+        )
     country = fixture.get("country") or {}
     league = fixture.get("league") or {}
     home_team = fixture.get("homeTeam") or {}
@@ -2018,7 +2083,8 @@ def create_enterprise_match_report(
     row = db.execute(
         text(
             """
-            SELECT id, fixture_id, report_status, report_content
+            SELECT id, fixture_id, state_code, state_name,
+                   report_status, report_content
             FROM enterprise_favorite_matches
             WHERE id = :favorite_id AND user_id = :user_id
             LIMIT 1
@@ -2028,6 +2094,13 @@ def create_enterprise_match_report(
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Favorite match not found")
+    if not _is_completed_enterprise_fixture(
+        {"state": {"code": row["state_code"], "name": row["state_name"]}}
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A match report can only be created after the match is completed",
+        )
 
     cached = dict(row["report_content"] or {})
     if (
