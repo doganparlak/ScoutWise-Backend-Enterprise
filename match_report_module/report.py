@@ -12,7 +12,7 @@ import requests
 SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
-MATCH_REPORT_VERSION = 37
+MATCH_REPORT_VERSION = 39
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -758,8 +758,8 @@ def _build_team_deep_analyses(report: dict[str, Any], lang: str) -> dict[str, li
         return values
 
     compact: dict[str, Any] = {"match": report.get("fixture"), "teams": {}}
-    fallback_headers_tr = ["Oyun Kimliği", "Üretim ve Verimlilik", "Kadro Kullanımı", "Maçın Kırılma Anları", "Baskı ve Dayanıklılık"]
-    fallback_headers_en = ["Game Identity", "Production and Efficiency", "Squad Usage", "Turning Points", "Pressure and Resilience"]
+    fallback_headers_tr = ["Oyun Kimliği", "Üretim ve Verimlilik", "Kadro Kullanımı", "Maçın Kırılma Anları", "Maç Yönetimi"]
+    fallback_headers_en = ["Game Identity", "Production and Efficiency", "Squad Usage", "Turning Points", "Game Management"]
     fallback: dict[str, list[dict[str, str]]] = {}
     for team in teams:
         team_id = team.get("id")
@@ -811,7 +811,7 @@ def _build_team_deep_analyses(report: dict[str, Any], lang: str) -> dict[str, li
             "period_metrics": scoped_periods,
             "players_used": team_lineups,
             "events": [event for event in events if event.get("team_id") == team_id],
-            "pressure_summary": pressure_by_half,
+            **({"pressure_summary": pressure_by_half} if pressure else {}),
         }
         headers = fallback_headers_tr if lang == "tr" else fallback_headers_en
         fallback[team_key] = [
@@ -828,7 +828,8 @@ def _build_team_deep_analyses(report: dict[str, Any], lang: str) -> dict[str, li
         response = ChatOpenAI(model=model, api_key=os.environ["OPENAI_API_KEY"], temperature=0.25).invoke([
             (
                 "system",
-                "You are ScoutWise Enterprise's senior match analyst. Return only valid JSON keyed by the supplied team IDs. Each team value must be an array of exactly five objects with exactly header, text, and tone. tone must be exactly positive, negative, or neutral. Assign positive when the central conclusion is a strength, successful effect, superiority, or effective response; negative when it is a weakness, inefficiency, error pattern, vulnerability, deterioration, or failed conversion; neutral when it is genuinely balanced, descriptive, or mixed without one dominant direction. Classify the central conclusion, not isolated sentences. Select five distinct, dynamic headers from the evidence; do not reuse a fixed template and do not use generic headings such as 'General Analysis'. Each header must capture the central football insight of its bullet in 2-5 words. Never mention, spell out, or encode a formation or numeric shape in a header: forbidden examples include '4-2-3-1', 'dört-iki-üç-bir', 'daralan 4-1-4-1', or 'üretken dört-iki-üç-bir'. Headers must describe the actual insight, such as control, width, finishing, resistance, transition risk, or late pressure. Formations may appear factually inside the text only. Each text must be a concise but evidence-led analysis of 40-60 words in the requested language. Read each team in relation to its opponent by combining formation, starters and substitutes with positions and formation fields, substitution timing, player ratings and metrics, overall and half-by-half team metrics, match events, score flow, and pressure/momentum summaries. Explain structural meaning, changes across the match, volume versus efficiency, personnel effects, strengths, vulnerabilities, and observable turning points without repeating evidence or packing several ideas into one sentence. Across the five bullets, cover shape/personnel, attacking production, possession/passing or progression, defensive/error discipline, and temporal pressure/event flow, but let the actual headers emerge from the match evidence. Formation fields establish only a player's line and slot, not a specific tactical role. Never label players as a number 6, 8, 10, regista, double pivot, double six, inverted fullback, or another inferred role unless that role is explicitly present in the supplied data. Prefer factual phrases such as 'central-midfield pair', 'same midfield line', or their natural equivalent. Do not claim causation from coincidence, attack direction, or unavailable tactical intent. Do not invent data. Do not use markdown, bullet characters, recommendations, or raw pressure numbers; translate pressure values into relative qualitative language.",
+                "You are ScoutWise Enterprise's senior match analyst. Return only valid JSON keyed by the supplied team IDs. Each team value must be an array of exactly five objects with exactly header, text, and tone. tone must be exactly positive, negative, or neutral. Assign positive when the central conclusion is a strength, successful effect, superiority, or effective response; negative when the central conclusion is a weakness, inefficiency, error pattern, vulnerability, deterioration, or failed conversion; neutral when it is genuinely balanced, descriptive, or mixed without one dominant direction. Classify the central conclusion, not isolated sentences. Select five distinct, dynamic headers from the evidence; do not reuse a fixed template and do not use generic headings such as 'General Analysis'. Each header must capture the central football insight of its bullet in 2-5 words. Never mention, spell out, or encode a formation or numeric shape in a header. Formations may appear factually inside the text only. Each text must be a concise but evidence-led analysis of 40-60 words in the requested language. Read each team in relation to its opponent by combining formation, starters and substitutes with positions and formation fields, substitution timing, player ratings and metrics, overall and half-by-half team metrics, match events, score flow, and any supplied pressure summaries. Explain structural meaning, changes across the match, volume versus efficiency, personnel effects, strengths, vulnerabilities, and observable turning points without repeating evidence. Across the five bullets, cover shape/personnel, attacking production, possession/passing or progression, defensive/error discipline, and temporal event flow. Formation fields establish only a player's line and slot, not a specific tactical role. Never infer unsupported roles, causation, attack direction, or tactical intent. Do not invent data. Do not use markdown, bullet characters, recommendations, or raw pressure numbers."
+                + (" No Pressure Index evidence is available: never mention pressure, momentum, dominance derived from pressure, pressure changes, or a Pressure Index." if not pressure else " Translate supplied pressure values into relative qualitative language."),
             ),
             ("human", f"Language: {language}\nFull match evidence by team:\n{json.dumps(compact, ensure_ascii=False, default=str)}"),
         ])
@@ -864,6 +865,8 @@ def _build_team_deep_analyses(report: dict[str, Any], lang: str) -> dict[str, li
 
 def _build_report_overview_summary(report: dict[str, Any], lang: str) -> list[dict[str, Any]]:
     teams = report.get("teams") or []
+    has_pressure = bool(report.get("pressure"))
+    has_territory = bool(report.get("ball_coordinates"))
     compact = {
         "fixture": report.get("fixture"),
         "league": report.get("league"),
@@ -879,8 +882,16 @@ def _build_report_overview_summary(report: dict[str, Any], lang: str) -> list[di
             for team in teams
         ],
         "score_flow": report.get("events"),
-        "momentum_interpretation": report.get("scoutwise_perspective_points"),
-        "regional_play_interpretation": report.get("regional_play_perspective"),
+        **(
+            {"momentum_interpretation": report.get("scoutwise_perspective_points")}
+            if has_pressure
+            else {}
+        ),
+        **(
+            {"regional_play_interpretation": report.get("regional_play_perspective")}
+            if has_territory
+            else {}
+        ),
         "team_comparison_interpretations": report.get("team_analysis_perspectives"),
         "team_deep_analyses": report.get("team_deep_analyses"),
         "player_analysis_interpretations": report.get("player_analysis_perspectives"),
@@ -911,8 +922,14 @@ def _build_report_overview_summary(report: dict[str, Any], lang: str) -> list[di
             for player in report.get("lineups") or []
         ],
     }
-    categories_tr = ["Maç Kartı", "Kadro ve Diziliş", "Maç Akışı", "Momentum", "Bölgesel Oyun Dağılımı", "Takım Karşılaştırması", "Takım Analizi", "Oyuncu Analizi"]
-    categories_en = ["Match Card", "Lineup & Formation", "Timeline", "Momentum", "Regional Play Distribution", "Team Comparison", "Team Analysis", "Player Analysis"]
+    categories_tr = ["Maç Kartı", "Kadro ve Diziliş", "Maç Akışı", "Bölgesel Oyun Dağılımı", "Takım Karşılaştırması", "Takım Analizi", "Oyuncu Analizi"]
+    categories_en = ["Match Card", "Lineup & Formation", "Timeline", "Regional Play Distribution", "Team Comparison", "Team Analysis", "Player Analysis"]
+    if has_pressure:
+        categories_tr.insert(3, "Momentum")
+        categories_en.insert(3, "Momentum")
+    if not has_territory:
+        categories_tr.remove("Bölgesel Oyun Dağılımı")
+        categories_en.remove("Regional Play Distribution")
     categories = categories_tr if lang == "tr" else categories_en
     fallback = [
         {"category": category, "summary": ("Bu bölümün rapor özeti hazırlanıyor." if lang == "tr" else "The report summary for this section is being prepared."), "sub_bullets": []}
@@ -925,16 +942,33 @@ def _build_report_overview_summary(report: dict[str, Any], lang: str) -> list[di
 
         model = os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna"))
         language = "Turkish" if lang == "tr" else "English"
+        section_count = len(categories)
+        section_order = ", ".join(categories_en)
+        momentum_instruction = (
+            "Lineup & Formation and Momentum have exactly two; "
+            if has_pressure
+            else "Lineup & Formation has exactly two; "
+        )
+        pressure_guard = (
+            " Never mention pressure or momentum because no Pressure Index data is available."
+            if not has_pressure
+            else ""
+        )
+        territory_guard = (
+            " Never mention regional play distribution, field zones, ball-location concentration, channels, or territory because no ball-coordinate evidence is available."
+            if not has_territory
+            else ""
+        )
         response = ChatOpenAI(model=model, api_key=os.environ["OPENAI_API_KEY"], temperature=0.2).invoke([
             (
                 "system",
-                "You are ScoutWise Enterprise's lead football-report editor. Return only a valid JSON array of exactly eight objects, in this exact report-section order: Match Card, Lineup & Formation, Timeline, Momentum, Regional Play Distribution, Team Comparison, Team Analysis, Player Analysis. Translate category names naturally into the requested language. Every object must contain exactly category, summary, and sub_bullets. Keep the same eight sections and be highly concise. summary must be a cohesive, evidence-led synthesis of 20-30 words containing only the section's decisive interpretation. Every sub-bullet object must contain exactly label and text, with text limited to 10-18 words. Apply these counts strictly: Match Card, Timeline, and Regional Play Distribution have zero sub-bullets; Lineup & Formation and Momentum have exactly two; Team Comparison, Team Analysis, and Player Analysis have exactly two. For Team Comparison and Team Analysis, create one sub-bullet per team and use that team's exact name as the label. For Player Analysis, select exactly one interpreted player from each team and use the player's full name as the label; never select two players from the same team. Integrate and compress the supplied existing ScoutWise interpretations; do not contradict them or introduce a new tactical claim. State only supported interpretations and what the evidence positively indicates. Never add defensive capability caveats such as 'does not prove', 'cannot determine', 'cannot establish', 'alone is insufficient', 'the data does not show', or their equivalents. In Regional Play Distribution especially, describe the supported spatial pattern, channel use, central versus wide concentration, and proximity to dangerous end areas without explaining what cannot be inferred. Preserve distinctions between observation, correlation, and causation through careful affirmative wording, not disclaimer sentences. Never invent data, attack direction, roles, or events. Avoid repeating the same fact across sections. Use polished, direct football-analysis language without markdown, bullet characters, recommendations, or generic filler.",
+                f"You are ScoutWise Enterprise's lead football-report editor. Return only a valid JSON array of exactly {section_count} objects, in this exact report-section order: {section_order}. Translate category names naturally into the requested language. Every object must contain exactly category, summary, and sub_bullets. Keep exactly these sections and be highly concise. summary must be a cohesive, evidence-led synthesis of 20-30 words containing only the section's decisive interpretation. Every sub-bullet object must contain exactly label and text, with text limited to 10-18 words. Apply these counts strictly: Match Card, Timeline, and Regional Play Distribution have zero sub-bullets; {momentum_instruction}Team Comparison, Team Analysis, and Player Analysis have exactly two. For Team Comparison and Team Analysis, create one sub-bullet per team and use that team's exact name as the label. For Player Analysis, select exactly one interpreted player from each team and use the player's full name as the label; never select two players from the same team. Integrate and compress the supplied existing ScoutWise interpretations; do not contradict them or introduce a new tactical claim. State only supported interpretations and what the evidence positively indicates. Never add defensive capability caveats such as 'does not prove', 'cannot determine', 'cannot establish', 'alone is insufficient', 'the data does not show', or their equivalents. In Regional Play Distribution especially, describe the supported spatial pattern, channel use, central versus wide concentration, and proximity to dangerous end areas without explaining what cannot be inferred. Preserve distinctions between observation, correlation, and causation through careful affirmative wording, not disclaimer sentences. Never invent data, attack direction, roles, or events.{pressure_guard}{territory_guard} Avoid repeating the same fact across sections. Use polished, direct football-analysis language without markdown, bullet characters, recommendations, or generic filler.",
             ),
             ("human", f"Language: {language}\nReport evidence and existing interpretations:\n{json.dumps(compact, ensure_ascii=False, default=str)}"),
         ])
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I)
         parsed = json.loads(raw)
-        if not isinstance(parsed, list) or len(parsed) != 8:
+        if not isinstance(parsed, list) or len(parsed) != section_count:
             return fallback
         cleaned = []
         for index, row in enumerate(parsed):
