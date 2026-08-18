@@ -41,6 +41,7 @@ REPORT_PARTNER_LOGOS_BY_EMAIL = {
     "aselcuk@htspor.com": "/HT_SPOR_LOGO_BEYAZ.png",
     "cemzengin@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
     "iergulen@haberturk.com": "/HT_SPOR_LOGO_BEYAZ.png",
+    "dgnprlk@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
 }
 
 REPORT_PARTNER_KEYS_BY_EMAIL = {
@@ -49,6 +50,7 @@ REPORT_PARTNER_KEYS_BY_EMAIL = {
     "aselcuk@htspor.com": "htspor",
     "cemzengin@gmail.com": "htspor",
     "iergulen@haberturk.com": "htspor",
+    "dgnprlk@gmail.com": "htspor",
 }
 
 

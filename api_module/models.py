@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
@@ -115,6 +116,52 @@ class LeaguePoolFilterOptionsOut(BaseModel):
 class LeaguePoolSearchRow(BaseModel):
     id: str
     content: Dict[str, Any]
+
+
+class MatchAnalysisOptionsIn(BaseModel):
+    country: Optional[str] = None
+    league: Optional[str] = None
+
+
+class MatchAnalysisOptionsOut(BaseModel):
+    countries: List[str]
+    leagues: List[str]
+    teams: List[str]
+
+
+class MatchAnalysisSearchIn(BaseModel):
+    country: Optional[str] = None
+    league: Optional[str] = None
+    leagueId: Optional[int] = None
+    homeTeam: Optional[str] = None
+    awayTeam: Optional[str] = None
+    startDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    endDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    page: int = Field(default=1, ge=1)
+    limit: int = Field(default=20, ge=1, le=20)
+
+
+class MatchAnalysisSearchOut(BaseModel):
+    fixtures: List[Dict[str, Any]]
+    pagination: Dict[str, Any]
+
+
+class EnterpriseFavoriteMatchIn(BaseModel):
+    fixture: Dict[str, Any]
+
+
+class EnterpriseFavoriteMatchOut(BaseModel):
+    favoriteId: str
+    fixture: Dict[str, Any]
+    createdAt: datetime
+
+
+class EnterpriseMatchReportOut(BaseModel):
+    favorite_match_id: str
+    status: str
+    content_json: Optional[Dict[str, Any]] = None
+    language: str
+    version: int
 
 
 class PlayerPoolPotentialOut(BaseModel):

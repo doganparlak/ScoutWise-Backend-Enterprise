@@ -26,6 +26,13 @@ from api_module.models import (
     LeaguePoolFilterOptionsOut,
     LeaguePoolSearchIn,
     LeaguePoolSearchRow,
+    MatchAnalysisOptionsIn,
+    MatchAnalysisOptionsOut,
+    MatchAnalysisSearchIn,
+    MatchAnalysisSearchOut,
+    EnterpriseFavoriteMatchIn,
+    EnterpriseFavoriteMatchOut,
+    EnterpriseMatchReportOut,
     EnterpriseFavoritePlayerIn,
     EnterpriseFavoritePlayerOut,
     EnterpriseAllowlistEmailIn,
@@ -78,6 +85,9 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
+from match_analysis_module import get_match_filter_options, resolve_league_id, search_fixtures
+from match_analysis_module.match_analysis import SportMonksError
+from match_report_module import MATCH_REPORT_VERSION, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
     get_player_season_rows,
@@ -1843,6 +1853,261 @@ def league_pool_search(
 ):
     del user_id
     return search_league_pool(db, payload.model_dump())
+
+
+@app.post("/match-analysis/options", response_model=MatchAnalysisOptionsOut)
+def match_analysis_options(
+    payload: MatchAnalysisOptionsIn = Body(default=MatchAnalysisOptionsIn()),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return get_match_filter_options(db, payload.country, payload.league)
+
+
+@app.post("/match-analysis/search", response_model=MatchAnalysisSearchOut)
+def match_analysis_search(
+    payload: MatchAnalysisSearchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    try:
+        filters = payload.model_dump(exclude_none=True)
+        if not filters.get("leagueId"):
+            filters["leagueId"] = resolve_league_id(db, payload.league, payload.country)
+        return search_fixtures(filters)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/favorite-matches", response_model=list[EnterpriseFavoriteMatchOut])
+def list_enterprise_favorite_matches(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            """
+            SELECT id, fixture_payload, created_at
+            FROM enterprise_favorite_matches
+            WHERE user_id = :user_id
+            ORDER BY starting_at DESC, created_at DESC
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().all()
+    return [
+        EnterpriseFavoriteMatchOut(
+            favoriteId=str(row["id"]),
+            fixture=dict(row["fixture_payload"] or {}),
+            createdAt=row["created_at"],
+        )
+        for row in rows
+    ]
+
+
+@app.post("/favorite-matches", response_model=EnterpriseFavoriteMatchOut)
+def save_enterprise_favorite_match(
+    payload: EnterpriseFavoriteMatchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    fixture = payload.fixture
+    country = fixture.get("country") or {}
+    league = fixture.get("league") or {}
+    home_team = fixture.get("homeTeam") or {}
+    away_team = fixture.get("awayTeam") or {}
+    required = {
+        "fixtureId": fixture.get("fixtureId"),
+        "startingAt": fixture.get("startingAt"),
+        "homeTeam.id": home_team.get("id"),
+        "homeTeam.name": home_team.get("name"),
+        "awayTeam.id": away_team.get("id"),
+        "awayTeam.name": away_team.get("name"),
+    }
+    missing = [key for key, value in required.items() if value is None or value == ""]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing fixture fields: {', '.join(missing)}")
+
+    values = {
+        "user_id": user_id,
+        "fixture_id": int(fixture["fixtureId"]),
+        "starting_at": fixture["startingAt"],
+        "country_id": country.get("id"),
+        "country_name": str(country.get("name") or ""),
+        "country_image_url": country.get("imageUrl"),
+        "league_id": league.get("id"),
+        "league_name": str(league.get("name") or ""),
+        "league_image_url": league.get("imageUrl"),
+        "home_team_id": int(home_team["id"]),
+        "home_team_name": str(home_team["name"]),
+        "home_team_image_url": home_team.get("imageUrl"),
+        "home_score": home_team.get("score"),
+        "away_team_id": int(away_team["id"]),
+        "away_team_name": str(away_team["name"]),
+        "away_team_image_url": away_team.get("imageUrl"),
+        "away_score": away_team.get("score"),
+        "state_code": (fixture.get("state") or {}).get("code"),
+        "state_name": (fixture.get("state") or {}).get("name"),
+        "result_info": fixture.get("resultInfo"),
+        "fixture_payload": json.dumps(fixture),
+    }
+    row = db.execute(
+        text(
+            """
+            INSERT INTO enterprise_favorite_matches (
+              user_id, fixture_id, starting_at,
+              country_id, country_name, country_image_url,
+              league_id, league_name, league_image_url,
+              home_team_id, home_team_name, home_team_image_url, home_score,
+              away_team_id, away_team_name, away_team_image_url, away_score,
+              state_code, state_name, result_info, fixture_payload
+            ) VALUES (
+              :user_id, :fixture_id, :starting_at,
+              :country_id, :country_name, :country_image_url,
+              :league_id, :league_name, :league_image_url,
+              :home_team_id, :home_team_name, :home_team_image_url, :home_score,
+              :away_team_id, :away_team_name, :away_team_image_url, :away_score,
+              :state_code, :state_name, :result_info, CAST(:fixture_payload AS jsonb)
+            )
+            ON CONFLICT (user_id, fixture_id) DO UPDATE SET
+              starting_at = EXCLUDED.starting_at,
+              country_id = EXCLUDED.country_id,
+              country_name = EXCLUDED.country_name,
+              country_image_url = EXCLUDED.country_image_url,
+              league_id = EXCLUDED.league_id,
+              league_name = EXCLUDED.league_name,
+              league_image_url = EXCLUDED.league_image_url,
+              home_team_id = EXCLUDED.home_team_id,
+              home_team_name = EXCLUDED.home_team_name,
+              home_team_image_url = EXCLUDED.home_team_image_url,
+              home_score = EXCLUDED.home_score,
+              away_team_id = EXCLUDED.away_team_id,
+              away_team_name = EXCLUDED.away_team_name,
+              away_team_image_url = EXCLUDED.away_team_image_url,
+              away_score = EXCLUDED.away_score,
+              state_code = EXCLUDED.state_code,
+              state_name = EXCLUDED.state_name,
+              result_info = EXCLUDED.result_info,
+              fixture_payload = EXCLUDED.fixture_payload,
+              updated_at = now()
+            RETURNING id, fixture_payload, created_at
+            """
+        ),
+        values,
+    ).mappings().one()
+    db.commit()
+    return EnterpriseFavoriteMatchOut(
+        favoriteId=str(row["id"]),
+        fixture=dict(row["fixture_payload"] or {}),
+        createdAt=row["created_at"],
+    )
+
+
+@app.post("/favorite-matches/{favorite_id}/report", response_model=EnterpriseMatchReportOut)
+def create_enterprise_match_report(
+    favorite_id: str,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    lang = normalize_lang(accept_language) or "en"
+    row = db.execute(
+        text(
+            """
+            SELECT id, fixture_id, report_status, report_content
+            FROM enterprise_favorite_matches
+            WHERE id = :favorite_id AND user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"favorite_id": favorite_id, "user_id": user_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Favorite match not found")
+
+    cached = dict(row["report_content"] or {})
+    if (
+        row["report_status"] == "ready"
+        and cached.get("version") == MATCH_REPORT_VERSION
+        and cached.get("language") == lang
+    ):
+        return EnterpriseMatchReportOut(
+            favorite_match_id=str(row["id"]),
+            status="ready",
+            content_json=cached,
+            language=lang,
+            version=MATCH_REPORT_VERSION,
+        )
+    if row["report_status"] == "processing":
+        return EnterpriseMatchReportOut(
+            favorite_match_id=str(row["id"]),
+            status="processing",
+            content_json=None,
+            language=lang,
+            version=MATCH_REPORT_VERSION,
+        )
+
+    db.execute(
+        text(
+            """
+            UPDATE enterprise_favorite_matches
+            SET report_status = 'processing', report_error = NULL, updated_at = NOW()
+            WHERE id = :favorite_id AND user_id = :user_id
+            """
+        ),
+        {"favorite_id": favorite_id, "user_id": user_id},
+    )
+    db.commit()
+    try:
+        content = generate_match_report(int(row["fixture_id"]), lang)
+        db.execute(
+            text(
+                """
+                UPDATE enterprise_favorite_matches
+                SET report_status = 'ready',
+                    report_content = CAST(:content AS jsonb),
+                    report_error = NULL,
+                    report_ready_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :favorite_id AND user_id = :user_id
+                """
+            ),
+            {
+                "favorite_id": favorite_id,
+                "user_id": user_id,
+                "content": json.dumps(content, ensure_ascii=False, default=str),
+            },
+        )
+        db.commit()
+        return EnterpriseMatchReportOut(
+            favorite_match_id=str(row["id"]),
+            status="ready",
+            content_json=content,
+            language=lang,
+            version=MATCH_REPORT_VERSION,
+        )
+    except Exception as exc:
+        db.rollback()
+        db.execute(
+            text(
+                """
+                UPDATE enterprise_favorite_matches
+                SET report_status = 'failed', report_error = :error, updated_at = NOW()
+                WHERE id = :favorite_id AND user_id = :user_id
+                """
+            ),
+            {"favorite_id": favorite_id, "user_id": user_id, "error": str(exc)},
+        )
+        db.commit()
+        print(
+            f"[enterprise_match_report] event=failed favorite_id={favorite_id} fixture_id={row['fixture_id']} error={exc}",
+            flush=True,
+        )
+        raise HTTPException(status_code=502, detail="Match report generation failed") from exc
 
 
 @app.get("/tactic-boards", response_model=list[EnterpriseTacticBoardOut])
