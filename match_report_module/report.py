@@ -357,6 +357,8 @@ def _build_scoutwise_perspective(report: dict[str, Any], lang: str) -> list[str]
     teams = report.get("teams") or []
     events = report.get("events") or []
     pressure = report.get("pressure") or []
+    if not pressure:
+        return []
     compact = {
         "teams": [
             {
