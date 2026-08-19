@@ -314,6 +314,7 @@ class EnterpriseFavoritePlayerOut(BaseModel):
     id: str
     playerId: Optional[int] = None
     clubPlayerId: Optional[int] = None
+    imageUrl: Optional[str] = None
     name: str
     nationality: Optional[str] = None
     age: Optional[int] = None

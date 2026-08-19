@@ -1159,6 +1159,7 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
         id=str(data["id"]),
         playerId=_metadata_int({"player_id": data.get("player_id")}, "player_id"),
         clubPlayerId=data.get("club_player_id"),
+        imageUrl=data.get("image_url"),
         name=data["name"],
         nationality=data.get("nationality"),
         age=data.get("age"),
@@ -1221,6 +1222,39 @@ LEFT JOIN LATERAL (
     END
   LIMIT 1
 ) pd ON TRUE
+LEFT JOIN LATERAL (
+  SELECT image.image_url
+  FROM enterprise_player_images image
+  WHERE image.image_status = 'available'
+    AND (
+      (
+        COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
+        AND image.player_id = efp.player_id::numeric::bigint
+      )
+      OR (
+        COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+        AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint
+      )
+      OR translate(
+        lower(image.player_name),
+        'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
+        'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+      ) = translate(
+        lower(COALESCE(efp.name, '')),
+        'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
+        'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+      )
+    )
+  ORDER BY
+    CASE
+      WHEN COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
+       AND image.player_id = efp.player_id::numeric::bigint THEN 0
+      WHEN COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+       AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint THEN 1
+      ELSE 2
+    END
+  LIMIT 1
+) epi ON TRUE
 """
 
 
@@ -1275,6 +1309,7 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
             """
             SELECT efp.id, efp.player_id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
                    efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json,
+                   epi.image_url AS image_url,
                    pd.metadata->'position_counts' AS position_counts,
                    pd.metadata->>'position_count_total' AS position_count_total,
                    pd.metadata->'position_names_seen' AS position_names_seen,
@@ -2228,6 +2263,7 @@ def list_enterprise_favorite_players(
         text("""
         SELECT efp.id, efp.player_id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
                efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json, efp.created_at,
+               epi.image_url AS image_url,
                pd.metadata->'position_counts' AS position_counts,
                pd.metadata->>'position_count_total' AS position_count_total,
                pd.metadata->'position_names_seen' AS position_names_seen,
@@ -2399,6 +2435,7 @@ def save_enterprise_favorite_player(
         text("""
         SELECT efp.id, efp.player_id, efp.club_player_id, efp.name, efp.nationality, efp.age, efp.potential, efp.form,
                efp.gender, efp.height, efp.weight, efp.team, efp.league, efp.roles_json,
+               epi.image_url AS image_url,
                pd.metadata->'position_counts' AS position_counts,
                pd.metadata->>'position_count_total' AS position_count_total,
                pd.metadata->'position_names_seen' AS position_names_seen,
