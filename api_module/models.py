@@ -230,6 +230,7 @@ class PlayerCompSeasonCandidateOut(BaseModel):
 class PlayerCompSeasonPlayerOut(BaseModel):
     playerId: int
     displayName: str
+    imageUrl: Optional[str] = None
     nationality: str = ""
     gender: str = ""
     latestTeam: str = ""

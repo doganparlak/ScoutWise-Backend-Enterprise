@@ -154,6 +154,7 @@ def search_league_pool(db: Session, filters: Dict[str, Any]) -> List[Dict[str, A
             MAX(pl.league_country_id) AS league_country_id,
             MAX(pl.league_country_name) AS league_country_name,
             MAX(pl.league_image_path) AS league_image_path,
+            COALESCE(MAX(eli.image_url), MAX(pl.league_image_path)) AS image_url,
             MAX(ltc.team_count) AS team_count,
             COUNT(*) AS player_count,
             ROUND(AVG(pl.match_count), 1) AS match_count,
@@ -166,6 +167,9 @@ def search_league_pool(db: Session, filters: Dict[str, Any]) -> List[Dict[str, A
         LEFT JOIN league_team_counts ltc ON ltc.league_id = pl.league_id
         LEFT JOIN league_roles lr ON lr.league_id = pl.league_id
         LEFT JOIN league_stats ls ON ls.league_id = pl.league_id
+        LEFT JOIN enterprise_league_images eli
+          ON eli.league_id = pl.league_id
+         AND eli.image_status = 'available'
         GROUP BY pl.league_id, pl.league_name, lr.position_counts, ls.stats
         ORDER BY pl.league_name
         LIMIT :limit

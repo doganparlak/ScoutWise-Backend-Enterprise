@@ -188,11 +188,11 @@ def _fetch_player_rows(db: Session, player_id: int) -> List[Dict[str, Any]]:
         text(
             """
             SELECT
-                player_id,
+                pcsd.player_id,
                 team_id,
                 league_id,
                 season_id,
-                player_name,
+                pcsd.player_name,
                 team_name,
                 league_name,
                 league_type,
@@ -210,10 +210,14 @@ def _fetch_player_rows(db: Session, player_id: int) -> List[Dict[str, Any]]:
                 position_name,
                 position_counts,
                 stats,
-                updated_at
-            FROM player_comp_season_data
-            WHERE player_id = :player_id
-            ORDER BY season_id DESC, league_name, team_name
+                pcsd.updated_at,
+                epi.image_url
+            FROM player_comp_season_data pcsd
+            LEFT JOIN enterprise_player_images epi
+              ON epi.player_id = pcsd.player_id
+             AND epi.image_status = 'available'
+            WHERE pcsd.player_id = :player_id
+            ORDER BY pcsd.season_id DESC, pcsd.league_name, pcsd.team_name
             """
         ),
         {"player_id": int(player_id)},
@@ -258,6 +262,7 @@ def get_player_season_rows(db: Session, player_id: int) -> Dict[str, Any]:
             "gender": str(latest.get("gender") or ""),
             "latestTeam": str(latest.get("team_name") or ""),
             "latestSeason": str(latest.get("season_name") or ""),
+            "imageUrl": str(latest.get("image_url") or "") or None,
         },
         "rows": [_row_out(row) for row in rows],
     }

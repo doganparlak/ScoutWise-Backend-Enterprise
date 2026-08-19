@@ -127,8 +127,16 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
     query = text(f"""
         SELECT
             id,
-            metadata AS content
+            metadata AS content,
+            epi.image_url
         FROM {table_name}
+        LEFT JOIN enterprise_player_images epi
+          ON epi.player_id = CASE
+              WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+$'
+              THEN (metadata->>'player_id')::bigint
+              ELSE NULL
+          END
+         AND epi.image_status = 'available'
         WHERE (
                 :name_q IS NULL
                 OR metadata->>'player_name' ILIKE :name_q
@@ -293,7 +301,14 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
         },
     ).mappings().all()
 
-    return [{"id": row["id"], "content": row["content"] or {}} for row in rows]
+    results = []
+    for row in rows:
+        content = dict(row["content"] or {})
+        image_url = str(row.get("image_url") or "").strip()
+        if image_url:
+            content["image_url"] = image_url
+        results.append({"id": row["id"], "content": content})
+    return results
 
 
 def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) -> Dict[str, List[str]]:

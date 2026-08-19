@@ -43,6 +43,9 @@ def _normalize_position_counts(value: Any) -> Dict[str, int]:
 
 def _with_position_distribution(row: Dict[str, Any]) -> Dict[str, Any]:
     content = dict(row.get("content") or {})
+    image_url = str(row.get("image_url") or "").strip()
+    if image_url:
+        content["image_url"] = image_url
     position_counts = _normalize_position_counts(content.get("position_counts"))
 
     raw_seen = content.get("position_names_seen")
@@ -292,7 +295,8 @@ def get_weekly_popular_players(
         text(f"""
         SELECT
             current_pd.id,
-            current_pd.metadata AS content
+            current_pd.metadata AS content,
+            epi.image_url
         FROM player_pool_weekly_searches pws
         JOIN LATERAL (
             SELECT pd.id, pd.metadata
@@ -301,6 +305,9 @@ def get_weekly_popular_players(
             ORDER BY pd.id DESC
             LIMIT 1
         ) current_pd ON TRUE
+        LEFT JOIN enterprise_player_images epi
+          ON epi.player_id = pws.player_id
+         AND epi.image_status = 'available'
         WHERE pws.week_start = DATE_TRUNC('week', NOW())::date
         ORDER BY pws.search_count DESC, pws.last_searched_at DESC, current_pd.id DESC
         LIMIT :limit
@@ -310,7 +317,11 @@ def get_weekly_popular_players(
     return [
         _ensure_weekly_scores(
             db,
-            _with_position_distribution({"id": row["id"], "content": row["content"] or {}}),
+            _with_position_distribution({
+                "id": row["id"],
+                "content": row["content"] or {},
+                "image_url": row.get("image_url"),
+            }),
             False,
         )
         for row in rows
