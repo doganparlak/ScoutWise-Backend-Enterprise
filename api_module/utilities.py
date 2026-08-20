@@ -39,18 +39,14 @@ REPORT_PARTNER_LOGOS_BY_EMAIL = {
     "saltfutbol90@gmail.com": "/saltfutbol-logo.png",
     "berkbekgoz1@gmail.com": "/berk_bekgoz_logo.png",
     "aselcuk@htspor.com": "/HT_SPOR_LOGO_BEYAZ.png",
-    "cemzengin@gmail.com": "/HT_SPOR_LOGO_BEYAZ.png",
     "iergulen@haberturk.com": "/HT_SPOR_LOGO_BEYAZ.png",
-    "dgnprlk@gmail.com": "/berk_bekgoz_logo.png",
 }
 
 REPORT_PARTNER_KEYS_BY_EMAIL = {
     "saltfutbol90@gmail.com": "saltfutbol",
     "berkbekgoz1@gmail.com": "berk_bekgoz",
     "aselcuk@htspor.com": "htspor",
-    "cemzengin@gmail.com": "htspor",
     "iergulen@haberturk.com": "htspor",
-    "dgnprlk@gmail.com": "berk_bekgoz",
 }
 
 
