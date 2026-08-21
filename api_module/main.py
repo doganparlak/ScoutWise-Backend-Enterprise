@@ -419,6 +419,66 @@ def _dashboard_report_out(row: Any) -> EnterpriseDashboardReportOut:
     )
 
 
+def _dashboard_report_player_image(
+    db: Session,
+    player_payload: Dict[str, Any],
+    player_card: Dict[str, Any],
+) -> str | None:
+    existing = str(
+        player_payload.get("imageUrl")
+        or player_payload.get("image_url")
+        or player_card.get("imageUrl")
+        or player_card.get("image_url")
+        or ""
+    ).strip()
+    if existing:
+        return existing
+
+    club_player_id = (
+        player_payload.get("club_player_id")
+        or player_payload.get("clubPlayerId")
+        or player_payload.get("playerId")
+    )
+    player_name = str(
+        player_payload.get("name") or player_card.get("name") or ""
+    ).strip()
+    row = db.execute(
+        text(
+            """
+            SELECT image.image_url
+            FROM enterprise_player_images image
+            LEFT JOIN player_data pd ON pd.id = :club_player_id
+            WHERE image.image_status = 'available'
+              AND (
+                (
+                  COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+                  AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint
+                )
+                OR translate(
+                  lower(COALESCE(image.player_name, '')),
+                  'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
+                  'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+                ) = translate(
+                  lower(:player_name),
+                  'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
+                  'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+                )
+              )
+            ORDER BY
+              CASE
+                WHEN COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+                 AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint
+                THEN 0
+                ELSE 1
+              END
+            LIMIT 1
+            """
+        ),
+        {"club_player_id": club_player_id, "player_name": player_name},
+    ).mappings().first()
+    return str(row["image_url"]).strip() if row and row.get("image_url") else None
+
+
 @app.get("/dashboard/notes", response_model=list[EnterpriseDashboardNoteOut])
 def list_enterprise_dashboard_notes(
     user_id: str = Depends(require_auth),
@@ -545,7 +605,7 @@ def get_enterprise_dashboard_report(
     row = db.execute(
         text(
             """
-            SELECT id, cache_key, status, content, content_json, language, version
+            SELECT id, cache_key, status, content, content_json, player_payload, language, version
             FROM enterprise_player_pool_scouting_reports
             WHERE id = :report_id
               AND user_id = :user_id
@@ -556,11 +616,19 @@ def get_enterprise_dashboard_report(
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Report not found")
+    content_json = dict(row.get("content_json") or {})
+    player_payload = dict(row.get("player_payload") or {})
+    player_card = dict(content_json.get("player_card") or {})
+    image_url = _dashboard_report_player_image(db, player_payload, player_card)
+    if image_url:
+        player_card["image_url"] = image_url
+        player_card["imageUrl"] = image_url
+        content_json["player_card"] = player_card
     return {
         "favorite_player_id": str(row.get("cache_key") or row["id"]),
         "status": row["status"],
         "content": row["content"],
-        "content_json": row["content_json"],
+        "content_json": content_json,
         "language": row.get("language") or "en",
         "version": int(row.get("version") or 1),
     }
