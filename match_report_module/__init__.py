@@ -1,3 +1,3 @@
-from .report import MATCH_REPORT_VERSION, generate_match_report
+from .report import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 
-__all__ = ["MATCH_REPORT_VERSION", "generate_match_report"]
+__all__ = ["MATCH_REPORT_VERSION", "build_team_report_attack_profile", "build_team_report_defense_profile", "build_team_report_metrics", "build_team_report_momentum_perspectives", "build_team_report_overview", "build_team_report_player_perspectives", "build_team_report_regional_perspective", "build_team_report_score_flow_profile", "build_team_report_strengths", "build_team_report_weaknesses", "generate_match_report"]

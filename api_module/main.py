@@ -5,6 +5,7 @@ import re
 import secrets
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -30,6 +31,11 @@ from api_module.models import (
     MatchAnalysisOptionsOut,
     MatchAnalysisSearchIn,
     MatchAnalysisSearchOut,
+    TeamPoolSearchIn,
+    TeamPoolSearchRow,
+    TeamPlayedMatchRow,
+    TeamAnalysisReportIn,
+    TeamAnalysisReportOut,
     EnterpriseFavoriteMatchIn,
     EnterpriseFavoriteMatchOut,
     EnterpriseMatchReportOut,
@@ -85,9 +91,9 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
-from match_analysis_module import get_match_filter_options, resolve_league_id, search_fixtures
+from match_analysis_module import get_match_filter_options, get_team_played_matches, resolve_league_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
-from match_report_module import MATCH_REPORT_VERSION, generate_match_report
+from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
     get_player_season_rows,
@@ -2018,6 +2024,59 @@ def match_analysis_search(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/team-pool/search", response_model=list[TeamPoolSearchRow])
+def team_pool_search(
+    payload: TeamPoolSearchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    try:
+        return search_team_pool(db, payload.team, payload.country, payload.league, payload.limit)
+    except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/team-pool/{team_id}/matches", response_model=list[TeamPlayedMatchRow])
+def team_played_matches(
+    team_id: int,
+    leagueId: int = FastAPIQuery(...),
+    user_id: str = Depends(require_auth),
+):
+    del user_id
+    try:
+        return get_team_played_matches(team_id, leagueId)
+    except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/team-analysis/report-data", response_model=TeamAnalysisReportOut)
+def team_analysis_report_data(
+    payload: TeamAnalysisReportIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+):
+    del user_id
+    fixture_ids = list(dict.fromkeys(payload.fixtureIds))
+    lang = normalize_lang(accept_language) or "en"
+    try:
+        with ThreadPoolExecutor(max_workers=min(5, len(fixture_ids))) as executor:
+            reports = list(executor.map(lambda fixture_id: generate_match_report(fixture_id, lang, False), fixture_ids))
+        team_metrics, perspectives = build_team_report_metrics(reports, payload.teamId, lang)
+        player_perspectives = build_team_report_player_perspectives(reports, payload.teamId, lang)
+        momentum_perspectives = build_team_report_momentum_perspectives(reports, payload.teamId, lang)
+        regional_perspective = build_team_report_regional_perspective(reports, payload.teamId, lang)
+        attack_profile = build_team_report_attack_profile(reports, payload.teamId, team_metrics, lang)
+        defense_profile = build_team_report_defense_profile(reports, payload.teamId, team_metrics, lang)
+        score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang)
+        strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang)
+        weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang)
+        overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, momentum_perspectives, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
+        return TeamAnalysisReportOut(reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 

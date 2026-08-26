@@ -129,6 +129,42 @@ class MatchAnalysisOptionsOut(BaseModel):
     teams: List[str]
 
 
+class TeamPoolSearchIn(BaseModel):
+    team: Optional[str] = None
+    country: Optional[str] = None
+    league: Optional[str] = None
+    limit: int = Field(default=50, ge=1, le=50)
+
+
+class TeamPoolSearchRow(BaseModel):
+    id: str
+    name: str
+    country: str
+    league: str
+    logoUrl: Optional[str] = None
+    city: str
+    coachName: str
+    playerCount: int
+    stadiumName: str
+    stadiumImageUrl: Optional[str] = None
+    leagueId: Optional[int] = None
+
+
+class TeamPlayedMatchRow(BaseModel):
+    fixtureId: int
+    name: str
+    startingAt: str
+    country: str
+    league: str
+    homeTeam: str
+    awayTeam: str
+    homeTeamId: Optional[int] = None
+    awayTeamId: Optional[int] = None
+    homeScore: Optional[int] = None
+    awayScore: Optional[int] = None
+    thisSeason: bool
+
+
 class MatchAnalysisSearchIn(BaseModel):
     country: Optional[str] = None
     league: Optional[str] = None
@@ -162,6 +198,26 @@ class EnterpriseMatchReportOut(BaseModel):
     content_json: Optional[Dict[str, Any]] = None
     language: str
     version: int
+
+
+class TeamAnalysisReportIn(BaseModel):
+    fixtureIds: List[int] = Field(min_length=1, max_length=10)
+    teamId: int
+
+
+class TeamAnalysisReportOut(BaseModel):
+    reports: List[Dict[str, Any]]
+    teamMetrics: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    perspectives: Dict[str, str] = Field(default_factory=dict)
+    playerPerspectives: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    momentumPerspectives: Dict[str, str] = Field(default_factory=dict)
+    regionalPerspective: str = ""
+    attackProfile: Dict[str, Any] = Field(default_factory=dict)
+    defenseProfile: Dict[str, Any] = Field(default_factory=dict)
+    scoreFlowProfile: Dict[str, Any] = Field(default_factory=dict)
+    overview: List[Dict[str, Any]] = Field(default_factory=list)
+    strengths: Dict[str, Any] = Field(default_factory=dict)
+    weaknesses: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PlayerPoolPotentialOut(BaseModel):
