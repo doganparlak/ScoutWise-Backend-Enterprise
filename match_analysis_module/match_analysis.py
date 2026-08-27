@@ -309,6 +309,43 @@ def resolve_league_id(db: Session, league: str | None, country: str | None) -> i
     return int(value) if value is not None else None
 
 
+def resolve_team_id(db: Session, team: str | None) -> int | None:
+    team = _clean(team)
+    if not team:
+        return None
+    rows = db.execute(
+        text(
+            """
+            SELECT team_id, team_name, COUNT(*) AS usage_count
+            FROM player_comp_data
+            WHERE team_id IS NOT NULL
+              AND COALESCE(team_name, '') <> ''
+              AND LOWER(team_name) = LOWER(:team)
+            GROUP BY team_id, team_name
+            ORDER BY COUNT(*) DESC, team_id
+            """
+        ),
+        {"team": team},
+    ).mappings().all()
+    if rows:
+        return int(rows[0]["team_id"])
+    candidates = db.execute(
+        text(
+            """
+            SELECT team_id, team_name, COUNT(*) AS usage_count
+            FROM player_comp_data
+            WHERE team_id IS NOT NULL
+              AND COALESCE(team_name, '') <> ''
+            GROUP BY team_id, team_name
+            ORDER BY COUNT(*) DESC, team_id
+            """
+        )
+    ).mappings().all()
+    folded = _fold(team)
+    match = next((row for row in candidates if _fold(row["team_name"]) == folded), None)
+    return int(match["team_id"]) if match else None
+
+
 def _current_score(scores: list[dict[str, Any]], location: str) -> int | None:
     current = next(
         (
@@ -382,8 +419,11 @@ def search_fixtures(filters: dict[str, Any]) -> dict[str, Any]:
     upstream_filters: list[str] = []
     if league_id:
         upstream_filters.append(f"fixtureLeagues:{int(league_id)}")
+    home_team_id = filters.get("homeTeamId")
+    away_team_id = filters.get("awayTeamId")
+    participant_id = home_team_id or away_team_id
     participant = _clean(filters.get("homeTeam")) or _clean(filters.get("awayTeam"))
-    if participant:
+    if participant and not participant_id:
         upstream_filters.append(f"participantSearch:{participant}")
     if upstream_filters:
         params["filters"] = ";".join(upstream_filters)
@@ -401,8 +441,11 @@ def search_fixtures(filters: dict[str, Any]) -> dict[str, Any]:
     has_more = False
     pages_read = 0
     while pages_read < MAX_UPSTREAM_PAGES and len(collected) < limit:
+        endpoint = f"{SPORTMONKS_BASE_URL}/fixtures/between/{start.isoformat()}/{end.isoformat()}"
+        if participant_id:
+            endpoint = f"{endpoint}/{int(participant_id)}"
         response = requests.get(
-            f"{SPORTMONKS_BASE_URL}/fixtures/between/{start.isoformat()}/{end.isoformat()}",
+            endpoint,
             params=params,
             timeout=45,
         )
@@ -423,9 +466,13 @@ def search_fixtures(filters: dict[str, Any]) -> dict[str, Any]:
                 continue
             if not _matches(item["league"]["name"], filters.get("league")):
                 continue
-            if not _team_matches(item["homeTeam"]["name"], filters.get("homeTeam")):
+            if home_team_id is not None and int(item["homeTeam"]["id"] or 0) != int(home_team_id):
                 continue
-            if not _team_matches(item["awayTeam"]["name"], filters.get("awayTeam")):
+            if home_team_id is None and not _team_matches(item["homeTeam"]["name"], filters.get("homeTeam")):
+                continue
+            if away_team_id is not None and int(item["awayTeam"]["id"] or 0) != int(away_team_id):
+                continue
+            if away_team_id is None and not _team_matches(item["awayTeam"]["name"], filters.get("awayTeam")):
                 continue
             collected.append(item)
             if len(collected) >= limit:

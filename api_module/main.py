@@ -91,7 +91,7 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
-from match_analysis_module import get_match_filter_options, get_team_played_matches, resolve_league_id, search_fixtures, search_team_pool
+from match_analysis_module import get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
 from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
@@ -2020,6 +2020,8 @@ def match_analysis_search(
         filters = payload.model_dump(exclude_none=True)
         if not filters.get("leagueId"):
             filters["leagueId"] = resolve_league_id(db, payload.league, payload.country)
+        filters["homeTeamId"] = resolve_team_id(db, payload.homeTeam)
+        filters["awayTeamId"] = resolve_team_id(db, payload.awayTeam)
         return search_fixtures(filters)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
