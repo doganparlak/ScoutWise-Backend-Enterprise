@@ -440,10 +440,15 @@ def _dashboard_report_player_image(
     if existing:
         return existing
 
-    club_player_id = (
-        player_payload.get("club_player_id")
-        or player_payload.get("clubPlayerId")
-        or player_payload.get("playerId")
+    sportmonks_player_id = _metadata_int(
+        {
+            "player_id": (
+                player_payload.get("sportmonksPlayerId")
+                or player_payload.get("sportmonks_player_id")
+                or player_payload.get("player_id")
+            )
+        },
+        "player_id",
     )
     player_name = str(
         player_payload.get("name") or player_card.get("name") or ""
@@ -453,34 +458,36 @@ def _dashboard_report_player_image(
             """
             SELECT image.image_url
             FROM enterprise_player_images image
-            LEFT JOIN player_data pd ON pd.id = :club_player_id
             WHERE image.image_status = 'available'
               AND (
                 (
-                  COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
-                  AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint
+                  :sportmonks_player_id IS NOT NULL
+                  AND image.player_id = :sportmonks_player_id
                 )
-                OR translate(
-                  lower(COALESCE(image.player_name, '')),
-                  'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
-                  'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
-                ) = translate(
-                  lower(:player_name),
-                  'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
-                  'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+                OR (
+                  :sportmonks_player_id IS NULL
+                  AND translate(
+                    lower(COALESCE(image.player_name, '')),
+                    'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
+                    'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+                  ) = translate(
+                    lower(:player_name),
+                    'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
+                    'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
+                  )
                 )
               )
             ORDER BY
               CASE
-                WHEN COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
-                 AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint
+                WHEN :sportmonks_player_id IS NOT NULL
+                 AND image.player_id = :sportmonks_player_id
                 THEN 0
                 ELSE 1
               END
             LIMIT 1
             """
         ),
-        {"club_player_id": club_player_id, "player_name": player_name},
+        {"sportmonks_player_id": sportmonks_player_id, "player_name": player_name},
     ).mappings().first()
     return str(row["image_url"]).strip() if row and row.get("image_url") else None
 
@@ -1358,6 +1365,10 @@ def _enterprise_favorite_identity(row: Any) -> Dict[str, Any]:
 
     return {
         "favorite_id": str(data["id"]),
+        "player_id": data.get("player_id"),
+        "sportmonksPlayerId": _metadata_int(
+            {"player_id": data.get("player_id")}, "player_id"
+        ),
         "club_player_id": data.get("club_player_id"),
         "name": data.get("name"),
         "nationality": data.get("nationality"),
@@ -2594,6 +2605,37 @@ def save_enterprise_favorite_player(
 
 
 def _resolve_enterprise_player_pool_report_club_row(db: Session, player_payload: Dict[str, Any]) -> Any | None:
+    sportmonks_player_id = _metadata_int(
+        {
+            "player_id": (
+                player_payload.get("sportmonksPlayerId")
+                or player_payload.get("sportmonks_player_id")
+                or player_payload.get("player_id")
+            )
+        },
+        "player_id",
+    )
+    if sportmonks_player_id is not None:
+        row = db.execute(
+            text("""
+            SELECT id, metadata
+            FROM player_data
+            WHERE COALESCE(metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+              AND (metadata->>'player_id')::numeric::bigint = :player_id
+            LIMIT 1
+            """),
+            {"player_id": sportmonks_player_id},
+        ).mappings().first()
+        if row:
+            return row
+        print(
+            "[enterprise_player_pool_report] "
+            f"event=sportmonks_id_not_found sportmonks_player_id={sportmonks_player_id!r} "
+            f"name={player_payload.get('name')!r}",
+            flush=True,
+        )
+        return None
+
     club_player_id = player_payload.get("club_player_id") or player_payload.get("clubPlayerId")
     if club_player_id is not None:
         row = db.execute(
@@ -2605,13 +2647,24 @@ def _resolve_enterprise_player_pool_report_club_row(db: Session, player_payload:
             """),
             {"player_id": club_player_id},
         ).mappings().first()
-        if row:
+        if row and _is_safe_enterprise_club_candidate(
+            dict(row["metadata"] or {}), player_payload, "club_player_id"
+        ):
             return row
-        print(
-            "[enterprise_player_pool_report] "
-            f"event=club_id_stale club_player_id={club_player_id!r} name={player_payload.get('name')!r}",
-            flush=True,
-        )
+        if row:
+            print(
+                "[enterprise_player_pool_report] "
+                f"event=club_id_identity_mismatch club_player_id={club_player_id!r} "
+                f"name={player_payload.get('name')!r} "
+                f"candidate_name={_metadata_text(dict(row['metadata'] or {}), 'player_name', 'name')!r}",
+                flush=True,
+            )
+        else:
+            print(
+                "[enterprise_player_pool_report] "
+                f"event=club_id_stale club_player_id={club_player_id!r} name={player_payload.get('name')!r}",
+                flush=True,
+            )
 
     player_id = player_payload.get("playerId") or player_payload.get("player_id")
     world_cup_mode = bool(player_payload.get("worldCupMode") or player_payload.get("world_cup_mode"))
@@ -2697,6 +2750,10 @@ def _apply_enterprise_club_row_to_report_payload(
 ) -> Dict[str, Any]:
     metadata = dict(club_row["metadata"] or {})
     next_payload = dict(player_payload)
+    sportmonks_player_id = _metadata_int(metadata, "player_id")
+    if sportmonks_player_id is not None:
+        next_payload["sportmonksPlayerId"] = sportmonks_player_id
+        next_payload["player_id"] = str(sportmonks_player_id)
     next_payload["club_player_id"] = int(club_row["id"])
     next_payload["playerId"] = str(club_row["id"])
     next_payload["worldCupMode"] = False
@@ -2780,7 +2837,35 @@ def _ensure_enterprise_player_pool_report_scores(
     player_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     next_payload = dict(player_payload)
-    score_player_id = next_payload.get("club_player_id") or next_payload.get("clubPlayerId") or next_payload.get("playerId") or next_payload.get("player_id")
+    sportmonks_player_id = _metadata_int(
+        {
+            "player_id": (
+                next_payload.get("sportmonksPlayerId")
+                or next_payload.get("sportmonks_player_id")
+                or next_payload.get("player_id")
+            )
+        },
+        "player_id",
+    )
+    score_player_id = None
+    if sportmonks_player_id is not None:
+        row = db.execute(
+            text("""
+            SELECT id
+            FROM player_data
+            WHERE COALESCE(metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+              AND (metadata->>'player_id')::numeric::bigint = :player_id
+            LIMIT 1
+            """),
+            {"player_id": sportmonks_player_id},
+        ).mappings().first()
+        score_player_id = row["id"] if row else None
+    else:
+        score_player_id = (
+            next_payload.get("club_player_id")
+            or next_payload.get("clubPlayerId")
+            or next_payload.get("playerId")
+        )
     if score_player_id is None:
         return next_payload
 
@@ -2972,7 +3057,7 @@ def create_enterprise_player_pool_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 8
+    version = 9
     player_payload = payload.model_dump(exclude_none=True)
     return _get_or_create_enterprise_player_pool_report_from_payload(
         db,
@@ -2993,13 +3078,21 @@ def get_or_create_enterprise_scouting_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 8
+    version = 9
 
     favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
     player_payload = _enterprise_favorite_identity(favorite_row)
     incoming_payload = payload.model_dump(exclude_none=True)
-    if incoming_payload.get("clubPlayerId") is not None:
-        incoming_payload["club_player_id"] = incoming_payload.pop("clubPlayerId")
+    for protected_identity_key in (
+        "playerId",
+        "player_id",
+        "sportmonksPlayerId",
+        "sportmonks_player_id",
+        "clubPlayerId",
+        "club_player_id",
+        "name",
+    ):
+        incoming_payload.pop(protected_identity_key, None)
     player_payload.update(incoming_payload)
 
     club_row = _resolve_enterprise_player_pool_report_club_row(db, player_payload)

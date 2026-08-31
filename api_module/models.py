@@ -395,6 +395,7 @@ class EnterpriseFavoritePlayerOut(BaseModel):
 
 class EnterpriseScoutingReportIn(BaseModel):
     playerId: Optional[str] = None
+    sportmonksPlayerId: Optional[int] = None
     clubPlayerId: Optional[int] = None
     club_player_id: Optional[int] = None
     worldCupMode: Optional[bool] = False
