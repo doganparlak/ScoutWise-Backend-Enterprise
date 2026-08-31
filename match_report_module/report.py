@@ -630,8 +630,8 @@ def _build_player_analysis_perspectives(
                         return None
         return None
 
-    def has_unsupported_goal_or_assist_claim(text: str, player: dict[str, Any]) -> bool:
-        """Reject an AI narrative if it changes a player's factual G/A total."""
+    def normalize_goal_or_assist_claims(text: str, player: dict[str, Any]) -> str:
+        """Keep any stated goal/assist total aligned with the lineup metrics."""
         metrics = player.get("metrics") or {}
         goals = metrics.get("shooting", {}).get("Goals")
         assists = metrics.get("passing", {}).get("Assists")
@@ -644,7 +644,7 @@ def _build_player_analysis_perspectives(
         except (TypeError, ValueError):
             assists = None
 
-        normalized = str(text or "").casefold()
+        corrected = str(text or "")
         claims = (
             (goals, r"\b(\d+)\s+gol(?:[a-zçğıöşü']*)?\b(?!\s+(?:dönüş|beklent|oran|performans))"),
             (assists, r"\b(\d+)\s+asist(?:[a-zçğıöşü']*)?\b(?!\s+(?:verim|oran))"),
@@ -654,10 +654,13 @@ def _build_player_analysis_perspectives(
         for expected, pattern in claims:
             if expected is None:
                 continue
-            for claimed in re.findall(pattern, normalized, flags=re.I):
-                if int(claimed) != expected:
-                    return True
-        return False
+            corrected = re.sub(
+                pattern,
+                lambda match: match.group(0).replace(match.group(1), str(expected), 1),
+                corrected,
+                flags=re.I,
+            )
+        return corrected
 
     def development_evidence(player: dict[str, Any]) -> dict[str, Any]:
         """Give the model an explicit weakness-first view of a development selection."""
@@ -765,8 +768,12 @@ def _build_player_analysis_perspectives(
                     metric.get("name"): metric.get("value")
                     for metric in player.get("expected_metrics") or []
                 },
+                "authoritative_output": {
+                    "Goals": find_metric(player, "Goals") or 0,
+                    "Assists": find_metric(player, "Assists") or 0,
+                },
                 "events": [
-                    {key: event.get(key) for key in ("type", "minute", "extra_minute", "info", "addition")}
+                    {key: event.get(key) for key in ("type", "minute", "extra_minute", "info")}
                     for event in events
                     if event.get("player_id") == player.get("player_id")
                     or event.get("related_player_id") == player.get("player_id")
@@ -805,7 +812,7 @@ def _build_player_analysis_perspectives(
         response = ChatOpenAI(model=model, api_key=os.environ["OPENAI_API_KEY"], temperature=0.2).invoke([
             (
                 "system",
-                "You are ScoutWise Enterprise's senior player-performance analyst. Return only valid JSON keyed by the supplied team IDs. Each value must preserve the supplied three-player order and contain exactly player_id and text. Write one focused, evidence-led interpretation of 45-65 words per player in the requested language, considering the player's position. Write every numerical value with digits, never words: use forms such as 3 fouls, 4 duels, 70 minutes, 12 of 14 passes, and 42%. In Turkish put the percent sign before the number, for example %42. Goals and assists are factual counts: when you mention either one, reproduce its exact value from the supplied metrics and never infer or combine them from other data. Begin naturally with the player's name and the central meaning of the performance; never open with formulaic constructions such as 'a centre-back who played 71 minutes', 'playing 90 minutes as a midfielder', or their equivalents. Minutes and position may appear later only when analytically useful. For selection_type=featured, write an exclusively positive assessment: emphasize the player's highest and most influential metric values, scoring or creative output, efficiency, rating, position-specific strengths, and positive match impact. Do not include any negative sentence, limitation, weakness, loss, error, missed chance, low efficiency, adverse contrast, or a transition such as 'however'. For selection_type=development, write an exclusively weakness-focused diagnosis. Start with the central deficiency; prioritize supplied development_evidence.priority_errors_and_discipline, then low efficiency percentages and low position-relevant output. Discuss concrete negatives such as cards, penalties conceded, fouls, errors, possession losses, duels or aerial duels lost, missed chances, inaccurate actions, and weak conversion. Do not praise, soften, balance, or acknowledge any strength or positive evidence. Never cite a successful action or favorable ratio in a development assessment, even if it is supplied in the data; include a metric only when it directly demonstrates a weakness. Never mention leadership, captaincy, experience, security, successful passes, successful clearances, successful interceptions, successful tackles, high volume, good contribution, resilience, or use transitions such as 'however', 'although', 'despite', 'while', 'but', 'yine de', 'ancak', 'buna karşın', or 'rağmen'. Do not turn mere minutes played, captaincy, or involvement volume into a positive statement. In Turkish use natural football terminology: write 'ikili mücadele', never the untranslated word 'duel'. Select only supported weaknesses and explain why they matter for the player's position. Combine rating, minutes, role, events, volume and efficiency where they support the assigned selection type. Never invent actions, tactics, causation, or metrics. Use clear sentences with no headings, markdown, bullets, recommendations, or raw category names.",
+                "You are ScoutWise Enterprise's senior player-performance analyst. Return only valid JSON keyed by the supplied team IDs. Each value must preserve the supplied three-player order and contain exactly player_id and text. Write one focused, evidence-led interpretation of 45-65 words per player in the requested language, considering the player's position. Write every numerical value with digits, never words: use forms such as 3 fouls, 4 duels, 70 minutes, 12 of 14 passes, and 42%. In Turkish put the percent sign before the number, for example %42. The supplied metrics and authoritative_output object are the only factual source. Goals and assists must match authoritative_output exactly; never infer a personal total from a team-goal sequence, an event order, or any other field. Begin naturally with the player's name and the central meaning of the performance; never open with formulaic constructions such as 'a centre-back who played 71 minutes', 'playing 90 minutes as a midfielder', or their equivalents. Minutes and position may appear later only when analytically useful. For selection_type=featured, write an exclusively positive assessment: emphasize the player's highest and most influential metric values, scoring or creative output, efficiency, rating, position-specific strengths, and positive match impact. Do not include any negative sentence, limitation, weakness, loss, error, missed chance, low efficiency, adverse contrast, or a transition such as 'however'. For selection_type=development, write an exclusively weakness-focused diagnosis. Start with the central deficiency; prioritize supplied development_evidence.priority_errors_and_discipline, then low efficiency percentages and low position-relevant output. Discuss concrete negatives such as cards, penalties conceded, fouls, errors, possession losses, duels or aerial duels lost, missed chances, inaccurate actions, and weak conversion. Do not praise, soften, balance, or acknowledge any strength or positive evidence. Never cite a successful action or favorable ratio in a development assessment, even if it is supplied in the data; include a metric only when it directly demonstrates a weakness. Never mention leadership, captaincy, experience, security, successful passes, successful clearances, successful interceptions, successful tackles, high volume, good contribution, resilience, or use transitions such as 'however', 'although', 'despite', 'while', 'but', 'yine de', 'ancak', 'buna karşın', or 'rağmen'. Do not turn mere minutes played, captaincy, or involvement volume into a positive statement. In Turkish use natural football terminology: write 'ikili mücadele', never the untranslated word 'duel'. Select only supported weaknesses and explain why they matter for the player's position. Combine rating, minutes, role, events, volume and efficiency where they support the assigned selection type. Never invent actions, tactics, causation, or metrics. Use clear sentences with no headings, markdown, bullets, recommendations, or raw category names.",
             ),
             ("human", f"Language: {language}\nSelected standout and development-area players with match data:\n{json.dumps(compact, ensure_ascii=False, default=str)}"),
         ])
@@ -822,14 +829,8 @@ def _build_player_analysis_perspectives(
             for index, row in enumerate(rows):
                 generated_text = by_id.get(str(row.get("player_id")))
                 player_data = compact[team_key]["players"][index]
-                if generated_text and not has_unsupported_goal_or_assist_claim(generated_text, player_data):
-                    row["text"] = generated_text
-                elif generated_text:
-                    print(
-                        "[enterprise_match_report] event=player_perspective_rejected_unsupported_ga "
-                        f"player_id={row.get('player_id')}",
-                        flush=True,
-                    )
+                if generated_text:
+                    row["text"] = normalize_goal_or_assist_claims(generated_text, player_data)
         return selected
     except Exception as exc:
         print(f"[enterprise_match_report] event=player_perspective_fallback error={exc}")
