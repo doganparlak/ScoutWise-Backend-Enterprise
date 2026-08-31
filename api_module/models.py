@@ -118,6 +118,43 @@ class LeaguePoolSearchRow(BaseModel):
     content: Dict[str, Any]
 
 
+class LeagueStandingsIn(BaseModel):
+    leagueId: int = Field(ge=1)
+
+
+class LeagueStandingRow(BaseModel):
+    position: int | None = None
+    teamId: int | None = None
+    teamName: str
+    teamImageUrl: str | None = None
+    played: int | None = None
+    won: int | None = None
+    drawn: int | None = None
+    lost: int | None = None
+    goalsFor: int | None = None
+    goalsAgainst: int | None = None
+    goalDifference: int | None = None
+    points: int | None = None
+    form: str | None = None
+    standingRule: Dict[str, str] | None = None
+    seasonName: str | None = None
+
+
+class LeagueStandingsTable(BaseModel):
+    key: str
+    label: str
+    stageId: int | None = None
+    groupId: int | None = None
+    rows: List[LeagueStandingRow]
+
+
+class LeagueStandingsOut(BaseModel):
+    leagueId: int
+    seasonId: int
+    seasonName: str | None = None
+    tables: List[LeagueStandingsTable]
+
+
 class MatchAnalysisOptionsIn(BaseModel):
     country: Optional[str] = None
     league: Optional[str] = None

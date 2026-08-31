@@ -27,6 +27,8 @@ from api_module.models import (
     LeaguePoolFilterOptionsOut,
     LeaguePoolSearchIn,
     LeaguePoolSearchRow,
+    LeagueStandingsIn,
+    LeagueStandingsOut,
     MatchAnalysisOptionsIn,
     MatchAnalysisOptionsOut,
     MatchAnalysisSearchIn,
@@ -93,6 +95,7 @@ from matchup_module.comparison import get_matchup_comparison, get_player_compari
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
 from match_analysis_module import get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
+from standings_module import StandingsError, get_league_standings
 from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
@@ -2008,6 +2011,18 @@ def league_pool_search(
 ):
     del user_id
     return search_league_pool(db, payload.model_dump())
+
+
+@app.post("/league-standings", response_model=LeagueStandingsOut)
+def league_standings(
+    payload: LeagueStandingsIn,
+    user_id: str = Depends(require_auth),
+):
+    del user_id
+    try:
+        return get_league_standings(payload.leagueId)
+    except StandingsError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/match-analysis/options", response_model=MatchAnalysisOptionsOut)
