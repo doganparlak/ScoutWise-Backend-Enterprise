@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
+import requests
 from dotenv import load_dotenv
 from fastapi import Body, BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query as FastAPIQuery, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -93,8 +94,9 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
-from match_analysis_module import get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
+from match_analysis_module import get_fixture, get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
+from match_analysis_module.pre_match_report import build_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
 from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
@@ -653,6 +655,7 @@ def get_enterprise_dashboard_report(
 @app.get("/dashboard/match-reports")
 def list_enterprise_dashboard_match_reports(
     limit: int = FastAPIQuery(default=12, ge=1, le=50),
+    report_type: str = FastAPIQuery(default="post_match", pattern="^(pre_match|post_match)$"),
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -663,13 +666,14 @@ def list_enterprise_dashboard_match_reports(
                    report_ready_at, created_at, updated_at
             FROM enterprise_favorite_matches
             WHERE user_id = :user_id
+              AND COALESCE(report_type, 'post_match') = :report_type
               AND report_status = 'ready'
               AND report_content IS NOT NULL
             ORDER BY report_ready_at DESC NULLS LAST, updated_at DESC
             LIMIT :limit
             """
         ),
-        {"user_id": user_id, "limit": limit},
+        {"user_id": user_id, "limit": limit, "report_type": report_type},
     ).mappings().all()
     return [
         {
@@ -2116,7 +2120,7 @@ def list_enterprise_favorite_matches(
     rows = db.execute(
         text(
             """
-            SELECT id, fixture_payload, created_at
+            SELECT id, fixture_id, fixture_payload, report_type, report_status, created_at
             FROM enterprise_favorite_matches
             WHERE user_id = :user_id
             ORDER BY starting_at DESC, created_at DESC
@@ -2124,10 +2128,30 @@ def list_enterprise_favorite_matches(
         ),
         {"user_id": user_id},
     ).mappings().all()
+    def current_fixture(fixture_id: int) -> dict[str, Any] | None:
+        try:
+            return get_fixture(fixture_id)
+        except Exception as exc:
+            print(
+                f"[enterprise_favorite_matches] event=fixture_refresh_failed fixture_id={fixture_id} error={exc}",
+                flush=True,
+            )
+            return None
+
+    fixture_ids = list({int(row["fixture_id"]) for row in rows})
+    current_fixtures: dict[int, dict[str, Any]] = {}
+    if fixture_ids:
+        with ThreadPoolExecutor(max_workers=min(6, len(fixture_ids))) as executor:
+            refreshed = executor.map(current_fixture, fixture_ids)
+            for fixture_id, fixture in zip(fixture_ids, refreshed):
+                if fixture:
+                    current_fixtures[fixture_id] = fixture
     return [
         EnterpriseFavoriteMatchOut(
             favoriteId=str(row["id"]),
-            fixture=dict(row["fixture_payload"] or {}),
+            fixture=current_fixtures.get(int(row["fixture_id"]), dict(row["fixture_payload"] or {})),
+            reportType=str(row.get("report_type") or "post_match"),
+            reportStatus=str(row.get("report_status") or ""),
             createdAt=row["created_at"],
         )
         for row in rows
@@ -2159,6 +2183,206 @@ def _is_completed_enterprise_fixture(fixture: dict[str, Any]) -> bool:
     )
 
 
+def _is_live_enterprise_fixture(fixture: dict[str, Any]) -> bool:
+    state = fixture.get("state") or {}
+    code = str(state.get("code") or state.get("short_name") or "").strip().upper().replace(" ", "_")
+    if code in {"LIVE", "HT", "1ST", "2ND", "ET", "PEN_LIVE", "BREAK", "INT", "SUSP"}:
+        return True
+    name = str(state.get("name") or "").strip().casefold()
+    return any(marker in name for marker in ("live", "in progress", "half time", "extra time", "penalty shootout"))
+
+
+def _is_not_started_enterprise_fixture(fixture: dict[str, Any]) -> bool:
+    if _is_completed_enterprise_fixture(fixture) or _is_live_enterprise_fixture(fixture):
+        return False
+    state = fixture.get("state") or {}
+    code = str(state.get("code") or state.get("short_name") or "").strip().upper().replace(" ", "_")
+    if code in {"NS", "TBA", "POSTP", "DELAYED"}:
+        return True
+    name = str(state.get("name") or "").strip().casefold()
+    return any(marker in name for marker in ("not started", "scheduled", "to be announced", "postponed", "delayed"))
+
+
+def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any]:
+    """A compact, viewable pre-match report until richer pre-match sections are added."""
+    league = dict(fixture.get("league") or {})
+    country = dict(fixture.get("country") or {})
+    home = dict(fixture.get("homeTeam") or {})
+    away = dict(fixture.get("awayTeam") or {})
+    state = dict(fixture.get("state") or {})
+    venue = dict(fixture.get("venue") or {})
+    season = dict(fixture.get("season") or {})
+    stage = dict(fixture.get("stage") or {})
+    round_data = dict(fixture.get("round") or {})
+    lineup_confirmed = bool(fixture.get("lineupConfirmed"))
+    lineup_rows = list(
+        fixture.get("officialLineups")
+        if lineup_confirmed
+        else fixture.get("expectedLineups") or fixture.get("officialLineups") or []
+    )
+    formations = list(fixture.get("formations") or [])
+
+    def formation_for(team_id: int) -> str:
+        row = next(
+            (item for item in formations if int(item.get("participant_id") or item.get("team_id") or 0) == team_id),
+            {},
+        )
+        return str(row.get("formation") or row.get("name") or "")
+
+    def team(side: dict[str, Any], location: str) -> dict[str, Any]:
+        return {
+            "id": int(side.get("id") or 0),
+            "name": str(side.get("name") or "—"),
+            "image_url": side.get("imageUrl"),
+            "coach_name": side.get("coachName") or "",
+            "player_count": int(side.get("playerCount") or 0),
+            "location": location,
+            "formation": formation_for(int(side.get("id") or 0)) or None,
+            "categories": {},
+            "extra_metrics": [],
+            "expected_metrics": [],
+        }
+
+    lineup_count_by_team: dict[int, int] = {}
+
+    def lineup(row: dict[str, Any], index: int) -> dict[str, Any]:
+        player = row.get("player") or {}
+        position = row.get("position") or {}
+        player_id = int(row.get("player_id") or player.get("id") or 0)
+        team_id = int(row.get("team_id") or row.get("participant_id") or 0)
+        lineup_count_by_team[team_id] = lineup_count_by_team.get(team_id, 0) + 1
+        return {
+            "player_id": player_id or index + 1,
+            "player_name": row.get("player_name") or player.get("display_name") or player.get("name") or "—",
+            "player_image_url": player.get("image_path") or row.get("image_path"),
+            "team_id": team_id,
+            "team_name": "",
+            "position_id": row.get("position_id") or position.get("id"),
+            "position_name": position.get("name") or row.get("position_name"),
+            "starter": bool(row.get("formation_field")) or lineup_count_by_team[team_id] <= 11,
+            "jersey_number": row.get("jersey_number"),
+            "formation_field": row.get("formation_field"),
+            "categories": {},
+            "extra_metrics": [],
+            "expected_metrics": [],
+        }
+
+    content = {
+        "report_type": "pre_match",
+        "pre_match_schema_version": 6,
+        "language": lang,
+        "version": MATCH_REPORT_VERSION,
+        "fixture": {
+            "id": fixture.get("fixtureId"),
+            "name": fixture.get("name"),
+            "starting_at": fixture.get("startingAt"),
+            "leg": fixture.get("leg"),
+        },
+        "league": {
+            "id": league.get("id"),
+            "name": league.get("name"),
+            "country": {"id": country.get("id"), "name": country.get("name")},
+        },
+        "season": season,
+        "stage": stage,
+        "round": round_data,
+        "state": {"short_name": state.get("code"), "name": state.get("name")},
+        "venue": {
+            "id": venue.get("id"),
+            "name": venue.get("name"),
+            "city_name": venue.get("cityName"),
+            "capacity": venue.get("capacity"),
+            "surface": venue.get("surface"),
+            "image_path": venue.get("imageUrl"),
+        },
+        "weather": {},
+        "teams": [team(home, "home"), team(away, "away")],
+        "lineups": [lineup(row, index) for index, row in enumerate(lineup_rows) if isinstance(row, dict)],
+        "pre_match_lineup_confirmed": lineup_confirmed,
+        "events": [],
+        "formations": [],
+        "scores": [],
+        "periods": [],
+        "coaches": [],
+        "referees": (
+            [{"name": fixture.get("refereeName")}]
+            if fixture.get("refereeName")
+            else []
+        ),
+        "pressure": [],
+        "trends": [],
+        "ball_coordinates": [],
+        "summary": [],
+        "coverage": {
+            "unique_team_metrics": 0,
+            "unique_player_metrics": 0,
+            "players_with_minutes": 0,
+        },
+        "temporary_extra_team_metrics": [],
+    }
+    try:
+        content["recent_squad_usage"] = build_recent_squad_usage(fixture, lang)
+    except (SportMonksError, TypeError, ValueError, requests.RequestException):
+        # The pre-match report remains usable if a historical lineup request is
+        # temporarily unavailable; the UI renders an explicit no-data state.
+        content["recent_squad_usage"] = {"teams": []}
+    try:
+        standings = get_league_standings(int(league.get("id") or 0))
+        standing_by_team: dict[int, dict[str, Any]] = {}
+        for table in standings.get("tables") or []:
+            for row in table.get("rows") or []:
+                team_id = int(row.get("teamId") or 0)
+                if team_id and team_id not in standing_by_team:
+                    standing_by_team[team_id] = {
+                        "position": row.get("position"),
+                        "played": row.get("played"),
+                        "won": row.get("won"),
+                        "drawn": row.get("drawn"),
+                        "lost": row.get("lost"),
+                        "goal_difference": row.get("goalDifference"),
+                        "points": row.get("points"),
+                        "table_label": table.get("label") or "",
+                    }
+        content["league_standings"] = standing_by_team
+    except (StandingsError, TypeError, ValueError, requests.RequestException):
+        content["league_standings"] = {}
+    return content
+
+
+@app.post("/pre-match-report-preview", response_model=EnterpriseMatchReportOut)
+def preview_enterprise_pre_match_report(
+    payload: EnterpriseFavoriteMatchIn,
+    accept_language: str | None = Header(default=None),
+    _user_id: str = Depends(require_auth),
+):
+    """Generate a development preview without persisting a favorite or report."""
+    fixture = payload.fixture
+    try:
+        current_fixture = get_fixture(
+            int(fixture.get("fixtureId") or 0),
+            include_team_details=True,
+            include_pre_match_data=True,
+        )
+        if current_fixture:
+            fixture = current_fixture
+    except (SportMonksError, TypeError, ValueError):
+        # The selected fixture payload remains a safe fallback for the preview.
+        pass
+    if not _is_not_started_enterprise_fixture(fixture):
+        raise HTTPException(
+            status_code=409,
+            detail="A pre-match report preview is only available before the match starts",
+        )
+    lang = normalize_lang(accept_language) or "en"
+    return EnterpriseMatchReportOut(
+        favorite_match_id=f"preview-{fixture.get('fixtureId') or 'fixture'}",
+        status="ready",
+        content_json=_build_pre_match_report(fixture, lang),
+        language=lang,
+        version=MATCH_REPORT_VERSION,
+    )
+
+
 @app.post("/favorite-matches", response_model=EnterpriseFavoriteMatchOut)
 def save_enterprise_favorite_match(
     payload: EnterpriseFavoriteMatchIn,
@@ -2166,10 +2390,15 @@ def save_enterprise_favorite_match(
     db: Session = Depends(get_db),
 ):
     fixture = payload.fixture
-    if not _is_completed_enterprise_fixture(fixture):
+    if payload.reportType == "pre_match" and not _is_not_started_enterprise_fixture(fixture):
         raise HTTPException(
             status_code=409,
-            detail="Only completed matches can be saved",
+            detail="A pre-match report can only be saved before the match starts",
+        )
+    if payload.reportType == "post_match" and not _is_completed_enterprise_fixture(fixture):
+        raise HTTPException(
+            status_code=409,
+            detail="A post-match report can only be saved after the match is completed",
         )
     country = fixture.get("country") or {}
     league = fixture.get("league") or {}
@@ -2190,6 +2419,7 @@ def save_enterprise_favorite_match(
     values = {
         "user_id": user_id,
         "fixture_id": int(fixture["fixtureId"]),
+        "report_type": payload.reportType,
         "starting_at": fixture["startingAt"],
         "country_id": country.get("id"),
         "country_name": str(country.get("name") or ""),
@@ -2214,21 +2444,21 @@ def save_enterprise_favorite_match(
         text(
             """
             INSERT INTO enterprise_favorite_matches (
-              user_id, fixture_id, starting_at,
+              user_id, fixture_id, report_type, starting_at,
               country_id, country_name, country_image_url,
               league_id, league_name, league_image_url,
               home_team_id, home_team_name, home_team_image_url, home_score,
               away_team_id, away_team_name, away_team_image_url, away_score,
               state_code, state_name, result_info, fixture_payload
             ) VALUES (
-              :user_id, :fixture_id, :starting_at,
+              :user_id, :fixture_id, :report_type, :starting_at,
               :country_id, :country_name, :country_image_url,
               :league_id, :league_name, :league_image_url,
               :home_team_id, :home_team_name, :home_team_image_url, :home_score,
               :away_team_id, :away_team_name, :away_team_image_url, :away_score,
               :state_code, :state_name, :result_info, CAST(:fixture_payload AS jsonb)
             )
-            ON CONFLICT (user_id, fixture_id) DO UPDATE SET
+            ON CONFLICT (user_id, fixture_id, report_type) DO UPDATE SET
               starting_at = EXCLUDED.starting_at,
               country_id = EXCLUDED.country_id,
               country_name = EXCLUDED.country_name,
@@ -2249,7 +2479,7 @@ def save_enterprise_favorite_match(
               result_info = EXCLUDED.result_info,
               fixture_payload = EXCLUDED.fixture_payload,
               updated_at = now()
-            RETURNING id, fixture_payload, created_at
+            RETURNING id, fixture_payload, report_type, created_at
             """
         ),
         values,
@@ -2258,6 +2488,7 @@ def save_enterprise_favorite_match(
     return EnterpriseFavoriteMatchOut(
         favoriteId=str(row["id"]),
         fixture=dict(row["fixture_payload"] or {}),
+        reportType=str(row.get("report_type") or "post_match"),
         createdAt=row["created_at"],
     )
 
@@ -2273,7 +2504,7 @@ def create_enterprise_match_report(
     row = db.execute(
         text(
             """
-            SELECT id, fixture_id, state_code, state_name,
+            SELECT id, fixture_id, fixture_payload, report_type, state_code, state_name,
                    report_status, report_content
             FROM enterprise_favorite_matches
             WHERE id = :favorite_id AND user_id = :user_id
@@ -2284,19 +2515,17 @@ def create_enterprise_match_report(
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Favorite match not found")
-    if not _is_completed_enterprise_fixture(
-        {"state": {"code": row["state_code"], "name": row["state_name"]}}
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="A match report can only be created after the match is completed",
-        )
-
+    report_type = str(row.get("report_type") or "post_match")
     cached = dict(row["report_content"] or {})
     if (
         row["report_status"] == "ready"
         and cached.get("version") == MATCH_REPORT_VERSION
         and cached.get("language") == lang
+        and (
+            report_type != "pre_match"
+            or cached.get("pre_match_schema_version") == 6
+            or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
+        )
     ):
         return EnterpriseMatchReportOut(
             favorite_match_id=str(row["id"]),
@@ -2304,6 +2533,19 @@ def create_enterprise_match_report(
             content_json=cached,
             language=lang,
             version=MATCH_REPORT_VERSION,
+        )
+    fixture = dict(row.get("fixture_payload") or {})
+    if report_type == "pre_match" and not _is_not_started_enterprise_fixture(fixture):
+        raise HTTPException(
+            status_code=409,
+            detail="A pre-match report can only be created before the match starts",
+        )
+    if report_type == "post_match" and not _is_completed_enterprise_fixture(
+        {"state": {"code": row["state_code"], "name": row["state_name"]}}
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A post-match report can only be created after the match is completed",
         )
     if row["report_status"] == "processing":
         return EnterpriseMatchReportOut(
@@ -2326,7 +2568,11 @@ def create_enterprise_match_report(
     )
     db.commit()
     try:
-        content = generate_match_report(int(row["fixture_id"]), lang)
+        content = (
+            _build_pre_match_report(fixture, lang)
+            if report_type == "pre_match"
+            else generate_match_report(int(row["fixture_id"]), lang)
+        )
         db.execute(
             text(
                 """

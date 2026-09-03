@@ -221,11 +221,14 @@ class MatchAnalysisSearchOut(BaseModel):
 
 class EnterpriseFavoriteMatchIn(BaseModel):
     fixture: Dict[str, Any]
+    reportType: Literal["pre_match", "post_match"] = "post_match"
 
 
 class EnterpriseFavoriteMatchOut(BaseModel):
     favoriteId: str
     fixture: Dict[str, Any]
+    reportType: Literal["pre_match", "post_match"] = "post_match"
+    reportStatus: str = ""
     createdAt: datetime
 
 

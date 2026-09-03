@@ -148,6 +148,23 @@ PLAYER_METRIC_CATEGORY: dict[str, tuple[str, str]] = {
     "Redcards": ("errors_discipline", "Red Cards"),
 }
 
+# Percentages that have a known numerator and denominator must be derived from
+# their aggregated components, never averaged as independently rounded match
+# percentages.
+DERIVED_PERCENTAGE_METRICS: dict[str, tuple[str, str]] = {
+    "Shots On Target (%)": ("Shots On Target", "Shots Total"),
+    "Goal Conversion (%)": ("Goals", "Shots Total"),
+    "On Target Goal Conversion (%)": ("Goals", "Shots On Target"),
+    "Assist Efficiency (%)": ("Assists", "Key Passes"),
+    "Dribble Accuracy (%)": ("Successful Dribbles", "Dribble Attempts"),
+    "Tackles Won (%)": ("Tackles Won", "Tackles"),
+    "Aerials Won (%)": ("Aerials Won", "Aerials"),
+    "Duels Won (%)": ("Duels Won", "Total Duels"),
+    "Long Balls Won (%)": ("Long Balls Won", "Long Balls"),
+    "Accurate Passes (%)": ("Accurate Passes", "Passes"),
+    "Accurate Crosses (%)": ("Accurate Crosses", "Total Crosses"),
+}
+
 
 class MatchReportError(RuntimeError):
     pass
@@ -1426,11 +1443,15 @@ def build_team_report_metrics(
         for name, values in metrics.items():
             is_average = "%" in name or "percentage" in name.casefold() or "performance" in name.casefold()
             total = sum(values)
+            numerator_denominator = DERIVED_PERCENTAGE_METRICS.get(name)
+            numerator = sum(metrics.get(numerator_denominator[0], [])) if numerator_denominator else 0.0
+            denominator = sum(metrics.get(numerator_denominator[1], [])) if numerator_denominator else 0.0
+            derived_rate = numerator / denominator * 100 if numerator_denominator and denominator > 0 else None
             aggregate[group].append({
                 "name": name,
-                "value": round(total / len(values), 2) if is_average else round(total, 2),
-                "perMatch": round(total / len(values), 2),
-                "aggregation": "average" if is_average else "total",
+                "value": round(derived_rate, 2) if derived_rate is not None else round(total / len(values), 2) if is_average else round(total, 2),
+                "perMatch": round(derived_rate, 2) if derived_rate is not None else round(total / len(values), 2),
+                "aggregation": "derived_rate" if derived_rate is not None else "average" if is_average else "total",
                 "matchesCovered": len(values),
             })
         aggregate[group].sort(key=lambda row: row["name"])
@@ -1516,10 +1537,21 @@ def build_team_report_player_perspectives(
             compact_metrics[group] = {}
             for name, samples in metrics.items():
                 average = "%" in name or any(word in name.casefold() for word in ("rating", "percentage", "performance", "captain"))
+                available_minutes = sum(minutes for _, minutes in samples)
                 compact_metrics[group][name] = round(
-                    sum(value * minutes for value, minutes in samples) / sum(minutes for _, minutes in samples)
-                    if average else sum(value for value, _ in samples), 2
+                    sum(value * minutes for value, minutes in samples) / available_minutes
+                    if average and available_minutes else
+                    sum(value for value, _ in samples) * 90 / available_minutes
+                    if available_minutes else 0,
+                    2,
                 )
+            # Keep the player-perspective evidence consistent with the cells:
+            # derive each known percentage from its aggregated count pair.
+            for rate_name, (numerator_name, denominator_name) in DERIVED_PERCENTAGE_METRICS.items():
+                numerator = compact_metrics[group].get(numerator_name)
+                denominator = compact_metrics[group].get(denominator_name)
+                if numerator is not None and denominator is not None and denominator > 0:
+                    compact_metrics[group][rate_name] = round(numerator / denominator * 100, 2)
         player["metrics"] = compact_metrics
         eligible.append(player)
     ordered = sorted(eligible, key=lambda player: (-player["rating"], -player["minutes"], str(player["player_name"])))

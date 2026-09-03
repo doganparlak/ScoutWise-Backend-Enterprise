@@ -369,6 +369,24 @@ def _fixture_out(fixture: dict[str, Any]) -> dict[str, Any] | None:
     country = league.get("country") or {}
     state = fixture.get("state") or {}
     scores = fixture.get("scores") or []
+    venue = fixture.get("venue") or {}
+    season = fixture.get("season") or {}
+    stage = fixture.get("stage") or {}
+    round_data = fixture.get("round") or {}
+    referees = fixture.get("referees") or []
+    primary_referee = next(
+        (
+            item for item in referees
+            if str((item.get("type") or {}).get("name") or "").casefold()
+            in {"referee", "main referee"}
+        ),
+        referees[0] if referees else {},
+    )
+    referee_name = (
+        primary_referee.get("name")
+        or (primary_referee.get("referee") or {}).get("name")
+        or ""
+    )
     return {
         "fixtureId": fixture.get("id"),
         "name": fixture.get("name") or f'{home.get("name", "")} vs {away.get("name", "")}',
@@ -376,10 +394,137 @@ def _fixture_out(fixture: dict[str, Any]) -> dict[str, Any] | None:
         "resultInfo": fixture.get("result_info"),
         "country": {"id": country.get("id"), "name": country.get("name") or "", "imageUrl": country.get("image_path")},
         "league": {"id": league.get("id"), "name": league.get("name") or "", "imageUrl": league.get("image_path")},
+        "season": {"id": season.get("id"), "name": season.get("name") or ""},
+        "stage": {"id": stage.get("id"), "name": stage.get("name") or ""},
+        "round": {"id": round_data.get("id"), "name": round_data.get("name") or ""},
+        "leg": fixture.get("leg") or "",
+        "refereeName": referee_name,
+        "venue": {
+            "id": venue.get("id"),
+            "name": venue.get("name") or "",
+            "cityName": venue.get("city_name") or "",
+            "capacity": venue.get("capacity"),
+            "surface": venue.get("surface") or "",
+            "imageUrl": venue.get("image_path"),
+        },
         "homeTeam": {"id": home.get("id"), "name": home.get("name") or "", "imageUrl": home.get("image_path"), "score": _current_score(scores, "home")},
         "awayTeam": {"id": away.get("id"), "name": away.get("name") or "", "imageUrl": away.get("image_path"), "score": _current_score(scores, "away")},
         "state": {"code": state.get("short_name") or state.get("state") or "", "name": state.get("name") or ""},
     }
+
+
+def get_fixture(
+    fixture_id: int,
+    include_team_details: bool = False,
+    include_pre_match_data: bool = False,
+) -> dict[str, Any] | None:
+    """Return the current compact fixture representation used by Enterprise."""
+    token = os.getenv("SPORTMONKS_API_KEY")
+    if not token:
+        raise SportMonksError("ScoutWise data service is not configured")
+    includes = "participants;league.country;season;stage;round;venue;state;referees;scores"
+    if include_pre_match_data:
+        includes += ";lineups.player;lineups.position;formations;metadata;expectedLineups.player;expectedLineups.team"
+    response = requests.get(
+        f"{SPORTMONKS_BASE_URL}/fixtures/{int(fixture_id)}",
+        params={
+            "api_token": token,
+            "include": includes,
+        },
+        timeout=45,
+    )
+    # Expected lineups are a premium include. Keep the rest of the pre-match
+    # card available when an account does not have that entitlement.
+    if include_pre_match_data and response.status_code == 403:
+        fallback_includes = includes.replace(
+            ";expectedLineups.player;expectedLineups.team", ""
+        )
+        response = requests.get(
+            f"{SPORTMONKS_BASE_URL}/fixtures/{int(fixture_id)}",
+            params={"api_token": token, "include": fallback_includes},
+            timeout=45,
+        )
+    if response.status_code != 200:
+        detail = "ScoutWise fixture data request failed"
+        try:
+            detail = response.json().get("message") or detail
+        except ValueError:
+            pass
+        raise SportMonksError(f"{detail} (HTTP {response.status_code})")
+    compact = _fixture_out(response.json().get("data") or {})
+    if not compact:
+        return None
+    raw_fixture = response.json().get("data") or {}
+    if include_pre_match_data:
+        metadata = raw_fixture.get("metadata") or []
+        if isinstance(metadata, dict):
+            metadata = [metadata]
+        confirmed = False
+        for item in metadata:
+            if not isinstance(item, dict):
+                continue
+            type_data = item.get("type") or {}
+            key = str(
+                item.get("key")
+                or item.get("name")
+                or type_data.get("code")
+                or type_data.get("name")
+                or ""
+            ).strip().casefold().replace(" ", "_")
+            if key != "lineup_confirmed":
+                continue
+            value = item.get("value", item.get("data", item.get("boolean")))
+            confirmed = value is True or str(value).strip().casefold() in {"true", "1", "yes"}
+            break
+        compact["lineupConfirmed"] = confirmed
+        compact["officialLineups"] = raw_fixture.get("lineups") or []
+        compact["expectedLineups"] = (
+            raw_fixture.get("expectedLineups")
+            or raw_fixture.get("expected_lineups")
+            or raw_fixture.get("expectedlineups")
+            or []
+        )
+        compact["formations"] = raw_fixture.get("formations") or []
+    venue = compact.get("venue") or {}
+    if include_team_details:
+        try:
+            sides = ("homeTeam", "awayTeam")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                details = list(
+                    executor.map(
+                        lambda side: _get_team_details(
+                            int((compact.get(side) or {}).get("id") or 0)
+                        ),
+                        sides,
+                    )
+                )
+            for side, detail in zip(sides, details):
+                compact[side] = {
+                    **(compact.get(side) or {}),
+                    "coachName": detail.get("coachName") or "",
+                    "playerCount": int(detail.get("playerCount") or 0),
+                }
+            home_details = details[0]
+            compact["venue"] = {
+                **venue,
+                "name": venue.get("name") or home_details.get("stadiumName") or "",
+                "cityName": venue.get("cityName") or home_details.get("city") or "",
+                "imageUrl": venue.get("imageUrl") or home_details.get("stadiumImageUrl"),
+            }
+        except (SportMonksError, TypeError, ValueError):
+            pass
+    elif not venue.get("name") or not venue.get("cityName"):
+        try:
+            home_details = _get_team_details(int((compact.get("homeTeam") or {}).get("id") or 0))
+            compact["venue"] = {
+                **venue,
+                "name": venue.get("name") or home_details.get("stadiumName") or "",
+                "cityName": venue.get("cityName") or home_details.get("city") or "",
+                "imageUrl": venue.get("imageUrl") or home_details.get("stadiumImageUrl"),
+            }
+        except (SportMonksError, TypeError, ValueError):
+            pass
+    return compact
 
 
 def search_fixtures(filters: dict[str, Any]) -> dict[str, Any]:
@@ -411,7 +556,7 @@ def search_fixtures(filters: dict[str, Any]) -> dict[str, Any]:
     limit = min(max(1, int(filters.get("limit") or MAX_FIXTURE_RESULTS)), MAX_FIXTURE_RESULTS)
     params: dict[str, Any] = {
         "api_token": token,
-        "include": "participants;league.country;state;scores",
+        "include": "participants;league.country;season;stage;round;venue;state;referees;scores",
         "order": "asc",
         "per_page": MAX_FIXTURE_RESULTS,
         "page": page,
