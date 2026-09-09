@@ -1900,6 +1900,8 @@ def player_pool_matchup_comparison(
             bool(payload.worldCupMode),
             payload.player1Sources,
             payload.player2Sources,
+            payload.player1SportmonksId,
+            payload.player2SportmonksId,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1911,12 +1913,13 @@ def player_pool_matchup_comparison(
 )
 def player_pool_matchup_sources(
     player_id: str,
+    sportmonksId: int | None = FastAPIQuery(default=None, gt=0),
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
     del user_id
     try:
-        return get_player_comparison_sources(db, player_id)
+        return get_player_comparison_sources(db, player_id, sportmonksId)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

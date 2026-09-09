@@ -35,6 +35,19 @@ def _fetch_player_metadata(db: Session, player_id: str, world_cup_mode: bool = F
     }
 
 
+def _fetch_player_by_sportmonks_id(db: Session, sportmonks_id: int, world_cup_mode: bool = False) -> Dict[str, Any]:
+    table_name = player_pool_table(world_cup_mode)
+    rows = db.execute(text(f"""
+        SELECT id, metadata AS content FROM {table_name}
+        WHERE CASE WHEN metadata->>'player_id' ~ '^[0-9]+([.]0+)?$'
+              THEN (metadata->>'player_id')::numeric END = :sportmonks_id
+        LIMIT 2
+    """), {"sportmonks_id": sportmonks_id}).mappings().all()
+    if len(rows) != 1:
+        raise ValueError(f"Expected one current player for SportMonks ID {sportmonks_id}; found {len(rows)}")
+    return {"id": rows[0]["id"], "content": rows[0]["content"] or {}}
+
+
 def _source_key(team_id: Any, competition_id: Any) -> str:
     return json.dumps([str(team_id or ""), str(competition_id or "")], separators=(",", ":"))
 
@@ -42,12 +55,12 @@ def _source_key(team_id: Any, competition_id: Any) -> str:
 def _fetch_comp_rows(db: Session, player_id: str) -> List[Dict[str, Any]]:
     player = _fetch_player_metadata(db, player_id, False)
     metadata = player["content"] or {}
-    player_name = str(metadata.get("player_name") or metadata.get("name") or "").strip()
-    nationality = str(
-        metadata.get("nationality_name") or metadata.get("nationality") or ""
-    ).strip()
-    if not player_name:
-        raise ValueError(f"Player identity not found: {player_id}")
+    try:
+        sportmonks_id = int(metadata.get("player_id"))
+        if sportmonks_id <= 0:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError(f"SportMonks ID is missing for player: {player_id}") from None
     rows = db.execute(
         text("""
             SELECT
@@ -67,19 +80,17 @@ def _fetch_comp_rows(db: Session, player_id: str) -> List[Dict[str, Any]]:
                 position_counts,
                 stats
             FROM player_comp_data
-            WHERE LOWER(TRIM(player_name)) = LOWER(TRIM(:player_name))
-              AND (
-                :nationality = ''
-                OR LOWER(TRIM(COALESCE(nationality_name, ''))) = LOWER(TRIM(:nationality))
-              )
+            WHERE player_id = :sportmonks_id
             ORDER BY team_name, league_name
         """),
-        {"player_name": player_name, "nationality": nationality},
+        {"sportmonks_id": sportmonks_id},
     ).mappings().all()
     return [dict(row) for row in rows]
 
 
-def get_player_comparison_sources(db: Session, player_id: str) -> List[Dict[str, Any]]:
+def get_player_comparison_sources(db: Session, player_id: str, sportmonks_id: int | None = None) -> List[Dict[str, Any]]:
+    if sportmonks_id is not None:
+        player_id = str(_fetch_player_by_sportmonks_id(db, sportmonks_id)["id"])
     rows = _fetch_comp_rows(db, player_id)
     grouped: Dict[str, Dict[str, Any]] = {}
     for row in rows:
@@ -198,16 +209,18 @@ def get_matchup_comparison(
     world_cup_mode: bool = False,
     player1_sources: List[str] | None = None,
     player2_sources: List[str] | None = None,
+    player1_sportmonks_id: int | None = None,
+    player2_sportmonks_id: int | None = None,
 ) -> Dict[str, Any]:
-    player1 = _fetch_player_metadata(db, player1_id, world_cup_mode)
-    player2 = _fetch_player_metadata(db, player2_id, world_cup_mode)
+    player1 = _fetch_player_by_sportmonks_id(db, player1_sportmonks_id, world_cup_mode) if player1_sportmonks_id is not None else _fetch_player_metadata(db, player1_id, world_cup_mode)
+    player2 = _fetch_player_by_sportmonks_id(db, player2_sportmonks_id, world_cup_mode) if player2_sportmonks_id is not None else _fetch_player_metadata(db, player2_id, world_cup_mode)
     if player1_sources:
         player1["content"] = _selected_comp_metadata(
-            db, player1_id, player1_sources, player1["content"]
+            db, str(player1["id"]), player1_sources, player1["content"]
         )
     if player2_sources:
         player2["content"] = _selected_comp_metadata(
-            db, player2_id, player2_sources, player2["content"]
+            db, str(player2["id"]), player2_sources, player2["content"]
         )
     return {
         "player1": player1,

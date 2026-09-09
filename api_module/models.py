@@ -275,6 +275,8 @@ class PlayerPoolFormOut(BaseModel):
 
 
 class MatchupComparisonIn(BaseModel):
+    player1SportmonksId: Optional[int] = Field(default=None, gt=0)
+    player2SportmonksId: Optional[int] = Field(default=None, gt=0)
     player1Id: str
     player2Id: str
     worldCupMode: Optional[bool] = False
