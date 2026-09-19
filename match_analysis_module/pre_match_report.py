@@ -184,6 +184,7 @@ _PLAYER_NEGATIVE_METRIC_TERMS = (
     "foul", "card", "offside", "lost", "error", "missed", "conceded",
     "penalty committed", "dribbled past", "passed", "dispossessed", "turn over",
 )
+_PLAYER_METRIC_MIN_RECORDED_MINUTES = 90
 _PLAYER_HIGHLIGHT_EXCLUDED_METRICS = {
     "Long Balls Won Percentage",
     "Tacles Won Percentage",
@@ -237,6 +238,23 @@ def _lineup_numeric_metrics(row: dict[str, Any]) -> dict[str, float]:
             and not any(term in name.casefold() for term in _PLAYER_RATE_METRIC_TERMS)
         ):
             values[name] = values.get(name, 0.0) + value
+    return values
+
+
+def _match_covered_count_metrics(row: dict[str, Any], covered_names: set[str]) -> dict[str, float]:
+    """Zero-fill omitted counts only when another player records them in this match.
+
+    This is our match-level coverage assumption, not a provider guarantee.
+    Explicit null/invalid values remain unknown; percentages are never zero-filled.
+    """
+    values = _lineup_numeric_metrics(row)
+    present = {
+        _PLAYER_METRIC_NAME_ALIASES.get(name, name)
+        for detail in row.get("details") or []
+        for name in [str((detail.get("type") or {}).get("name") or detail.get("name") or "").strip()]
+    }
+    for name in sorted(covered_names - present):
+        values[name] = 0.0
     return values
 
 
@@ -509,6 +527,7 @@ def _team_recent_squad_usage(
     player_rate_minutes: dict[int, Counter[str]] = defaultdict(Counter)
     player_derived_rate_numerators: dict[int, Counter[str]] = defaultdict(Counter)
     player_derived_rate_denominators: dict[int, Counter[str]] = defaultdict(Counter)
+    player_derived_rate_minutes: dict[int, Counter[str]] = defaultdict(Counter)
     pressure_samples: dict[int, list[float]] = {}
     momentum_events: list[dict[str, Any]] = []
     territory_counts = [0] * 9
@@ -527,6 +546,14 @@ def _team_recent_squad_usage(
         if formation_name:
             formation_counts[formation_name] += 1
 
+        # Only player-level statistics establish player-metric coverage.
+        # A metric seen solely in team totals is not sufficient evidence.
+        covered_count_names = {
+            name
+            for lineup in fixture.get("lineups") or []
+            if (_metric_value(lineup, "Minutes Played") or 0) > 0
+            for name in _lineup_numeric_metrics(lineup)
+        }
         team_rows = [
             row
             for row in fixture.get("lineups") or []
@@ -559,17 +586,17 @@ def _team_recent_squad_usage(
                 player_rating_weighted[player_id] += rating * minutes
                 player_rating_minutes[player_id] += minutes
             if minutes > 0:
-                count_metrics = _lineup_numeric_metrics(row)
+                count_metrics = _match_covered_count_metrics(row, covered_count_names)
                 for metric_name, metric_value in count_metrics.items():
                     player_metric_totals[player_id][metric_name] += metric_value
-                    # Missing provider details are unavailable, not silently
-                    # treated as a zero. Each metric therefore receives the
-                    # minutes from appearances where it is actually present.
+                    # Include minutes for recorded values and match-covered
+                    # omitted counts, but not entirely unavailable metrics.
                     player_metric_minutes[player_id][metric_name] += minutes
                 for rate_name, (numerator_name, denominator_name) in _DERIVED_PLAYER_PERCENTAGES.items():
                     if numerator_name in count_metrics and denominator_name in count_metrics:
                         player_derived_rate_numerators[player_id][rate_name] += count_metrics[numerator_name]
                         player_derived_rate_denominators[player_id][rate_name] += count_metrics[denominator_name]
+                        player_derived_rate_minutes[player_id][rate_name] += minutes
             # Percentages retain their meaning only as a minute-weighted
             # average across appearances with that metric available.
             if minutes > 0:
@@ -699,25 +726,28 @@ def _team_recent_squad_usage(
                     "name": name,
                     "value": round(value * 90 / player_metric_minutes[player_id][name], 2),
                     "is_percentage": False,
+                    "recorded_minutes": player_metric_minutes[player_id][name],
                 }
                 for name, value in player_metric_totals[player_id].items()
-                if player_metric_minutes[player_id][name] > 0 and value >= 0
+                if player_metric_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES and value >= 0
             ] + [
                 {
                     "name": name,
                     "value": round(player_derived_rate_numerators[player_id][name] * 100 / denominator, 2),
+                    "recorded_minutes": player_derived_rate_minutes[player_id][name],
                     "is_percentage": True,
                 }
                 for name, denominator in player_derived_rate_denominators[player_id].items()
-                if denominator > 0
+                if denominator > 0 and player_derived_rate_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
             ] + [
                 {
                     "name": name,
                     "value": round(weighted_value / player_rate_minutes[player_id][name], 2),
+                    "recorded_minutes": player_rate_minutes[player_id][name],
                     "is_percentage": True,
                 }
                 for name, weighted_value in player_rate_weighted_totals[player_id].items()
-                if player_rate_minutes[player_id][name] > 0
+                if player_rate_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
             ],
         })
     _attach_player_highlight_metrics(eligible_performers)
