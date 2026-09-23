@@ -541,6 +541,7 @@ class EnterpriseProStrategySavedOut(EnterpriseProStrategySavedIn):
 
 
 class EnterpriseProChatIn(BaseModel):
+    selected_player_id: Optional[int] = Field(default=None, gt=0)
     message: str = Field(min_length=1, max_length=4000)
     session_id: Optional[str] = "default"
     strategy: Optional[str] = None

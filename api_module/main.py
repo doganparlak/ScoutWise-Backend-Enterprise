@@ -17,6 +17,11 @@ from sqlalchemy.orm import Session
 
 load_dotenv()
 
+from scoutwise_pro_module.comparison_insights import ProComparisonInsightsIn, get_comparison_insights
+from scoutwise_pro_module.team_fit import TeamFitIn, get_team_fit
+from scoutwise_pro_module.discovery import DiscoveryIn, discovery_config, discover_players
+from scoutwise_pro_module.strategy_fit import StrategyFitIn, strategy_fit
+from scoutwise_pro_module.league_fit import LeagueFitIn, LeagueFitInsightsIn, league_fit_data, league_fit_insights
 from api_module.database import SessionLocal, get_db
 from api_module.models import (
     LoginIn,
@@ -731,6 +736,51 @@ def pro_strategies_delete(
 ):
     delete_named_strategy(db, user_id, strategy_id)
     return Response(status_code=204)
+
+
+@app.get("/pro/discovery/config")
+def pro_discovery_config(user_id: str = Depends(require_auth)):
+    return discovery_config()
+
+
+@app.post("/pro/discovery")
+def pro_discovery(payload: DiscoveryIn, user_id: str = Depends(require_auth), accept_language: str | None = Header(default=None), db: Session = Depends(get_db)):
+    return discover_players(db, user_id, payload, accept_language)
+
+
+@app.post("/pro/strategy-fit")
+def pro_strategy_fit(payload: StrategyFitIn, user_id: str = Depends(require_auth), accept_language: str | None = Header(default=None), db: Session = Depends(get_db)):
+    return strategy_fit(db, user_id, payload, accept_language)
+
+
+@app.post("/pro/league-fit/data")
+def pro_league_fit_data(payload: LeagueFitIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    return league_fit_data(db, payload)
+
+
+@app.post("/pro/league-fit")
+def pro_league_fit(payload: LeagueFitInsightsIn, user_id: str = Depends(require_auth), accept_language: str | None = Header(default=None), db: Session = Depends(get_db)):
+    return league_fit_insights(db, payload, accept_language)
+
+
+@app.post("/pro/team-fit")
+def pro_team_fit(
+    payload: TeamFitIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    return get_team_fit(db, payload, accept_language)
+
+
+@app.post("/pro/comparison-insights")
+def pro_comparison_insights(
+    payload: ProComparisonInsightsIn,
+    user_id: str = Depends(require_auth),
+    accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    return get_comparison_insights(db, payload, accept_language)
 
 
 @app.post("/pro/chat")

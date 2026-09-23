@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from sqlalchemy import text
@@ -102,7 +103,7 @@ def role_short_sql() -> str:
     """
 
 
-def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = False, candidate_roles: List[str] | None = None, candidate_choices: Dict[str, List[str]] | None = None) -> List[Dict[str, Any]]:
     world_cup_mode = bool(filters.get("worldCupMode"))
     table_name = player_pool_table(world_cup_mode)
     name = clean_str(filters.get("name"))
@@ -124,6 +125,13 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
     nationality_norm = norm_name(nationality) if nationality else None
     position_norm = norm_name(position_search) if position_search else None
 
+    league_choices = []
+    for value in (candidate_choices or {}).get("league", []):
+        parts = value.rsplit(" | ", 1)
+        league_choices.append({"name": norm_name(parts[0]), "country": norm_name(parts[1]) if len(parts) == 2 else ""})
+    context_league_sql = folded_text_sql("league_name").replace("metadata->>'league_name'", "choice_context.league_name")
+    context_country_sql = folded_text_sql("league_country_name").replace("metadata->>'league_country_name'", "choice_context.league_country_name")
+
     query = text(f"""
         SELECT
             id,
@@ -143,6 +151,33 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
                 OR metadata->>'player_name_norm' ILIKE :name_norm_q
                 OR {folded_text_sql("player_name")} LIKE :name_folded_q
               )
+          AND (
+                CAST(:candidate_roles AS text[]) IS NULL
+                OR {role_short_sql()} = ANY(CAST(:candidate_roles AS text[]))
+                OR EXISTS (
+                    SELECT 1 FROM jsonb_object_keys(
+                        CASE WHEN jsonb_typeof(metadata->'position_counts') = 'object'
+                        THEN metadata->'position_counts' ELSE '{{}}'::jsonb END
+                    ) AS discovery_role(value)
+                    WHERE {role_value_short_sql("discovery_role.value")} = ANY(CAST(:candidate_roles AS text[]))
+                )
+              )
+          AND (CAST(:choices_nationality AS text[]) IS NULL OR REGEXP_REPLACE(TRIM({folded_text_sql("nationality_name")}), '[[:space:]]+', ' ', 'g') = ANY(CAST(:choices_nationality AS text[])))
+          AND (CAST(:choices_team AS text[]) IS NULL OR REGEXP_REPLACE(TRIM({folded_text_sql("team_name")}), '[[:space:]]+', ' ', 'g') = ANY(CAST(:choices_team AS text[])))
+          AND (
+              CAST(:choices_league AS jsonb) IS NULL
+              OR REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g') IN (
+                  SELECT name FROM jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
+                  WHERE country = ''
+              )
+              OR (COALESCE(metadata->>'player_id', ''), REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g')) IN (
+                  SELECT choice_context.player_id::text, REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g')
+                  FROM player_comp_data choice_context
+                  JOIN jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
+                    ON REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g') = chosen_league.name
+                   AND REGEXP_REPLACE(TRIM({context_country_sql}), '[[:space:]]+', ' ', 'g') = chosen_league.country
+              )
+          )
           AND (:gender IS NULL OR LOWER(COALESCE(metadata->>'gender', '')) = LOWER(:gender))
           AND (
                 :nationality IS NULL
@@ -275,6 +310,9 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
             "name_norm_q": f"%{name_norm}%" if name_norm else None,
             "name_folded_q": f"%{name_norm}%" if name_norm else None,
             "gender": gender,
+            "candidate_roles": candidate_roles,
+            **{f"choices_{key}": [norm_name(value) for value in (candidate_choices or {}).get(key, [])] or None for key in ("nationality", "team")},
+            "choices_league": json.dumps(league_choices) if league_choices else None,
             "nationality": nationality,
             "nationality_folded_q": f"%{nationality_norm}%" if nationality_norm else None,
             "league": league,
@@ -297,7 +335,7 @@ def search_players(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]
             "contract_status": contract_status,
             "loan_end_date": loan_end_date,
             "contract_end_date": contract_end_date,
-            "limit": int(filters.get("limit") or SEARCH_LIMIT),
+            "limit": None if all_matches else int(filters.get("limit") or SEARCH_LIMIT),
         },
     ).mappings().all()
 

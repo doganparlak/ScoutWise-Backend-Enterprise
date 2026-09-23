@@ -13,7 +13,7 @@ from api_module.utilities import (
     session_exists_and_active,
     split_response_parts,
 )
-from chatbot_module.chatbot_agentic import answer_question
+from chatbot_module.chatbot_agentic import answer_question, answer_selected_player
 
 
 def _session_log_label(token: str) -> str:
@@ -209,11 +209,26 @@ def send_chat(
         f"message={_message_preview(message)!r}",
         flush=True,
     )
-    result = answer_question(
-        message,
-        session_id=session_token,
-        strategy=strategy_text or None,
-    )
+    if payload.selected_player_id is not None:
+        row = db.execute(
+            text("SELECT id, metadata, content FROM player_data WHERE id = :id LIMIT 1"),
+            {"id": payload.selected_player_id},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Seçilen oyuncu artık mevcut değil. Lütfen yeniden ara." if lang == "tr"
+                else "The selected player is no longer available. Please search again.",
+            )
+        result = answer_selected_player(
+            dict(row), session_id=session_token, lang=lang, strategy=strategy_text or None,
+        )
+    else:
+        result = answer_question(
+            message,
+            session_id=session_token,
+            strategy=strategy_text or None,
+        )
     answer_text = (result.get("answer") or "").strip()
     data = result.get("data") or {"players": []}
     players = data.get("players") if isinstance(data, dict) else []

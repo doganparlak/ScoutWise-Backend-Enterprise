@@ -44,6 +44,8 @@ from chatbot_module.tools import (
 )
 from constants_module.constants import ROLE_LONG_TO_SHORT
 from chatbot_module.tools_agentic import (
+    _metadata_to_candidate,
+    candidate_to_meta,
     build_agentic_context,
     build_filtered_retriever_agentic,
     build_payload_from_candidate,
@@ -949,6 +951,39 @@ def _answer_seen_or_comparison(
         _trace_step(trace, "tool", "persist_memory")
         _log_trace(trace, session_id=session_id, outcome="seen_player_followup")
     return {"answer": answer, "data": {"players": []}}
+
+
+
+def answer_selected_player(
+    row: Dict[str, Any],
+    *,
+    session_id: str,
+    lang: str,
+    strategy: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the profile only from the explicitly selected database row.
+
+    Do not use name retrieval or the legacy payload builder here: both can
+    resolve a different player with the same name.
+    """
+    metadata = dict(row.get("metadata") or {})
+    metadata["id"] = row["id"]
+    candidate = _metadata_to_candidate(metadata, content=row.get("content") or "")
+    profile = candidate_to_meta(candidate)["players"][0]
+    profile["playerId"] = metadata.get("player_id")
+    for key in ("potential", "form", "is_on_loan", "contract_team_id", "contract_team_name", "loan_end_date", "contract_end_date"):
+        profile[key] = metadata.get(key)
+    player = {
+        "id": row["id"], "name": candidate.get("name") or "",
+        "meta": profile, "stats": candidate.get("stats") or [],
+    }
+    payload = {"players": [player]}
+    question = f"Analyze the explicitly selected player: {player['name']} ({profile.get('team') or ''}), record ID {row['id']}."
+    # Category interpretations are requested against the displayed chart evidence.
+    # Keep the exact profile in conversation memory without generating a second summary.
+    answer = ""
+    _persist_turn(session_id, question, answer, payload)
+    return {"answer": answer, "data": payload}
 
 
 def answer_question(

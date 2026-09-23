@@ -49,7 +49,7 @@ def get_league_pool_options(
     return {key: list(row[key] or []) for key in ("leagues", "countries", "positions")}
 
 
-def search_league_pool(db: Session, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+def search_league_pool(db: Session, filters: Dict[str, Any], *, role_gap_filter: bool = False, excluded_player_id: int | None = None) -> List[Dict[str, Any]]:
     leagues = _clean_many(filters.get("leagues"))
     countries = _clean_many(filters.get("countries"))
     positions = [value.upper() for value in _clean_many(filters.get("positions"))]
@@ -59,10 +59,12 @@ def search_league_pool(db: Session, filters: Dict[str, Any]) -> List[Dict[str, A
         WITH eligible_rows AS (
             SELECT pc.*
             FROM player_comp_data pc
-            WHERE (CAST(:leagues AS text[]) = '{}' OR pc.league_name = ANY(CAST(:leagues AS text[])))
+            WHERE (CAST(:excluded_player_id AS bigint) IS NULL OR pc.player_id <> CAST(:excluded_player_id AS bigint))
+              AND (CAST(:leagues AS text[]) = '{}' OR pc.league_name = ANY(CAST(:leagues AS text[])))
               AND (CAST(:countries AS text[]) = '{}' OR pc.league_country_name = ANY(CAST(:countries AS text[])))
               AND (
                 CAST(:positions AS text[]) = '{}'
+                OR :role_gap_filter
                 OR EXISTS (
                     SELECT 1
                     FROM jsonb_each_text(
@@ -81,6 +83,21 @@ def search_league_pool(db: Session, filters: Dict[str, Any]) -> List[Dict[str, A
                           ))
                 )
               )
+              AND (NOT :role_gap_filter OR EXISTS (
+                SELECT 1 FROM (
+                    SELECT UPPER(role) AS role, appearances,
+                        ROW_NUMBER() OVER (ORDER BY appearances DESC, role ASC) AS rank,
+                        MAX(appearances) OVER () AS highest,
+                        SUM(appearances) OVER () AS total
+                    FROM (
+                        SELECT key AS role, CASE WHEN value ~ '^[0-9]+([.][0-9]+)?$' THEN value::numeric ELSE 0 END AS appearances
+                        FROM jsonb_each_text(CASE WHEN jsonb_typeof(pc.position_counts) = 'object' THEN pc.position_counts ELSE '{}'::jsonb END)
+                    ) parsed
+                    WHERE appearances > 0
+                ) ranked
+                WHERE rank <= 2 AND highest - appearances <= total * 0.20
+                  AND role = ANY(CAST(:positions AS text[]))
+              ))
         ), player_dimensions AS (
             SELECT
                 league_id,
@@ -175,7 +192,7 @@ def search_league_pool(db: Session, filters: Dict[str, Any]) -> List[Dict[str, A
         LIMIT :limit
     """)
 
-    rows = db.execute(query, {"leagues": leagues, "countries": countries, "positions": positions, "limit": limit}).mappings().all()
+    rows = db.execute(query, {"leagues": leagues, "countries": countries, "positions": positions, "limit": limit, "role_gap_filter": role_gap_filter, "excluded_player_id": excluded_player_id}).mappings().all()
     result = []
     for row in rows:
         content = dict(row)
