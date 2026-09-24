@@ -138,13 +138,16 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
             metadata AS content,
             epi.image_url
         FROM {table_name}
-        LEFT JOIN enterprise_player_images epi
-          ON epi.player_id = CASE
-              WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+$'
-              THEN (metadata->>'player_id')::bigint
-              ELSE NULL
-          END
-         AND epi.image_status = 'available'
+        -- An indexed lookup per candidate avoids repeated full image scans when
+        -- combined filters make the planner underestimate the candidate count.
+        LEFT JOIN LATERAL (
+            SELECT image_url FROM enterprise_player_images images
+            WHERE images.player_id = CASE
+                WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+$'
+                THEN (metadata->>'player_id')::bigint ELSE NULL END
+              AND images.image_status = 'available'
+            OFFSET 0
+        ) epi ON TRUE
         WHERE (
                 :name_q IS NULL
                 OR metadata->>'player_name' ILIKE :name_q
@@ -170,12 +173,25 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
                   SELECT name FROM jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
                   WHERE country = ''
               )
-              OR (COALESCE(metadata->>'player_id', ''), REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g')) IN (
-                  SELECT choice_context.player_id::text, REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g')
-                  FROM player_comp_data choice_context
-                  JOIN jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
-                    ON REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g') = chosen_league.name
-                   AND REGEXP_REPLACE(TRIM({context_country_sql}), '[[:space:]]+', ' ', 'g') = chosen_league.country
+              OR (
+                  REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g') IN (
+                      SELECT name FROM jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM player_comp_data choice_context
+                      JOIN jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
+                        ON REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g') = chosen_league.name
+                       AND REGEXP_REPLACE(TRIM({context_country_sql}), '[[:space:]]+', ' ', 'g') = chosen_league.country
+                      WHERE choice_context.player_id = CASE
+                          WHEN COALESCE(metadata->>'player_id', '') ~ '^-?[0-9]+$'
+                          THEN (metadata->>'player_id')::bigint ELSE NULL END
+                        AND choice_context.player_id::text = COALESCE(metadata->>'player_id', '')
+                        AND REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g') = REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g')
+                      -- Keep the indexed per-player lookup; avoid a hashed subplan
+                      -- that normalizes every player_comp_data row for each search.
+                      OFFSET 0
+                  )
               )
           )
           AND (:gender IS NULL OR LOWER(COALESCE(metadata->>'gender', '')) = LOWER(:gender))
@@ -200,9 +216,14 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
                 OR EXISTS (
                     SELECT 1
                     FROM player_comp_data league_context
-                    WHERE league_context.player_id::text = COALESCE(metadata->>'player_id', '')
+                    WHERE league_context.player_id = CASE
+                        WHEN COALESCE(metadata->>'player_id', '') ~ '^-?[0-9]+$'
+                        THEN (metadata->>'player_id')::bigint ELSE NULL END
+                      AND league_context.player_id::text = COALESCE(metadata->>'player_id', '')
                       AND LOWER(COALESCE(league_context.league_name, '')) = LOWER(:league)
                       AND LOWER(COALESCE(league_context.league_country_name, '')) = LOWER(:league_country)
+                    -- Preserve an indexed per-player lookup, as for multi-league discovery.
+                    OFFSET 0
                 )
               )
           AND (

@@ -19,6 +19,7 @@ load_dotenv()
 
 from scoutwise_pro_module.comparison_insights import ProComparisonInsightsIn, get_comparison_insights
 from scoutwise_pro_module.team_fit import TeamFitIn, get_team_fit
+from scoutwise_pro_module.similar_players import SimilarPlayersIn, similar_players, similarity_eligibility
 from scoutwise_pro_module.discovery import DiscoveryIn, discovery_config, discover_players
 from scoutwise_pro_module.strategy_fit import StrategyFitIn, strategy_fit
 from scoutwise_pro_module.league_fit import LeagueFitIn, LeagueFitInsightsIn, league_fit_data, league_fit_insights
@@ -741,6 +742,16 @@ def pro_strategies_delete(
 @app.get("/pro/discovery/config")
 def pro_discovery_config(user_id: str = Depends(require_auth)):
     return discovery_config()
+
+
+@app.post("/pro/similar-players/eligibility")
+def pro_similarity_eligibility(payload: SimilarPlayersIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    return similarity_eligibility(db, payload)
+
+
+@app.post("/pro/similar-players")
+def pro_similar_players(payload: SimilarPlayersIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    return similar_players(db, payload)
 
 
 @app.post("/pro/discovery")
