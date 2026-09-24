@@ -49,14 +49,14 @@ def get_league_pool_options(
     return {key: list(row[key] or []) for key in ("leagues", "countries", "positions")}
 
 
-def search_league_pool(db: Session, filters: Dict[str, Any], *, role_gap_filter: bool = False, excluded_player_id: int | None = None) -> List[Dict[str, Any]]:
+def search_league_pool(db: Session, filters: Dict[str, Any], *, role_gap_filter: bool = False, excluded_player_id: int | None = None, min_total_minutes: float = 0) -> List[Dict[str, Any]]:
     leagues = _clean_many(filters.get("leagues"))
     countries = _clean_many(filters.get("countries"))
     positions = [value.upper() for value in _clean_many(filters.get("positions"))]
     limit = min(max(int(filters.get("limit") or 100), 1), 200)
 
     query = text("""
-        WITH eligible_rows AS (
+        WITH role_eligible_rows AS (
             SELECT pc.*
             FROM player_comp_data pc
             WHERE (CAST(:excluded_player_id AS bigint) IS NULL OR pc.player_id <> CAST(:excluded_player_id AS bigint))
@@ -98,6 +98,18 @@ def search_league_pool(db: Session, filters: Dict[str, Any], *, role_gap_filter:
                 WHERE rank <= 2 AND highest - appearances <= total * 0.20
                   AND role = ANY(CAST(:positions AS text[]))
               ))
+        ), minute_eligible_players AS (
+            SELECT league_id, player_id
+            FROM role_eligible_rows
+            GROUP BY league_id, player_id
+            HAVING :min_total_minutes <= 0 OR SUM(
+                CASE WHEN stats->>'minutes_played' ~ '^[0-9]+([.][0-9]+)?$'
+                     THEN (stats->>'minutes_played')::numeric * GREATEST(COALESCE(match_count, 0), 0)
+                     ELSE 0 END
+            ) >= :min_total_minutes
+        ), eligible_rows AS (
+            SELECT er.* FROM role_eligible_rows er
+            JOIN minute_eligible_players qualified USING (league_id, player_id)
         ), player_dimensions AS (
             SELECT
                 league_id,
@@ -192,7 +204,7 @@ def search_league_pool(db: Session, filters: Dict[str, Any], *, role_gap_filter:
         LIMIT :limit
     """)
 
-    rows = db.execute(query, {"leagues": leagues, "countries": countries, "positions": positions, "limit": limit, "role_gap_filter": role_gap_filter, "excluded_player_id": excluded_player_id}).mappings().all()
+    rows = db.execute(query, {"leagues": leagues, "countries": countries, "positions": positions, "limit": limit, "role_gap_filter": role_gap_filter, "excluded_player_id": excluded_player_id, "min_total_minutes": max(0, float(min_total_minutes))}).mappings().all()
     result = []
     for row in rows:
         content = dict(row)
