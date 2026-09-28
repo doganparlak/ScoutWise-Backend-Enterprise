@@ -96,6 +96,7 @@ from api_module.utilities import (
     now_utc,
     require_auth,
 )
+from player_pool_module.entity_images import ImageLookupBatch, resolve_images, enrich_player_rows
 from player_pool_module.player_pool import get_player_pool_filter_options, search_players
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
@@ -751,12 +752,16 @@ def pro_similarity_eligibility(payload: SimilarPlayersIn, user_id: str = Depends
 
 @app.post("/pro/similar-players")
 def pro_similar_players(payload: SimilarPlayersIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
-    return similar_players(db, payload)
+    result = similar_players(db, payload)
+    enrich_player_rows(db, [match["player"] for match in result["players"]])
+    return result
 
 
 @app.post("/pro/discovery")
 def pro_discovery(payload: DiscoveryIn, user_id: str = Depends(require_auth), accept_language: str | None = Header(default=None), db: Session = Depends(get_db)):
-    return discover_players(db, user_id, payload, accept_language)
+    result = discover_players(db, user_id, payload, accept_language)
+    enrich_player_rows(db, result["players"])
+    return result
 
 
 @app.post("/pro/strategy-fit")
@@ -1868,6 +1873,15 @@ def _favorite_values_from_payload(payload: EnterpriseFavoritePlayerIn) -> Dict[s
     }
 
 
+@app.post("/entity-images")
+def entity_images(
+    payload: ImageLookupBatch,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return {"items": resolve_images(db, payload.items)}
+
+
 @app.post("/player-pool/search", response_model=list[PlayerPoolSearchRow])
 def player_pool_search(
     payload: PlayerPoolSearchIn,
@@ -1882,7 +1896,7 @@ def player_pool_search(
     if payload.minWeight is not None and payload.maxWeight is not None and payload.minWeight > payload.maxWeight:
         raise HTTPException(status_code=400, detail="minWeight cannot be greater than maxWeight")
 
-    return search_players(db, payload.model_dump(exclude_none=True))
+    return enrich_player_rows(db, search_players(db, payload.model_dump(exclude_none=True)))
 
 
 @app.post("/player-pool/{player_id}/search-hit")
@@ -1943,7 +1957,7 @@ def player_pool_weekly_popular(
     db: Session = Depends(get_db),
 ):
     del user_id
-    return get_weekly_popular_players(db, payload.limit or 10, bool(payload.worldCupMode))
+    return enrich_player_rows(db, get_weekly_popular_players(db, payload.limit or 10, bool(payload.worldCupMode)))
 
 
 @app.post("/player-pool/matchup/comparison", response_model=MatchupComparisonOut)

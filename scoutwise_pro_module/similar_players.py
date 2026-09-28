@@ -1,11 +1,12 @@
 """Deterministic role-filtered player similarity; no LLM or tactical inputs."""
 from bisect import bisect_left, bisect_right
 from math import sqrt
+from heapq import nsmallest
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from matchup_module.comparison import _fetch_player_metadata
-from player_pool_module.player_pool import search_players
-from scoutwise_pro_module.discovery import CATEGORY_DEFINITIONS, CONTEXT_BUNDLES, DiscoveryFilters, player_metrics, discovery_roles
+from player_pool_module.player_pool import search_players, fetch_player_rows_by_ids
+from scoutwise_pro_module.discovery import ALIASES, BUNDLES, CONTEXT_METRICS, CATEGORY_DEFINITIONS, CONTEXT_BUNDLES, DiscoveryFilters, player_metrics, discovery_roles
 
 from scoutwise_pro_module.similarity_weights import feature_weights
 
@@ -18,6 +19,17 @@ METRIC_CATEGORIES = {
     for key, _, _, metrics in groups
     for metric in [*metrics, *CONTEXT_BUNDLES.get(f'{category}.{key}', [])]
 }
+
+
+# Keep every input to role eligibility, metric normalization, data sufficiency
+# and duplicate selection. Do not restrict this to the source's shared metrics:
+# candidate completeness determines which duplicate record wins.
+SIMILARITY_METADATA_FIELDS = sorted({
+    'player_id', 'position_counts', 'primary_position_code', 'Minutes Played', 'match_count',
+    *(metric.lstrip('-') for metrics in BUNDLES.values() for metric in metrics),
+    *CONTEXT_METRICS,
+    *(alias for aliases in ALIASES.values() for alias in aliases),
+})
 
 
 def sufficient_metrics(metrics, goalkeeper):
@@ -76,24 +88,24 @@ def rank_similar(source_row, rows):
         values = distributions[metric]
         return (bisect_left(values, value) + bisect_right(values, value)) / (2 * len(values))
     target = {m: percentile(m, source[m]) for m in weights}
-    ranked = []
-    for entry in eligible.values():
-        common = [m for m in weights if m in entry['metrics']]
-        coverage = sum(weights[m] for m in common)
-        if not sufficient_metrics(common, 'GK' in roles) or coverage + 1e-9 < MIN_COVERAGE:
-            continue
-        candidate = {m: percentile(m, entry['metrics'][m]) for m in common}
-        dot = sum(weights[m] * target[m] * candidate[m] for m in common)
-        norm = sqrt(sum(weights[m] * target[m] ** 2 for m in common) * sum(weights[m] * candidate[m] ** 2 for m in common))
-        if norm <= 0:
-            continue
-        cosine = min(1.0, max(0.0, dot / norm))
-        closeness = 1 - sum(weights[m] * abs(target[m] - candidate[m]) for m in common) / coverage
-        score = round(100 * (0.7 * cosine + 0.3 * closeness), 1)
-        ranked.append({'player': entry['row'], 'similarity': score, 'coverage': round(100 * coverage, 1), 'commonMetricCount': len(common), 'matchedRoles': entry['roles']})
-    ranked.sort(key=lambda row: (-row['similarity'], -row['coverage'], int(row['player']['id'])))
-    # Rank once; the client reveals this snapshot in batches of ten.
-    return ranked[:50]
+    def scored_candidates():
+        for entry in eligible.values():
+            common = [m for m in weights if m in entry['metrics']]
+            coverage = sum(weights[m] for m in common)
+            if not sufficient_metrics(common, 'GK' in roles) or coverage + 1e-9 < MIN_COVERAGE:
+                continue
+            candidate = {m: percentile(m, entry['metrics'][m]) for m in common}
+            dot = sum(weights[m] * target[m] * candidate[m] for m in common)
+            norm = sqrt(sum(weights[m] * target[m] ** 2 for m in common) * sum(weights[m] * candidate[m] ** 2 for m in common))
+            if norm <= 0:
+                continue
+            cosine = min(1.0, max(0.0, dot / norm))
+            closeness = 1 - sum(weights[m] * abs(target[m] - candidate[m]) for m in common) / coverage
+            score = round(100 * (0.7 * cosine + 0.3 * closeness), 1)
+            yield {'player': entry['row'], 'similarity': score, 'coverage': round(100 * coverage, 1), 'commonMetricCount': len(common), 'matchedRoles': entry['roles']}
+    # Consume every score, retaining at most 50 ranking entries. nsmallest
+    # preserves the previous stable ordering, including exact key ties.
+    return nsmallest(50, scored_candidates(), key=lambda row: (-row['similarity'], -row['coverage'], int(row['player']['id'])))
 
 
 def load_similarity_source(db, player_id):
@@ -126,5 +138,16 @@ def similar_players(db, payload):
     # Full database coverage; no discovery shortlist limit and no AI selection.
     filters = payload.filters.model_dump(mode='json', exclude_none=True)
     choices = {key: filters.pop(key, []) for key in ('nationality', 'team', 'league')}
-    rows = search_players(db, filters, all_matches=True, candidate_roles=list(discovery_roles(source['content'])), candidate_choices=choices)
-    return {'players': rank_similar(source, rows), 'minimumCoverage': 70, 'minimumCommonMetrics': MIN_COMMON_METRICS, 'minimumCategories': MIN_CATEGORIES, 'method': 'role-weighted-percentile-cosine70-closeness30-v3'}
+    rows = search_players(db, filters, all_matches=True, candidate_roles=list(discovery_roles(source['content'])), candidate_choices=choices, metadata_fields=SIMILARITY_METADATA_FIELDS)
+    ranked = rank_similar(source, rows)
+    del rows  # Non-winning candidate metadata is no longer needed.
+    profiles = {str(row['id']): row for row in fetch_player_rows_by_ids(db, [int(match['player']['id']) for match in ranked])}
+    for match in ranked:
+        candidate = match['player']
+        full = profiles.get(str(candidate['id']))
+        # A concurrent data refresh can replace row IDs. Never attach another
+        # player's profile or changed ranking inputs to an already scored row.
+        if full is None or {key: value for key, value in full['content'].items() if key in SIMILARITY_METADATA_FIELDS} != candidate['content']:
+            raise HTTPException(status_code=409, detail='Player data changed during search. Please retry.')
+        match['player'] = full
+    return {'players': ranked, 'minimumCoverage': 70, 'minimumCommonMetrics': MIN_COMMON_METRICS, 'minimumCategories': MIN_CATEGORIES, 'method': 'role-weighted-percentile-cosine70-closeness30-v3'}

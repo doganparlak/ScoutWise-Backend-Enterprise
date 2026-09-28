@@ -18,6 +18,20 @@ from player_pool_module.utilities import (
 
 SEARCH_LIMIT = 100
 
+# Shared by normal full-profile search and final-winner hydration.
+PLAYER_IMAGE_JOIN = """
+        -- An indexed lookup per candidate avoids repeated full image scans when
+        -- combined filters make the planner underestimate the candidate count.
+        LEFT JOIN LATERAL (
+            SELECT image_url FROM enterprise_player_images images
+            WHERE images.player_id = CASE
+                WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+$'
+                THEN (metadata->>'player_id')::bigint ELSE NULL END
+              AND images.image_status = 'available'
+            OFFSET 0
+        ) epi ON TRUE
+"""
+
 
 def role_value_short_sql(value_expr: str) -> str:
     position = f"LOWER(TRIM(COALESCE({value_expr}, '')))"
@@ -103,7 +117,7 @@ def role_short_sql() -> str:
     """
 
 
-def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = False, candidate_roles: List[str] | None = None, candidate_choices: Dict[str, List[str]] | None = None) -> List[Dict[str, Any]]:
+def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = False, candidate_roles: List[str] | None = None, candidate_choices: Dict[str, List[str]] | None = None, metadata_fields: List[str] | None = None) -> List[Dict[str, Any]]:
     world_cup_mode = bool(filters.get("worldCupMode"))
     table_name = player_pool_table(world_cup_mode)
     name = clean_str(filters.get("name"))
@@ -132,22 +146,22 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
     context_league_sql = folded_text_sql("league_name").replace("metadata->>'league_name'", "choice_context.league_name")
     context_country_sql = folded_text_sql("league_country_name").replace("metadata->>'league_country_name'", "choice_context.league_country_name")
 
+    # Projection is internal-only. SQL filters/order still inspect complete stored
+    # metadata; only the fields sent to Python change. Photo lookup is deferred.
+    content_sql = "metadata"
+    image_sql = "epi.image_url"
+    image_join = PLAYER_IMAGE_JOIN
+    if metadata_fields is not None:
+        content_sql = """(SELECT COALESCE(jsonb_object_agg(field.key, field.value), '{}'::jsonb)
+            FROM jsonb_each(metadata) AS field(key, value)
+            WHERE field.key = ANY(CAST(:metadata_fields AS text[])))"""
+        image_sql = "NULL::text"
+        image_join = ""
+
     query = text(f"""
-        SELECT
-            id,
-            metadata AS content,
-            epi.image_url
+        SELECT id, {content_sql} AS content, {image_sql} AS image_url
         FROM {table_name}
-        -- An indexed lookup per candidate avoids repeated full image scans when
-        -- combined filters make the planner underestimate the candidate count.
-        LEFT JOIN LATERAL (
-            SELECT image_url FROM enterprise_player_images images
-            WHERE images.player_id = CASE
-                WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+$'
-                THEN (metadata->>'player_id')::bigint ELSE NULL END
-              AND images.image_status = 'available'
-            OFFSET 0
-        ) epi ON TRUE
+        {image_join}
         WHERE (
                 :name_q IS NULL
                 OR metadata->>'player_name' ILIKE :name_q
@@ -327,6 +341,7 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
     rows = db.execute(
         query,
         {
+            "metadata_fields": metadata_fields,
             "name_q": f"%{name}%" if name else None,
             "name_norm_q": f"%{name_norm}%" if name_norm else None,
             "name_folded_q": f"%{name_norm}%" if name_norm else None,
@@ -360,6 +375,10 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
         },
     ).mappings().all()
 
+    return _player_rows(rows)
+
+
+def _player_rows(rows) -> List[Dict[str, Any]]:
     results = []
     for row in rows:
         content = dict(row["content"] or {})
@@ -368,6 +387,22 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
             content["image_url"] = image_url
         results.append({"id": row["id"], "content": content})
     return results
+
+
+def fetch_player_rows_by_ids(db: Session, player_ids: List[int]) -> List[Dict[str, Any]]:
+    """Hydrate the final similarity winners by row ID in one bounded query."""
+    ids = list(dict.fromkeys(player_ids))
+    if not ids:
+        return []
+    if len(ids) > 50:
+        raise ValueError("At most 50 similarity winners can be hydrated")
+    rows = db.execute(text(f"""
+        SELECT id, metadata AS content, epi.image_url
+        FROM player_data
+        {PLAYER_IMAGE_JOIN}
+        WHERE id = ANY(CAST(:ids AS bigint[]))
+    """), {"ids": ids}).mappings().all()
+    return _player_rows(rows)
 
 
 def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) -> Dict[str, List[str]]:
