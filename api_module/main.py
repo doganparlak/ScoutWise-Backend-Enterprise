@@ -1337,59 +1337,63 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
     )
 
 
+# Try indexed provider/row IDs before scanning name fallbacks. Keep the
+# existing identity guards and priority; only execute a fallback on a miss.
 FAVORITE_PLAYER_DATA_IDENTITY_JOIN = """
 LEFT JOIN LATERAL (
-  SELECT current_pd.id, current_pd.metadata
-  FROM player_data current_pd
-  WHERE
-    lower(COALESCE(current_pd.metadata->>'player_name', current_pd.metadata->>'name', '')) = lower(COALESCE(efp.name, ''))
-    AND (
-         COALESCE(efp.nationality, '') = ''
-         OR lower(COALESCE(current_pd.metadata->>'nationality_name', current_pd.metadata->>'nationality', '')) = lower(COALESCE(efp.nationality, ''))
-    )
-    AND (
-      (
-        COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
-        AND COALESCE(current_pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
-        AND (current_pd.metadata->>'player_id')::numeric::bigint = efp.player_id::numeric::bigint
-      )
-      OR current_pd.id = efp.club_player_id
-      OR (
-        (
-          COALESCE(efp.team, '') = ''
-          OR lower(COALESCE(current_pd.metadata->>'team_name', current_pd.metadata->>'team', '')) = lower(COALESCE(efp.team, ''))
-        )
-        AND (
-          COALESCE(efp.league, '') = ''
-          OR lower(COALESCE(current_pd.metadata->>'league_name', current_pd.metadata->>'league', '')) = lower(COALESCE(efp.league, ''))
-        )
-      )
-    )
-  ORDER BY
-    CASE
-      WHEN COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
-       AND COALESCE(current_pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
-       AND (current_pd.metadata->>'player_id')::numeric::bigint = efp.player_id::numeric::bigint
-      THEN 0
-      WHEN current_pd.id = efp.club_player_id THEN 1
-      ELSE 2
-    END
-  LIMIT 1
+  WITH by_provider AS MATERIALIZED (
+    SELECT current_pd.id, current_pd.metadata
+    FROM player_data current_pd
+    WHERE (CASE WHEN (current_pd.metadata->>'player_id') ~ '^[0-9]+([.]0+)?$' THEN trunc((current_pd.metadata->>'player_id')::numeric)::text ELSE NULL END) = (CASE WHEN COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$' THEN trunc((efp.player_id)::numeric)::text ELSE NULL END)
+      AND lower(COALESCE(current_pd.metadata->>'player_name', current_pd.metadata->>'name', '')) = lower(COALESCE(efp.name, ''))
+    AND (COALESCE(efp.nationality, '') = '' OR lower(COALESCE(current_pd.metadata->>'nationality_name', current_pd.metadata->>'nationality', '')) = lower(COALESCE(efp.nationality, '')))
+    LIMIT 1
+  ), by_saved_row AS MATERIALIZED (
+    SELECT current_pd.id, current_pd.metadata
+    FROM player_data current_pd
+    WHERE NOT EXISTS (SELECT 1 FROM by_provider)
+      AND current_pd.id = efp.club_player_id
+      AND lower(COALESCE(current_pd.metadata->>'player_name', current_pd.metadata->>'name', '')) = lower(COALESCE(efp.name, ''))
+    AND (COALESCE(efp.nationality, '') = '' OR lower(COALESCE(current_pd.metadata->>'nationality_name', current_pd.metadata->>'nationality', '')) = lower(COALESCE(efp.nationality, '')))
+    LIMIT 1
+  )
+  SELECT * FROM by_provider
+  UNION ALL
+  SELECT * FROM by_saved_row
+  UNION ALL
+  (SELECT current_pd.id, current_pd.metadata
+   FROM player_data current_pd
+   WHERE NOT EXISTS (SELECT 1 FROM by_provider)
+     AND NOT EXISTS (SELECT 1 FROM by_saved_row)
+     AND lower(COALESCE(current_pd.metadata->>'player_name', current_pd.metadata->>'name', '')) = lower(COALESCE(efp.name, ''))
+    AND (COALESCE(efp.nationality, '') = '' OR lower(COALESCE(current_pd.metadata->>'nationality_name', current_pd.metadata->>'nationality', '')) = lower(COALESCE(efp.nationality, '')))
+     AND (COALESCE(efp.team, '') = '' OR lower(COALESCE(current_pd.metadata->>'team_name', current_pd.metadata->>'team', '')) = lower(COALESCE(efp.team, '')))
+     AND (COALESCE(efp.league, '') = '' OR lower(COALESCE(current_pd.metadata->>'league_name', current_pd.metadata->>'league', '')) = lower(COALESCE(efp.league, '')))
+   LIMIT 1)
 ) pd ON TRUE
 LEFT JOIN LATERAL (
-  SELECT image.image_url
-  FROM enterprise_player_images image
-  WHERE image.image_status = 'available'
-    AND (
-      (
-        COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
-        AND image.player_id = efp.player_id::numeric::bigint
-      )
-      OR (
-        COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
-        AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint
-      )
-      OR translate(
+  WITH by_saved_provider AS MATERIALIZED (
+    SELECT image.image_url
+    FROM enterprise_player_images image
+    WHERE image.image_status = 'available'
+      AND image.player_id = (CASE WHEN COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$' THEN (efp.player_id)::numeric::bigint ELSE NULL END)
+  ), by_current_provider AS MATERIALIZED (
+    SELECT image.image_url
+    FROM enterprise_player_images image
+    WHERE NOT EXISTS (SELECT 1 FROM by_saved_provider)
+      AND image.image_status = 'available'
+      AND image.player_id = (CASE WHEN COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$' THEN (pd.metadata->>'player_id')::numeric::bigint ELSE NULL END)
+  )
+  SELECT * FROM by_saved_provider
+  UNION ALL
+  SELECT * FROM by_current_provider
+  UNION ALL
+  (SELECT image.image_url
+   FROM enterprise_player_images image
+   WHERE NOT EXISTS (SELECT 1 FROM by_saved_provider)
+     AND NOT EXISTS (SELECT 1 FROM by_current_provider)
+     AND image.image_status = 'available'
+     AND translate(
         lower(image.player_name),
         'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
         'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
@@ -1398,16 +1402,7 @@ LEFT JOIN LATERAL (
         'áàâäãåçćčéèêëíìîïñóòôöõúùûüýÿžšđğışöüç',
         'aaaaaaccceeeeiiiinooooouuuuyyzsdgisouc'
       )
-    )
-  ORDER BY
-    CASE
-      WHEN COALESCE(efp.player_id, '') ~ '^[0-9]+([.]0+)?$'
-       AND image.player_id = efp.player_id::numeric::bigint THEN 0
-      WHEN COALESCE(pd.metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
-       AND image.player_id = (pd.metadata->>'player_id')::numeric::bigint THEN 1
-      ELSE 2
-    END
-  LIMIT 1
+   LIMIT 1)
 ) epi ON TRUE
 """
 
@@ -2188,6 +2183,15 @@ def team_analysis_report_data(
         return TeamAnalysisReportOut(reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/favorite-matches/count")
+def count_enterprise_favorite_matches(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    count = db.execute(text("SELECT count(*) FROM enterprise_favorite_matches WHERE user_id = :user_id"), {"user_id": user_id}).scalar_one()
+    return {"count": count}
 
 
 @app.get("/favorite-matches", response_model=list[EnterpriseFavoriteMatchOut])

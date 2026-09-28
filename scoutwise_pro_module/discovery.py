@@ -6,7 +6,7 @@ from datetime import date
 from constants_module.constants import ROLE_SHORT_TO_LONG
 from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
 from fastapi import HTTPException
-from player_pool_module.player_pool import search_players
+from player_pool_module.player_pool import search_players, fetch_player_rows_by_ids
 from scoutwise_pro_module.team_fit import eligible_roles, number, ROLE_CODES
 from scoutwise_pro_module.pro import get_strategy
 from api_module.utilities import normalize_lang
@@ -49,6 +49,17 @@ CATEGORIES = {cat: [f'{cat}.{key}' for key, _, _, _ in groups] for cat, _, _, gr
 CONTEXT_BUNDLES = {'passing.connection':['Backward Passes'], 'shooting.threat':['Hit Woodwork'], 'goalkeeping.saves':['Goals Conceded']}
 CONTEXT_METRICS = {metric for names in CONTEXT_BUNDLES.values() for metric in names}
 ALIASES = {'Goals Conceded':['Goalkeeper Goals Conceded','Goals Conceded.1'], 'Blocked Shots':['Shots Blocked'], 'On-Target to Goal Conversion (%)':['On Target Goal Conversion (%)'], 'Successful Crosses (%)':['Accurate Crosses (%)','Successful Crosses Percentage'], 'Accurate Passes (%)':['Accurate Passes Percentage'], 'Tackles Won (%)':['Tacles Won Percentage']}
+
+
+# Include every ranking, duplicate-selection, diversity and AI evidence input.
+# Photos and unused profile fields are fetched only for the final selections.
+DISCOVERY_METADATA_FIELDS = sorted({
+    'player_id', 'player_name', 'name', 'team_name', 'age',
+    'position_counts', 'primary_position_code', 'Minutes Played', 'match_count',
+    *(metric.lstrip('-') for metrics in BUNDLES.values() for metric in metrics),
+    *CONTEXT_METRICS,
+    *(alias for aliases in ALIASES.values() for alias in aliases),
+})
 
 
 def discovery_config():
@@ -230,8 +241,9 @@ def discover_players(db,user_id,payload,language):
         if not strategy:raise HTTPException(status_code=422,detail='Set a team strategy first')
     filters=payload.filters.model_dump(mode='json',exclude_none=True)
     choices={key:filters.pop(key,[]) for key in ('nationality','team','league')}
-    rows=search_players(db,filters,all_matches=True,candidate_roles=payload.roles or None,candidate_choices=choices)
+    rows=search_players(db,filters,all_matches=True,candidate_roles=payload.roles or None,candidate_choices=choices,metadata_fields=DISCOVERY_METADATA_FIELDS)
     shortlist,count=shortlist_players(rows,payload)
+    del rows
     if not shortlist:return {'players':[],'shortlistCount':0,'eligibleCount':count,'hasMore':False}
     required=min(5,len(shortlist))
     evidence={'output_language':normalize_lang(language),'description':payload.description,'strategy':strategy,'useWeights':payload.useWeights,'weights':payload.weights if payload.useWeights else {},'groupWeights':payload.groupWeights if payload.useWeights else {},'required_count':required,'shortlist':[{'playerId':int(entry['row']['id']),'name':entry['row']['content'].get('player_name'),'team':entry['row']['content'].get('team_name'),'age':entry['row']['content'].get('age'),'roles':sorted(entry['roles']),'matchedRole':entry['matchedRole'],'shortlistRank':index+1,'metrics':entry['metrics'],'contextMetrics':{key:value for key,value in player_metrics(entry['row']['content'],include_context=True).items() if key in CONTEXT_METRICS}} for index,entry in enumerate(shortlist)]}
@@ -243,7 +255,14 @@ def discover_players(db,user_id,payload,language):
             result=result if isinstance(result,Selection) else Selection.model_validate(result)
             ids=result.playerIds
             if len(ids)!=required or len(set(ids))!=required or any(pid not in valid for pid in ids):raise ValueError('Invalid selection')
-            return {'players':[valid[pid] for pid in ids],'shortlistCount':len(shortlist),'eligibleCount':count,'hasMore':count>len(ids)}
+            break
         except Exception as exc:
             if attempt:raise HTTPException(status_code=502,detail='Discovery selection could not be completed') from exc
             evidence['validation_instruction']='Return exactly required_count distinct IDs from shortlist.'
+
+    profiles = {int(row['id']): row for row in fetch_player_rows_by_ids(db, ids)}
+    for pid in ids:
+        full = profiles.get(pid)
+        if full is None or {key: value for key, value in full['content'].items() if key in DISCOVERY_METADATA_FIELDS} != valid[pid]['content']:
+            raise HTTPException(status_code=409, detail='Player data changed during search. Please retry.')
+    return {'players':[profiles[pid] for pid in ids],'shortlistCount':len(shortlist),'eligibleCount':count,'hasMore':count>len(ids)}
