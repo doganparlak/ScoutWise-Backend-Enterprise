@@ -1,3 +1,4 @@
+from datetime import date as CalendarDate
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
@@ -546,3 +547,9 @@ class EnterpriseProChatIn(BaseModel):
     session_id: Optional[str] = "default"
     strategy: Optional[str] = None
     tutorial_mode: Optional[bool] = False
+
+
+class LeagueInsightsIn(BaseModel):
+    leagueId: int = Field(ge=1)
+    seasonId: int = Field(ge=1)
+    periodStart: CalendarDate | None = None

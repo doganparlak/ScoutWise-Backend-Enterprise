@@ -36,6 +36,7 @@ from api_module.models import (
     LeaguePoolSearchRow,
     LeagueStandingsIn,
     LeagueStandingsOut,
+    LeagueInsightsIn,
     MatchAnalysisOptionsIn,
     MatchAnalysisOptionsOut,
     MatchAnalysisSearchIn,
@@ -105,6 +106,7 @@ from match_analysis_module import get_fixture, get_match_filter_options, get_tea
 from match_analysis_module.match_analysis import SportMonksError
 from match_analysis_module.pre_match_report import build_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
+from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
 from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
@@ -2094,10 +2096,13 @@ def league_pool_search(
 def league_standings(
     payload: LeagueStandingsIn,
     user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
 ):
     del user_id
     try:
-        return get_league_standings(payload.leagueId)
+        result = get_league_standings(payload.leagueId)
+        enqueue_season(db, result)
+        return result
     except StandingsError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -3533,3 +3538,33 @@ def delete_enterprise_favorite_player(
     )
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.on_event("startup")
+def start_league_insights_worker():
+    start_worker()
+
+
+@app.on_event("shutdown")
+def stop_league_insights_worker():
+    stop_worker()
+
+
+@app.post("/league-insights")
+def league_insights(payload: LeagueInsightsIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    del user_id
+    try:
+        return request_summary(db, payload.leagueId, payload.seasonId, payload.periodStart)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/league-insights/players/{player_id}")
+def league_insights_player(player_id: int, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    del user_id
+    if player_id <= 0:
+        raise HTTPException(status_code=422, detail="Invalid player ID")
+    player = player_profile(db, player_id)
+    if player is None:
+        raise HTTPException(status_code=404, detail="This player is not yet available in the player pool")
+    return player
