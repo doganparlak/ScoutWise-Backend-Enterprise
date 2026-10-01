@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 import unicodedata
@@ -99,56 +100,27 @@ def search_team_pool(
     league: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    rows = db.execute(
-        text(
-            """
-            WITH candidates AS (
-              SELECT team_id, MAX(team_name) AS team_name
-              FROM player_comp_data
-              WHERE team_id IS NOT NULL
-                AND COALESCE(team_name, '') <> ''
-                AND (
-                  :team_fold = ''
-                  OR TRANSLATE(LOWER(team_name), 'çğıöşü', 'cgiosu') LIKE ('%' || :team_fold || '%')
-                )
-                AND (:country = '' OR league_country_name = :country)
-                AND (:league = '' OR league_name = :league)
-              GROUP BY team_id
-              ORDER BY MAX(team_name)
-              LIMIT :limit
-            )
-            SELECT
-              candidate.team_id,
-              candidate.team_name,
-              domestic.league_country_name,
-              domestic.league_name,
-              domestic.league_id
-            FROM candidates candidate
-            LEFT JOIN LATERAL (
-              SELECT league_country_name, league_name, league_id
-              FROM player_comp_data team_context
-              WHERE team_context.team_id = candidate.team_id
-                AND COALESCE(league_country_name, '') <> ''
-                AND COALESCE(league_name, '') <> ''
-              GROUP BY league_country_name, league_name, league_id
-              ORDER BY
-                CASE WHEN LOWER(league_country_name) = 'europe' THEN 1 ELSE 0 END,
-                CASE WHEN LOWER(league_name) LIKE '%cup%' THEN 1 ELSE 0 END,
-                COUNT(*) DESC,
-                league_name
-              LIMIT 1
-            ) domestic ON TRUE
-            ORDER BY candidate.team_name
-            LIMIT :limit
-            """
-        ),
-        {
-            "team_fold": _fold(team),
-            "country": _clean(country),
-            "league": _clean(league),
-            "limit": min(max(1, int(limit)), 50),
-        },
-    ).mappings().all()
+    from .current_leagues import load_current_teams, fetch_current_league
+    candidates = [row for row in load_current_teams(db) if _matches(row['team_name'], team)]
+    rows = []
+    for candidate in candidates:
+        row = dict(candidate)
+        if row['league_id'] is None and _clean(team):
+            # Only named searches verify unresolved teams upstream. Broad league
+            # filters use confirmed membership, not hundreds of speculative calls.
+            try:
+                current = fetch_current_league(int(row['team_id']))
+            except RuntimeError as exc:
+                raise SportMonksError(str(exc)) from exc
+            if current:
+                row.update(current)
+        if _clean(country) and row['league_country_name'] != _clean(country):
+            continue
+        if _clean(league) and row['league_name'] != _clean(league):
+            continue
+        rows.append(row)
+        if len(rows) >= min(max(1, int(limit)), 50):
+            break
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(rows)))) as executor:
         details = list(executor.map(lambda row: _get_team_details(int(row["team_id"])), rows))
     return [
@@ -225,7 +197,17 @@ def get_team_played_matches(team_id: int, domestic_league_id: int) -> list[dict[
     if not domestic:
         return []
     current_domestic = next((season for season in domestic if season.get("is_current")), domestic[0])
-    previous_domestic = next((season for season in domestic if season.get("name") != current_domestic.get("name")), None)
+    # Promotions change league IDs. Select the preceding season by its year,
+    # not the last time this team happened to compete in its current division.
+    current_label = str(current_domestic.get("name") or "")
+    years = re.fullmatch(r"(\d{4})(?:([/-])(\d{2}|\d{4}))?", current_label)
+    previous_label = None
+    if years:
+        previous_label = str(int(years[1]) - 1)
+        if years[3]:
+            width = len(years[3])
+            previous_label += years[2] + str((int(years[3]) - 1) % (10 ** width)).zfill(width)
+    previous_domestic = next((season for season in seasons if season.get("name") == previous_label), None) if previous_label else None
     season_names = {current_domestic.get("name")}
     if previous_domestic:
         season_names.add(previous_domestic.get("name"))

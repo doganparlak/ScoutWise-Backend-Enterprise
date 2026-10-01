@@ -2132,6 +2132,16 @@ def match_analysis_search(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.post("/team-pool/options", response_model=MatchAnalysisOptionsOut)
+def team_pool_options(
+    payload: MatchAnalysisOptionsIn = Body(default=MatchAnalysisOptionsIn()),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    from match_analysis_module.current_leagues import get_team_filter_options
+    return get_team_filter_options(db, payload.country, payload.league)
+
+
 @app.post("/team-pool/search", response_model=list[TeamPoolSearchRow])
 def team_pool_search(
     payload: TeamPoolSearchIn,
