@@ -3417,7 +3417,7 @@ def create_enterprise_player_pool_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 9
+    version = 10
     player_payload = payload.model_dump(exclude_none=True)
     return _get_or_create_enterprise_player_pool_report_from_payload(
         db,
@@ -3438,7 +3438,7 @@ def get_or_create_enterprise_scouting_report(
     db: Session = Depends(get_db),
 ):
     lang = normalize_lang(accept_language) or "en"
-    version = 9
+    version = 10
 
     favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
     player_payload = _enterprise_favorite_identity(favorite_row)
