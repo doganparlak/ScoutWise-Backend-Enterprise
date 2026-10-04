@@ -107,6 +107,7 @@ from match_analysis_module.match_analysis import SportMonksError
 from match_analysis_module.pre_match_report import build_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
 from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
+from report_module.metric_validation import sanitize_percentages, sanitize_player_highlights
 from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
@@ -655,7 +656,7 @@ def get_enterprise_dashboard_report(
         "favorite_player_id": str(row.get("cache_key") or row["id"]),
         "status": row["status"],
         "content": row["content"],
-        "content_json": content_json,
+        "content_json": sanitize_percentages(content_json),
         "language": row.get("language") or "en",
         "version": int(row.get("version") or 1),
     }
@@ -2616,7 +2617,8 @@ def create_enterprise_match_report(
     cached = dict(row["report_content"] or {})
     if (
         row["report_status"] == "ready"
-        and cached.get("version") == MATCH_REPORT_VERSION
+        and (cached.get("version") == MATCH_REPORT_VERSION
+             or (report_type == "pre_match" and not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))))
         and cached.get("language") == lang
         and (
             report_type != "pre_match"
@@ -2627,7 +2629,7 @@ def create_enterprise_match_report(
         return EnterpriseMatchReportOut(
             favorite_match_id=str(row["id"]),
             status="ready",
-            content_json=cached,
+            content_json=sanitize_player_highlights(sanitize_percentages(cached)),
             language=lang,
             version=MATCH_REPORT_VERSION,
         )
@@ -3301,7 +3303,7 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
                     "favorite_player_id": outward_favorite_id,
                     "status": row["status"],
                     "content": row["content"],
-                    "content_json": row["content_json"],
+                    "content_json": sanitize_percentages(row["content_json"]),
                     "language": row["language"],
                     "version": row["version"],
                 }
@@ -3310,7 +3312,7 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
                 "favorite_player_id": outward_favorite_id,
                 "status": row["status"],
                 "content": row["content"],
-                "content_json": row["content_json"],
+                "content_json": sanitize_percentages(row["content_json"]),
                 "language": row["language"],
                 "version": row["version"],
             }

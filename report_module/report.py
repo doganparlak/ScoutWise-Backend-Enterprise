@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from report_module.metric_validation import percentage, sanitize_percentages, valid_metric
+
 import math
 import os
 import re
@@ -953,11 +955,11 @@ def _phase_taxonomy_roles(player_card: Dict[str, Any]) -> List[Tuple[str, float]
 
 def _metric_context_value(metric_docs: List[Dict[str, Any]], metric_name: str) -> Optional[Any]:
     selected: Optional[Any] = _derived_metric_value(metric_name, metric_docs)
-    if selected not in (None, ""):
+    if selected not in (None, "") and valid_metric(metric_name, selected):
         return selected
     for doc in metric_docs or []:
         selected = _metric_value_from_metadata(doc.get("metadata") or {}, metric_name)
-        if selected not in (None, ""):
+        if selected not in (None, "") and valid_metric(metric_name, selected):
             return selected
     return None
 
@@ -1311,7 +1313,10 @@ def _metric_value_from_metadata(metadata: Dict[str, Any], metric_name: str) -> O
             raw_name = stat.get("metric") or stat.get("stat") or stat.get("label") or stat.get("name")
             if _metric_key(raw_name) != target_key:
                 continue
-            return stat.get("value") or stat.get("amount") or stat.get("score")
+            for key in ("value", "amount", "score"):
+                if stat.get(key) is not None:
+                    return stat[key]
+            return None
 
     return None
 
@@ -1341,20 +1346,15 @@ def _derived_metric_value(metric_name: str, metric_docs: List[Dict[str, Any]]) -
         return None
 
     numerator_metric, denominator_metric = dependencies[metric_name]
-    numerator: Optional[float] = None
-    denominator: Optional[float] = None
+    # Both components must come from the same document snapshot.
     for doc in metric_docs or []:
         metadata = doc.get("metadata") or {}
-        if numerator is None:
-            numerator = _to_float(_metric_value_from_metadata(metadata, numerator_metric))
-        if denominator is None:
-            denominator = _to_float(_metric_value_from_metadata(metadata, denominator_metric))
-        if numerator is not None and denominator is not None:
-            break
-
-    if numerator is None or denominator is None or denominator <= 0:
-        return None
-    return round((numerator / denominator) * 100, 2)
+        numerator = _to_float(_metric_value_from_metadata(metadata, numerator_metric))
+        denominator = _to_float(_metric_value_from_metadata(metadata, denominator_metric))
+        value = percentage(numerator, denominator)
+        if value is not None:
+            return round(value, 2)
+    return None
 
 
 DERIVED_EFFICIENCY_METRICS: Dict[str, str] = {
@@ -1376,7 +1376,7 @@ def _build_derived_efficiency_context(metric_docs: List[Dict[str, Any]]) -> str:
                 selected = _to_float(_metric_value_from_metadata(doc.get("metadata") or {}, metric))
                 if selected is not None:
                     break
-        if selected is not None:
+        if selected is not None and valid_metric(metric, selected):
             values.append(f"- {metric}: value={selected:g}, meaning={meaning}")
 
     lines = [
@@ -1413,7 +1413,7 @@ def _build_category_metric_context(player_card: Dict[str, Any], metric_docs: Lis
                 selected = _metric_value_from_metadata(doc.get("metadata") or {}, metric)
                 if selected not in (None, ""):
                     break
-            if selected not in (None, ""):
+            if selected not in (None, "") and valid_metric(metric, selected):
                 values.append(f"{metric}={selected}")
         if values:
             category_values[category] = values
@@ -1683,6 +1683,7 @@ def build_player_card_from_docs(metric_docs: List[Dict[str, Any]]) -> Dict[str, 
 
 
 def _build_llm_input(player_card: Dict[str, Any], metric_docs: List[Dict[str, Any]]) -> str:
+    metric_docs = sanitize_percentages(metric_docs)
     parts: List[str] = ["PLAYER_CARD_JSON:", str(player_card or {}), "\nMETRIC_DOCUMENTS (newest first):"]
     parts.insert(0, _role_constraint_block(player_card))
     parts.insert(1, _build_metric_significance_block(metric_docs))
@@ -1750,7 +1751,7 @@ def generate_report_content(
         "version": version,
         "player_identity": identity,
         "player_card": player_card,
-        "metrics_docs": docs,
+        "metrics_docs": sanitize_percentages(docs),
         "report_text": report_text,
     }
     return {"content": report_text, "content_json": content_json}
