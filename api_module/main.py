@@ -105,6 +105,7 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
+from team_portfolio_module.portfolio import router as team_portfolio_router, begin_report, finish_report
 from standings_module.search import get_league_performance_options, search_league_performance
 from match_analysis_module import get_fixture, get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
@@ -215,6 +216,7 @@ def require_enterprise_admin(db: Session, user_id: str, accept_language: str | N
         raise HTTPException(status_code=403, detail=msg("admin_only", accept_language))
 
 app = FastAPI(title="ScoutWise Enterprise Backend")
+app.include_router(team_portfolio_router)
 
 origins_env = os.environ.get("CORS_ORIGINS")
 origins = [origin.strip() for origin in origins_env.split(",")] if origins_env else ["*"]
@@ -2203,13 +2205,18 @@ def team_analysis_report_data(
     payload: TeamAnalysisReportIn,
     user_id: str = Depends(require_auth),
     accept_language: str | None = Header(default=None),
+    db: Session = Depends(get_db),
 ):
-    del user_id
     fixture_ids = list(dict.fromkeys(payload.fixtureIds))
     lang = normalize_lang(accept_language) or "en"
+    job = begin_report(db, user_id, payload, lang, MATCH_REPORT_VERSION)
+    if job['content'] is not None:
+        return TeamAnalysisReportOut(**{**job['content'], 'reportId': job['id']})
     try:
         with ThreadPoolExecutor(max_workers=min(5, len(fixture_ids))) as executor:
             reports = list(executor.map(lambda fixture_id: generate_match_report(fixture_id, lang, False), fixture_ids))
+        if any(payload.teamId not in {int(team.get('id') or 0) for team in report.get('teams', [])} for report in reports):
+            raise HTTPException(422, 'Every selected fixture must include this team')
         team_metrics, perspectives = build_team_report_metrics(reports, payload.teamId, lang)
         player_perspectives = build_team_report_player_perspectives(reports, payload.teamId, lang)
         momentum_perspectives = build_team_report_momentum_perspectives(reports, payload.teamId, lang)
@@ -2220,9 +2227,15 @@ def team_analysis_report_data(
         strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang)
         weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang)
         overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, momentum_perspectives, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
-        return TeamAnalysisReportOut(reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
+        result = TeamAnalysisReportOut(reportId=job['id'], reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
+        finish_report(db, user_id, job, result.model_dump())
+        return result
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        db.rollback()
+        finish_report(db, user_id, job)
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=502, detail="Team report could not be generated. Please try again.") from exc
 
 
 @app.get("/favorite-matches/count")
@@ -2236,13 +2249,16 @@ def count_enterprise_favorite_matches(
 
 @app.get("/favorite-matches", response_model=list[EnterpriseFavoriteMatchOut])
 def list_enterprise_favorite_matches(
+    refresh_fixtures: bool = True,
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
     rows = db.execute(
         text(
             """
-            SELECT id, fixture_id, fixture_payload, report_type, report_status, created_at
+            SELECT id, fixture_id, fixture_payload, report_type,
+                   CASE WHEN report_status = 'ready' AND report_content IS NULL THEN 'not_started'
+                        ELSE report_status END AS report_status, created_at
             FROM enterprise_favorite_matches
             WHERE user_id = :user_id
             ORDER BY starting_at DESC, created_at DESC
@@ -2262,7 +2278,7 @@ def list_enterprise_favorite_matches(
 
     fixture_ids = list({int(row["fixture_id"]) for row in rows})
     current_fixtures: dict[int, dict[str, Any]] = {}
-    if fixture_ids:
+    if fixture_ids and refresh_fixtures:
         with ThreadPoolExecutor(max_workers=min(6, len(fixture_ids))) as executor:
             refreshed = executor.map(current_fixture, fixture_ids)
             for fixture_id, fixture in zip(fixture_ids, refreshed):
@@ -2601,7 +2617,7 @@ def save_enterprise_favorite_match(
               result_info = EXCLUDED.result_info,
               fixture_payload = EXCLUDED.fixture_payload,
               updated_at = now()
-            RETURNING id, fixture_payload, report_type, created_at
+            RETURNING id, fixture_payload, report_type, report_status, created_at
             """
         ),
         values,
@@ -2611,7 +2627,45 @@ def save_enterprise_favorite_match(
         favoriteId=str(row["id"]),
         fixture=dict(row["fixture_payload"] or {}),
         reportType=str(row.get("report_type") or "post_match"),
+        reportStatus=str(row.get("report_status") or "not_started"),
         createdAt=row["created_at"],
+    )
+
+
+@app.delete("/favorite-matches/fixture/{fixture_id}", status_code=204)
+def delete_enterprise_favorite_match(
+    fixture_id: int,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    if fixture_id <= 0:
+        raise HTTPException(status_code=422, detail="Invalid fixture ID")
+    # The portfolio displays one row per fixture, including both report types.
+    deleted = db.execute(
+        text("DELETE FROM enterprise_favorite_matches WHERE fixture_id=:fixture_id AND user_id=:user_id"),
+        {"fixture_id": fixture_id, "user_id": user_id},
+    ).rowcount
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Favorite match not found")
+    db.commit()
+
+
+@app.get("/favorite-matches/{favorite_id}/report", response_model=EnterpriseMatchReportOut)
+def open_enterprise_match_report(
+    favorite_id: uuid.UUID,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(text("""SELECT id, report_content FROM enterprise_favorite_matches
+        WHERE id=:id AND user_id=:user_id AND report_status='ready' AND report_content IS NOT NULL"""),
+        {"id": str(favorite_id), "user_id": user_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Saved match report not found")
+    content = dict(row['report_content'])
+    return EnterpriseMatchReportOut(
+        favorite_match_id=str(row['id']), status="ready",
+        content_json=sanitize_player_highlights(sanitize_percentages(content)),
+        language=content.get('language') or 'en', version=int(content.get('version') or 1),
     )
 
 

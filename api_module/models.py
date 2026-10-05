@@ -260,10 +260,13 @@ class EnterpriseMatchReportOut(BaseModel):
 
 class TeamAnalysisReportIn(BaseModel):
     fixtureIds: List[int] = Field(min_length=1, max_length=10)
-    teamId: int
+    teamId: int = Field(gt=0)
+    team: TeamPoolSearchRow
+    matches: List[TeamPlayedMatchRow] = Field(min_length=1, max_length=10)
 
 
 class TeamAnalysisReportOut(BaseModel):
+    reportId: Optional[str] = None
     reports: List[Dict[str, Any]]
     teamMetrics: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
     perspectives: Dict[str, str] = Field(default_factory=dict)
