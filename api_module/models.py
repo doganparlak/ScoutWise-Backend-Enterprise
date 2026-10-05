@@ -119,6 +119,23 @@ class LeaguePoolSearchRow(BaseModel):
     content: Dict[str, Any]
 
 
+class LeaguePerformanceSearchIn(LeaguePoolFilterIn):
+    limit: int = Field(default=100, ge=1, le=200)
+
+
+class LeaguePerformanceOptionsOut(BaseModel):
+    leagues: List[str]
+    countries: List[str]
+
+
+class LeaguePerformanceRow(BaseModel):
+    league_id: int
+    league_name: str
+    country_name: str | None = None
+    image_url: str | None = None
+    team_count: int
+
+
 class LeagueStandingsIn(BaseModel):
     leagueId: int = Field(ge=1)
 

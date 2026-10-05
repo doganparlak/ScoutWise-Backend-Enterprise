@@ -189,7 +189,7 @@ def publish(job, season):
         previous_periods = db.execute(text('SELECT period_start FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season'), job).scalars().all()
         periods_written = set()
         period = None
-        fortnight = Aggregate()
+        fortnight = Aggregate(include_team_metrics=False)
         rows = db.execute(text('''SELECT kickoff_at,included_in_aggregation,team_contributions,player_contributions
             FROM league_match_contributions WHERE league_id=:league AND season_id=:season
             AND included_in_aggregation=TRUE ORDER BY kickoff_at,fixture_id''').execution_options(stream_results=True, yield_per=20), job).mappings()
@@ -198,7 +198,7 @@ def publish(job, season):
             if period is not None and key != period:
                 save_period(db, job, period, fortnight.finish())
                 periods_written.add(period)
-                fortnight = Aggregate()
+                fortnight = Aggregate(include_team_metrics=False)
             period = key
             aggregate.add(row)
             fortnight.add(row)
@@ -206,7 +206,7 @@ def publish(job, season):
             save_period(db, job, period, fortnight.finish())
             periods_written.add(period)
         for empty in {*previous_periods, period_for(datetime.now(PERIOD_ZONE).date())[0]} - periods_written:
-            save_period(db, job, empty, Aggregate().finish())
+            save_period(db, job, empty, Aggregate(include_team_metrics=False).finish())
         result = aggregate.finish()
         hydrate_winner_images(db, result)
         params = {**job, **result, 'version': VERSION, 'season_name': season.get('name'),

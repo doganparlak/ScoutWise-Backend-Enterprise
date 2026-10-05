@@ -34,6 +34,9 @@ from api_module.models import (
     LeaguePoolFilterOptionsOut,
     LeaguePoolSearchIn,
     LeaguePoolSearchRow,
+    LeaguePerformanceSearchIn,
+    LeaguePerformanceOptionsOut,
+    LeaguePerformanceRow,
     LeagueStandingsIn,
     LeagueStandingsOut,
     LeagueInsightsIn,
@@ -102,6 +105,7 @@ from player_pool_module.player_pool import get_player_pool_filter_options, searc
 from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
+from standings_module.search import get_league_performance_options, search_league_performance
 from match_analysis_module import get_fixture, get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
 from match_analysis_module.pre_match_report import build_recent_squad_usage
@@ -2091,6 +2095,26 @@ def league_pool_search(
 ):
     del user_id
     return search_league_pool(db, payload.model_dump())
+
+
+@app.post("/league-performance/options", response_model=LeaguePerformanceOptionsOut)
+def league_performance_options(
+    payload: LeaguePoolFilterIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return get_league_performance_options(db, payload.leagues, payload.countries)
+
+
+@app.post("/league-performance/search", response_model=list[LeaguePerformanceRow])
+def league_performance_search(
+    payload: LeaguePerformanceSearchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    del user_id
+    return search_league_performance(db, payload.leagues, payload.countries, payload.limit)
 
 
 @app.post("/league-standings", response_model=LeagueStandingsOut)

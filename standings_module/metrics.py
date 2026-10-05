@@ -88,7 +88,8 @@ def normalize_fixture(fixture):
 
 
 class Aggregate:
-    def __init__(self):
+    def __init__(self, *, include_team_metrics=True):
+        self.include_team_metrics = include_team_metrics
         self.teams = {}
         self.players = {}
         self.fixture_count = 0
@@ -104,6 +105,8 @@ class Aggregate:
             team = self.teams.setdefault(tid, {'teamName': source['name'], 'matches': 0, 'metrics': {}})
             team['teamName'] = source['name']
             team['matches'] += 1
+            if not self.include_team_metrics:
+                continue
             metrics = source['metrics']
             for name, value in metrics.items():
                 if name in DERIVED_PERCENTAGE_METRICS:
@@ -132,6 +135,8 @@ class Aggregate:
     def finish(self):
         catalog = {}
         for team in self.teams.values():
+            if not self.include_team_metrics:
+                continue
             for name, metric in team['metrics'].items():
                 kind = 'derived_rate' if name in DERIVED_PERCENTAGE_METRICS else 'average' if name in AVERAGES or '%' in name or 'percentage' in name.casefold() or 'performance' in name.casefold() else 'total'
                 if kind == 'derived_rate':
