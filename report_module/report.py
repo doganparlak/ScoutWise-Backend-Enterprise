@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from report_module.metric_validation import percentage, sanitize_percentages, valid_metric
 
+from report_module.progress import emit_progress, is_streaming
+import time
+
 import math
 import os
 import re
@@ -1743,15 +1746,24 @@ def generate_report_content(
         if player_card.get(score_key) in (None, "") and identity.get(score_key) is not None:
             player_card[score_key] = identity[score_key]
 
-    report_text = (report_chain.invoke({"input_text": _build_llm_input(player_card, docs), "lang": lang}) or "").strip()
-    report_text = _normalize_report_narrative_titles(report_text, lang)
     content_json = {
-        "favorite_player_id": favorite_id,
-        "language": lang,
-        "version": version,
-        "player_identity": identity,
-        "player_card": player_card,
-        "metrics_docs": sanitize_percentages(docs),
-        "report_text": report_text,
+        "favorite_player_id": favorite_id, "language": lang, "version": version,
+        "player_identity": identity, "player_card": player_card,
+        "metrics_docs": sanitize_percentages(docs), "report_text": "",
     }
+    emit_progress(content_json, "statistics")
+    inputs = {"input_text": _build_llm_input(player_card, docs), "lang": lang}
+    if is_streaming():
+        report_text = ""
+        last_sent = time.monotonic()
+        for chunk in report_chain.stream(inputs):
+            report_text += chunk
+            if time.monotonic() - last_sent >= 1:
+                emit_progress({"report_text": _normalize_report_narrative_titles(report_text, lang)})
+                last_sent = time.monotonic()
+    else:
+        report_text = report_chain.invoke(inputs) or ""
+    report_text = _normalize_report_narrative_titles(report_text.strip(), lang)
+    content_json["report_text"] = report_text
+    emit_progress(content_json, "narrative")
     return {"content": report_text, "content_json": content_json}

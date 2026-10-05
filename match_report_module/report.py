@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from report_module.progress import emit_progress
+
 import os
 import json
 import re
@@ -1366,13 +1368,20 @@ def generate_match_report(fixture_id: int, lang: str = "en", build_narratives: b
     for team in report["teams"]:
         team["formation"] = formation_by_team.get(team.get("id"))
     if build_narratives:
+        emit_progress(report, "statistics")
         report["scoutwise_perspective_points"] = _build_scoutwise_perspective(report, lang)
         report["scoutwise_perspective"] = " ".join(report["scoutwise_perspective_points"])
+        emit_progress(report, "scoutwise_perspective")
         report["regional_play_perspective"] = _build_regional_play_perspective(report, lang)
+        emit_progress(report, "regional_play_perspective")
         report["team_analysis_perspectives"] = _build_team_analysis_perspectives(teams, period_teams, lang)
+        emit_progress(report, "team_analysis_perspectives")
         report["player_analysis_perspectives"] = _build_player_analysis_perspectives(teams, lineups, events, lang)
+        emit_progress(report, "player_analysis_perspectives")
         report["team_deep_analyses"] = _build_team_deep_analyses(report, lang)
+        emit_progress(report, "team_deep_analyses")
         report["overview_summary"] = _build_report_overview_summary(report, lang)
+        emit_progress(report, "overview_summary")
     report["analysis_model"] = os.getenv(
         "OPENAI_MATCH_REPORT_MODEL",
         os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna"),
@@ -1432,6 +1441,7 @@ def build_team_report_metrics(
                 "matchesCovered": len(pairs) if numerator_denominator else len(values),
             })
         aggregate[group].sort(key=lambda row: row["name"])
+    emit_progress({"teamMetrics": aggregate}, "teamMetrics")
     available = list(aggregate)
     fallback_text = (
         "Seçili maçların toplu değerleri, takımın bu kategorideki üretimini ve maç başına seviyesini birlikte gösteriyor."

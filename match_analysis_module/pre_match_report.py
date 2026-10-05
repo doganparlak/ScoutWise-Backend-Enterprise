@@ -7,6 +7,8 @@ Maç Önü Analizi as the report sections are introduced.
 
 from __future__ import annotations
 
+from report_module.progress import emit_progress
+
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -1424,22 +1426,28 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
                 teams,
             )
         )
-    team_analysis = _pre_match_team_analysis(usages, teams, lang)
-    comparisons = _pre_match_team_comparison_perspectives(usages, teams, lang)
-    momentum = _pre_match_momentum_perspectives(usages, teams, lang)
-    score_flow = _pre_match_score_flow_perspectives(usages, teams, lang)
-    regional = _pre_match_regional_perspective(usages, teams, lang)
-    return {
-        "teams": usages,
-        "head_to_head": _head_to_head_results(teams[0], teams[1], season_id, reference_date),
-        "player_perspectives": _pre_match_player_perspectives(usages, lang),
-        "team_analysis": team_analysis,
-        "team_comparison_perspectives": comparisons,
-        "momentum_perspectives": momentum,
-        "score_flow_perspectives": score_flow,
-        "regional_perspective": regional,
-        "overview_summary": _pre_match_overview_summary(usages, teams, team_analysis, momentum, score_flow, regional, comparisons, lang),
-    }
+    result = {"teams": usages}
+    def publish(section):
+        emit_progress({"recent_squad_usage": result}, section)
+    publish("recent_statistics")
+    result["head_to_head"] = _head_to_head_results(teams[0], teams[1], season_id, reference_date)
+    publish("head_to_head")
+    result["team_analysis"] = _pre_match_team_analysis(usages, teams, lang)
+    publish("pre_team_analysis")
+    result["team_comparison_perspectives"] = _pre_match_team_comparison_perspectives(usages, teams, lang)
+    publish("pre_comparisons")
+    result["momentum_perspectives"] = _pre_match_momentum_perspectives(usages, teams, lang)
+    publish("pre_momentum")
+    result["score_flow_perspectives"] = _pre_match_score_flow_perspectives(usages, teams, lang)
+    publish("pre_score_flow")
+    result["regional_perspective"] = _pre_match_regional_perspective(usages, teams, lang)
+    publish("pre_regional")
+    result["player_perspectives"] = _pre_match_player_perspectives(usages, lang)
+    publish("pre_players")
+    result["overview_summary"] = _pre_match_overview_summary(usages, teams, result["team_analysis"], result["momentum_perspectives"], result["score_flow_perspectives"], result["regional_perspective"], result["team_comparison_perspectives"], lang)
+    publish("pre_overview")
+    return result
+
 
 
 def build_pre_match_analysis(fixture: dict[str, Any], lang: str = "en") -> dict[str, Any]:

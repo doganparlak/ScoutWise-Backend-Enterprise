@@ -1,3 +1,4 @@
+from report_module.progress import streaming_requested, stream_report, configure_progress, emit_progress
 import datetime as dt
 import json
 import os
@@ -2206,27 +2207,48 @@ def team_analysis_report_data(
     user_id: str = Depends(require_auth),
     accept_language: str | None = Header(default=None),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    if streaming_requested(request):
+        return stream_report(lambda db: team_analysis_report_data(payload, user_id, accept_language, db))
     fixture_ids = list(dict.fromkeys(payload.fixtureIds))
     lang = normalize_lang(accept_language) or "en"
     job = begin_report(db, user_id, payload, lang, MATCH_REPORT_VERSION)
     if job['content'] is not None:
         return TeamAnalysisReportOut(**{**job['content'], 'reportId': job['id']})
+    def save_partial(content):
+        db.execute(text("""UPDATE enterprise_team_reports SET report_content=CAST(:content AS jsonb),updated_at=NOW()
+            WHERE id=:id AND user_id=:user_id AND generation_token=CAST(:token AS uuid) AND report_status='processing'"""),
+            {'content': json.dumps(content), 'id': job['id'], 'user_id': user_id, 'token': job['token']})
+        db.commit()
+    configure_progress(persist=save_partial)
+    emit_progress(TeamAnalysisReportOut(reportId=job['id'], reports=[]).model_dump())
     try:
         with ThreadPoolExecutor(max_workers=min(5, len(fixture_ids))) as executor:
             reports = list(executor.map(lambda fixture_id: generate_match_report(fixture_id, lang, False), fixture_ids))
         if any(payload.teamId not in {int(team.get('id') or 0) for team in report.get('teams', [])} for report in reports):
             raise HTTPException(422, 'Every selected fixture must include this team')
+        emit_progress({"reports": reports}, "statistics")
         team_metrics, perspectives = build_team_report_metrics(reports, payload.teamId, lang)
+        emit_progress({"perspectives": perspectives}, "perspectives")
         player_perspectives = build_team_report_player_perspectives(reports, payload.teamId, lang)
+        emit_progress({"playerPerspectives": player_perspectives}, "playerPerspectives")
         momentum_perspectives = build_team_report_momentum_perspectives(reports, payload.teamId, lang)
+        emit_progress({"momentumPerspectives": momentum_perspectives}, "momentumPerspectives")
         regional_perspective = build_team_report_regional_perspective(reports, payload.teamId, lang)
+        emit_progress({"regionalPerspective": regional_perspective}, "regionalPerspective")
         attack_profile = build_team_report_attack_profile(reports, payload.teamId, team_metrics, lang)
+        emit_progress({"attackProfile": attack_profile}, "attackProfile")
         defense_profile = build_team_report_defense_profile(reports, payload.teamId, team_metrics, lang)
+        emit_progress({"defenseProfile": defense_profile}, "defenseProfile")
         score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang)
+        emit_progress({"scoreFlowProfile": score_flow_profile}, "scoreFlowProfile")
         strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang)
+        emit_progress({"strengths": strengths}, "strengths")
         weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang)
+        emit_progress({"weaknesses": weaknesses}, "weaknesses")
         overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, momentum_perspectives, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
+        emit_progress({"overview": overview}, "overview")
         result = TeamAnalysisReportOut(reportId=job['id'], reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
         finish_report(db, user_id, job, result.model_dump())
         return result
@@ -2458,12 +2480,14 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
         },
         "temporary_extra_team_metrics": [],
     }
+    emit_progress(content, "fixture")
     try:
         content["recent_squad_usage"] = build_recent_squad_usage(fixture, lang)
     except (SportMonksError, TypeError, ValueError, requests.RequestException):
         # The pre-match report remains usable if a historical lineup request is
         # temporarily unavailable; the UI renders an explicit no-data state.
         content["recent_squad_usage"] = {"teams": []}
+    emit_progress(content, "recent_squad_usage")
     try:
         standings = get_league_standings(int(league.get("id") or 0))
         standing_by_team: dict[int, dict[str, Any]] = {}
@@ -2484,6 +2508,7 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
         content["league_standings"] = standing_by_team
     except (StandingsError, TypeError, ValueError, requests.RequestException):
         content["league_standings"] = {}
+    emit_progress(content, "league_standings")
     return content
 
 
@@ -2675,13 +2700,17 @@ def create_enterprise_match_report(
     user_id: str = Depends(require_auth),
     accept_language: str | None = Header(default=None),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    if streaming_requested(request):
+        return stream_report(lambda db: create_enterprise_match_report(favorite_id, user_id, accept_language, db))
     lang = normalize_lang(accept_language) or "en"
     row = db.execute(
         text(
             """
             SELECT id, fixture_id, fixture_payload, report_type, state_code, state_name,
-                   report_status, report_content
+                   report_status, report_content,
+                   (report_status='processing' AND updated_at<NOW()-INTERVAL '30 minutes') AS stale
             FROM enterprise_favorite_matches
             WHERE id = :favorite_id AND user_id = :user_id
             LIMIT 1
@@ -2724,11 +2753,11 @@ def create_enterprise_match_report(
             status_code=409,
             detail="A post-match report can only be created after the match is completed",
         )
-    if row["report_status"] == "processing":
+    if row["report_status"] == "processing" and not row.get("stale"):
         return EnterpriseMatchReportOut(
             favorite_match_id=str(row["id"]),
             status="processing",
-            content_json=None,
+            content_json=cached or None,
             language=lang,
             version=MATCH_REPORT_VERSION,
         )
@@ -2744,6 +2773,15 @@ def create_enterprise_match_report(
         {"favorite_id": favorite_id, "user_id": user_id},
     )
     db.commit()
+    def save_partial(content):
+        db.execute(text("""UPDATE enterprise_favorite_matches SET report_content=CAST(:content AS jsonb),updated_at=NOW()
+            WHERE id=:id AND user_id=:user_id AND report_status='processing'"""),
+            {'content': json.dumps(content), 'id': favorite_id, 'user_id': user_id})
+        db.commit()
+    configure_progress(lambda content: {
+        'favorite_match_id': favorite_id, 'status': 'processing', 'content_json': content,
+        'language': lang, 'version': MATCH_REPORT_VERSION,
+    }, save_partial)
     try:
         content = (
             _build_pre_match_report(fixture, lang)
@@ -3348,7 +3386,8 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
     outward_favorite_id = response_favorite_id or cache_key
     row = db.execute(
         text("""
-        SELECT id, status, content, content_json, language, version, player_payload
+        SELECT id, status, content, content_json, language, version, player_payload,
+               (status='processing' AND updated_at<NOW()-INTERVAL '30 minutes') AS stale
         FROM enterprise_player_pool_scouting_reports
         WHERE user_id = :user_id
           AND cache_key = :cache_key
@@ -3360,7 +3399,7 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
     ).mappings().first()
 
     if row:
-        if row["status"] == "failed":
+        if row["status"] == "failed" or row.get("stale"):
             db.execute(text("DELETE FROM enterprise_player_pool_scouting_reports WHERE id = :id"), {"id": row["id"]})
             db.commit()
             row = None
@@ -3396,6 +3435,21 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
             }
 
     report_id = str(uuid.uuid4())
+    def save_partial(content):
+        db.execute(text("""INSERT INTO enterprise_player_pool_scouting_reports
+            (id,user_id,cache_key,status,language,version,player_name,player_payload,content,content_json,created_at,updated_at)
+            VALUES (:id,:user_id,:key,'processing',:lang,:version,:name,CAST(:player AS jsonb),:narrative,CAST(:content AS jsonb),NOW(),NOW())
+            ON CONFLICT (user_id,cache_key,language,version) DO UPDATE SET
+              content=EXCLUDED.content,content_json=EXCLUDED.content_json,updated_at=NOW()
+            WHERE enterprise_player_pool_scouting_reports.status='processing'"""),
+            {'id': report_id, 'user_id': user_id, 'key': cache_key, 'lang': lang, 'version': version,
+             'name': name, 'player': json.dumps(player_payload, default=str),
+             'narrative': content.get('report_text', ''), 'content': json.dumps(content, default=str)})
+        db.commit()
+    configure_progress(lambda content: {
+        'favorite_player_id': outward_favorite_id, 'status': 'processing',
+        'content': content.get('report_text', ''), 'content_json': content, 'language': lang, 'version': version,
+    }, save_partial)
     try:
         generated = generate_report_content(
             db,
@@ -3493,7 +3547,10 @@ def create_enterprise_player_pool_report(
     user_id: str = Depends(require_auth),
     accept_language: str | None = Header(default=None),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    if streaming_requested(request):
+        return stream_report(lambda db: create_enterprise_player_pool_report(payload, user_id, accept_language, db))
     lang = normalize_lang(accept_language) or "en"
     version = 10
     player_payload = payload.model_dump(exclude_none=True)
@@ -3514,7 +3571,10 @@ def get_or_create_enterprise_scouting_report(
     user_id: str = Depends(require_auth),
     accept_language: str | None = Header(default=None),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    if streaming_requested(request):
+        return stream_report(lambda db: get_or_create_enterprise_scouting_report(favorite_id, background_tasks, payload, user_id, accept_language, db))
     lang = normalize_lang(accept_language) or "en"
     version = 10
 

@@ -171,12 +171,13 @@ def begin_report(db, user_id, payload, lang, version):
     db.commit()
     if existing['report_status'] == 'ready':
         return {'id': str(existing['id']), 'content': existing['report_content']}
-    raise HTTPException(409, 'This match selection is already being analyzed. Please try again shortly.')
+    raise HTTPException(409, 'Seçtiğiniz maçlar zaten analiz ediliyor. Lütfen kısa bir süre sonra tekrar deneyin.'
+                        if lang == 'tr' else 'This match selection is already being analyzed. Please try again shortly.')
 
 
 def finish_report(db, user_id, job, content=None):
     row = execute(db, '''UPDATE enterprise_team_reports SET report_status=:status,
-        report_content=CAST(:content AS jsonb),report_error=:error,
+        report_content=COALESCE(CAST(:content AS jsonb),report_content),report_error=:error,
         report_ready_at=CASE WHEN :status='ready' THEN NOW() ELSE NULL END,
         updated_at=NOW(),generation_token=NULL
         WHERE id=:id AND user_id=:user_id AND generation_token=CAST(:token AS uuid)
