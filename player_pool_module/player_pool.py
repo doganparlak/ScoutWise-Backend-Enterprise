@@ -117,7 +117,7 @@ def role_short_sql() -> str:
     """
 
 
-def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = False, candidate_roles: List[str] | None = None, candidate_choices: Dict[str, List[str]] | None = None, metadata_fields: List[str] | None = None) -> List[Dict[str, Any]]:
+def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = False, candidate_roles: List[str] | None = None, candidate_choices: Dict[str, List[str]] | None = None, metadata_fields: List[str] | None = None, batch_size: int | None = None, discovery_metric_names: Dict[str, str] | None = None):
     world_cup_mode = bool(filters.get("worldCupMode"))
     table_name = player_pool_table(world_cup_mode)
     name = clean_str(filters.get("name"))
@@ -158,11 +158,76 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
         image_sql = "NULL::text"
         image_join = ""
 
+    # Discovery eligibility runs before projection/transfer. Other searches keep
+    # their existing behavior. Numeric zero is available; aliases count once.
+    eligibility_sql = ""
+    eligibility_params = {}
+    eligibility_join = ""
+    if discovery_metric_names is not None:
+        numeric_pattern = r"^[[:space:]]*[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$"
+        def finite_number(field):
+            return f"(CASE WHEN metadata->>'{field}' ~ :eligibility_numeric_pattern THEN (metadata->>'{field}')::numeric ELSE NULL END)"
+        minutes = finite_number('Minutes Played')
+        matches = finite_number('match_count')
+        age = finite_number('age')
+        role_names = {name.lower(): code for code, name in ROLE_SHORT_TO_LONG.items()}
+        role_names.update({'central midfield':'CM', 'defensive midfield':'CDM', 'attacking midfield':'CAM', 'centre back':'CB'})
+        eligibility_join = """
+        CROSS JOIN LATERAL (
+          WITH normalized AS (
+            SELECT COALESCE(CAST(:eligibility_role_names AS jsonb)->>LOWER(BTRIM(field.key)), UPPER(BTRIM(field.key))) AS code,
+              CASE WHEN field.value ~ :eligibility_numeric_pattern THEN field.value::numeric ELSE NULL END AS count
+            FROM jsonb_each_text(CASE WHEN jsonb_typeof(metadata->'position_counts') = 'object'
+                 THEN metadata->'position_counts' ELSE '{}'::jsonb END) AS field(key, value)
+          ), counts AS (
+            SELECT code, SUM(count) AS count FROM normalized
+            WHERE code = ANY(CAST(:eligibility_role_codes AS text[])) AND count > 0
+            GROUP BY code
+          ), shares AS (
+            SELECT code, count, SUM(count) OVER () AS total, MAX(count) OVER () AS highest,
+              ROW_NUMBER() OVER (ORDER BY count DESC, code) AS rank
+            FROM counts
+          ), eligible AS (
+            SELECT code FROM shares WHERE rank <= 2 AND (highest-count)*100/total <= 20.00000001
+            UNION ALL
+            SELECT UPPER(metadata->>'primary_position_code')
+            WHERE NOT EXISTS (SELECT 1 FROM counts)
+              AND UPPER(metadata->>'primary_position_code') = ANY(CAST(:eligibility_role_codes AS text[]))
+          )
+          SELECT ARRAY(SELECT code FROM eligible WHERE CAST(:candidate_roles AS text[]) IS NULL
+            OR code = ANY(CAST(:candidate_roles AS text[]))) AS roles
+        ) discovery_eligibility
+        """
+        eligibility_sql = f"""
+          AND COALESCE(NULLIF(BTRIM(metadata->>'player_name'), ''), NULLIF(BTRIM(metadata->>'name'), '')) IS NOT NULL
+          AND NULLIF(BTRIM(metadata->>'team_name'), '') IS NOT NULL
+          AND NULLIF(BTRIM(metadata->>'league_name'), '') IS NOT NULL
+          AND NULLIF(BTRIM(metadata->>'nationality_name'), '') IS NOT NULL
+          AND {age} > 0 AND {age} <= 1.7976931348623157e308::numeric
+          AND CARDINALITY(discovery_eligibility.roles) > 0
+          AND {minutes} > 0 AND {matches} > 0
+          AND {minutes} * {matches} >= 90
+          AND (SELECT COUNT(DISTINCT CAST(:eligibility_metric_names AS jsonb)->>field.key)
+               FROM jsonb_each_text(metadata) AS field(key, value)
+               WHERE CAST(:eligibility_metric_names AS jsonb) ? field.key
+                 AND CASE WHEN field.value ~ :eligibility_numeric_pattern
+                     THEN ABS(field.value::numeric) <= 1.7976931348623157e308::numeric
+                     ELSE FALSE END) >= CASE WHEN 'GK' = ANY(discovery_eligibility.roles) THEN 15 ELSE 25 END
+        """
+        eligibility_params = {
+            'eligibility_role_names': json.dumps(role_names),
+            'eligibility_role_codes': list(ROLE_SHORT_TO_LONG),
+            'eligibility_metric_names': json.dumps(discovery_metric_names),
+            'eligibility_numeric_pattern': numeric_pattern,
+        }
+
     query = text(f"""
         SELECT id, {content_sql} AS content, {image_sql} AS image_url
         FROM {table_name}
         {image_join}
-        WHERE (
+        {eligibility_join}
+        WHERE TRUE {eligibility_sql}
+          AND (
                 :name_q IS NULL
                 OR metadata->>'player_name' ILIKE :name_q
                 OR metadata->>'player_name_norm' ILIKE :name_norm_q
@@ -170,6 +235,7 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
               )
           AND (
                 CAST(:candidate_roles AS text[]) IS NULL
+                OR {"TRUE" if discovery_metric_names is not None else "FALSE"}
                 OR {role_short_sql()} = ANY(CAST(:candidate_roles AS text[]))
                 OR EXISTS (
                     SELECT 1 FROM jsonb_object_keys(
@@ -338,9 +404,10 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
         LIMIT :limit
     """)
 
-    rows = db.execute(
+    result = db.execute(
         query,
         {
+            **eligibility_params,
             "metadata_fields": metadata_fields,
             "name_q": f"%{name}%" if name else None,
             "name_norm_q": f"%{name_norm}%" if name_norm else None,
@@ -373,9 +440,18 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
             "contract_end_date": contract_end_date,
             "limit": None if all_matches else int(filters.get("limit") or SEARCH_LIMIT),
         },
-    ).mappings().all()
+        execution_options={"stream_results": True, "yield_per": batch_size} if batch_size else {},
+    ).mappings()
 
-    return _player_rows(rows)
+    if batch_size:
+        def batches():
+            try:
+                for partition in result.partitions(batch_size):
+                    yield from _player_rows(partition)
+            finally:
+                result.close()
+        return batches()
+    return _player_rows(result.all())
 
 
 def _player_rows(rows) -> List[Dict[str, Any]]:
