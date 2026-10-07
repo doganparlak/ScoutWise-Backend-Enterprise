@@ -1,6 +1,7 @@
 from __future__ import annotations
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
+from typing import Literal
 from pydantic import BaseModel, Field, create_model, model_validator
 from sqlalchemy import text
 from fastapi import HTTPException
@@ -31,6 +32,19 @@ class LeagueFitInsightsIn(LeagueFitIn):
 class CategoryInsight(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     metrics: list[str] = Field(min_length=1, max_length=5)
+
+
+def league_fit_insight_model(categories):
+    fields = {}
+    for category in categories:
+        names = tuple(metric.metric for metric in category.metrics)
+        count = min(5, len(names))
+        selection = create_model(f'EnterpriseLeagueFit_{category.key}', __base__=CategoryInsight,
+            metrics=(list[Literal[names]] if names else list[str], Field(min_length=count, max_length=count)))
+        fields[category.key] = (selection, ...)
+    return create_model('LeagueFitPerspectives',
+        overall=(str, Field(min_length=1, max_length=1000)),
+        recommendation=(str, Field(min_length=1, max_length=1000)), **fields)
 
 
 def league_fit_data(db, payload):
@@ -64,12 +78,12 @@ Use ONLY the provided metric keys in the structured response, never translate ke
 def league_fit_insights(db, payload, language):
     from chatbot_module.chatbot import CHAT_LLM
     context = league_fit_data(db, payload)
-    output = create_model('LeagueFitPerspectives', overall=(str, Field(min_length=1, max_length=1000)), recommendation=(str, Field(min_length=1, max_length=1000)), **{c.key: (CategoryInsight, ...) for c in payload.categories})
+    output = league_fit_insight_model(payload.categories)
     evidence = {'output_language': 'Turkish' if normalize_lang(language) == 'tr' else 'English', 'player': context['playerName'], 'league': context['league']['content']['league_name'], 'roles': context['roles'], 'cohortPlayers': context['league']['content']['player_count'], 'metric_value_order': ['candidate', 'positional league average'], 'categories': [c.model_dump() for c in payload.categories]}
     evidence['discovery_context'] = payload.discoveryContext.model_dump() if payload.discoveryContext else None
     try:
         result = CHAT_LLM.with_structured_output(output).invoke([('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))])
-        result = result if isinstance(result, output) else output.model_validate(result)
+        result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
         values = result.model_dump()
         categories = []
         for category in payload.categories:

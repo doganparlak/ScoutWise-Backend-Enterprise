@@ -5,10 +5,10 @@ import json
 import math
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Literal
+from typing import Literal, Union
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from sqlalchemy import text
 
 from api_module.utilities import normalize_lang
@@ -44,6 +44,23 @@ class FitInsights(BaseModel):
     peers: list[PeerInsight]
     fit: FitSection
     recommendation: FitSection
+
+
+def team_fit_insight_model(candidate_stats, team_stats, peers):
+    def metric_field(names):
+        names = tuple(sorted(names))
+        return (list[Literal[names]] if names else list[str],
+                Field(min_length=min(4, len(names)), max_length=min(5, len(names))))
+    section_model = create_model('EnterpriseTeamContextFitSection', __base__=FitSection,
+        playerMetrics=metric_field(candidate_stats), teamMetrics=metric_field(team_stats))
+    peer_models = [create_model(f'EnterpriseTeamPeer_{peer["playerId"]}', __base__=PeerInsight,
+        playerId=(Literal[peer['playerId']], ...),
+        text=(str, Field(min_length=1, max_length=650, pattern=r'\S')),
+        metrics=metric_field(peer['common_metrics'])) for peer in peers]
+    peer_type = peer_models[0] if len(peer_models) == 1 else Union[tuple(peer_models)] if peer_models else PeerInsight
+    return create_model('EnterpriseTeamFitInsights', __base__=FitInsights,
+        peers=(list[peer_type], Field(min_length=len(peers), max_length=len(peers))),
+        fit=(section_model, ...), recommendation=(section_model, ...))
 
 
 ROLE_NAMES = {
@@ -165,6 +182,14 @@ def target_metrics(metadata):
 def peer_metric(name):
     # Peer comparisons use action counts per 90, not scoring, assists or rate metrics.
     return not rate(name) and not any(word in name.lower() for word in ('goal', 'assist'))
+
+
+def comparable_peer_metrics(candidate_stats, peer_stats):
+    common = sorted(name for name in peer_stats if name in candidate_stats and peer_metric(name)
+                    and number(candidate_stats[name]) is not None and number(peer_stats[name]) is not None)
+    # Individual zeros remain valid, but a wholly inactive peer supplies no
+    # meaningful pair comparison. Leave the other analysis sections intact.
+    return common if any(number(peer_stats[name]) != 0 for name in common) else []
 
 
 def evidence_rows(names, available, subject, player):
@@ -326,6 +351,7 @@ def get_team_fit(db, payload: TeamFitIn, accept_language):
             peer_stats = stored_peer_metrics(competition_rows)
             common = sorted(name for name in peer_stats if name in candidate_stats and peer_metric(name))
             source = 'stored_target_team_records'
+        common = comparable_peer_metrics(candidate_stats, peer_stats)
         name = next((row.get('player_name') for row in [*rows, *competition_rows] if row.get('player_name')), None)
         image = next((row.get('player_image_url') or row.get('image_url') for row in [*rows, *competition_rows] if row.get('player_image_url') or row.get('image_url')), None)
         if name and common:
@@ -345,8 +371,9 @@ def get_team_fit(db, payload: TeamFitIn, accept_language):
     }
     evidence['discovery_context'] = payload.discoveryContext.model_dump() if payload.discoveryContext else None
     try:
-        result = CHAT_LLM.with_structured_output(FitInsights).invoke([('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))])
-        result = result if isinstance(result, FitInsights) else FitInsights.model_validate(result)
+        output = team_fit_insight_model(candidate_stats, team_stats, peers)
+        result = CHAT_LLM.with_structured_output(output).invoke([('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))])
+        result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
         response = build_result(result, candidate_stats, team_stats, peers, evidence['player']['name'], evidence['team']['name'], positional_stats,
                                 f"{evidence['team']['name']} · {'Rol ortalaması' if lang == 'tr' else 'Role average'}")
     except Exception as exc:
