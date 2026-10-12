@@ -171,6 +171,9 @@ class LeagueStandingsOut(BaseModel):
     seasonId: int
     seasonName: str | None = None
     tables: List[LeagueStandingsTable]
+    stageScoped: bool = False
+    qualifyingRounds: List[Dict[str, Any]] = Field(default_factory=list)
+    knockoutRounds: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class MatchAnalysisOptionsIn(BaseModel):
@@ -573,3 +576,4 @@ class LeagueInsightsIn(BaseModel):
     leagueId: int = Field(ge=1)
     seasonId: int = Field(ge=1)
     periodStart: CalendarDate | None = None
+    scope: Literal["qualifying", "league", "knockout", "overall"] | None = None

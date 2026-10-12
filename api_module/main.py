@@ -3694,7 +3694,7 @@ def stop_league_insights_worker():
 def league_insights(payload: LeagueInsightsIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     del user_id
     try:
-        return request_summary(db, payload.leagueId, payload.seasonId, payload.periodStart)
+        return request_summary(db, payload.leagueId, payload.seasonId, payload.periodStart, payload.scope)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

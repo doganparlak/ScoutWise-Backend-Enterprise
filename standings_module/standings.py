@@ -5,6 +5,8 @@ from typing import Any
 
 import requests
 
+from .stages import EUROPEAN_LEAGUES, knockout_rounds, stage_scope
+
 
 SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
@@ -15,22 +17,23 @@ class StandingsError(RuntimeError):
     pass
 
 
+def provider_get(path: str, **params):
+    try:
+        response = requests.get(f'{SPORTMONKS_BASE_URL}/{path}', params=params, timeout=45)
+        if response.status_code != 200:
+            raise StandingsError(f'ScoutWise data request failed (HTTP {response.status_code})')
+        return response.json()
+    except (requests.RequestException, ValueError):
+        raise StandingsError('ScoutWise standings service is temporarily unavailable') from None
+
+
 def get_league_standings(league_id: int) -> dict[str, Any]:
     """Return grouped current-season standings and official position rules."""
     token = os.getenv("SPORTMONKS_API_KEY")
     if not token:
         raise StandingsError("ScoutWise data service is not configured")
 
-    league_response = requests.get(
-        f"{SPORTMONKS_BASE_URL}/leagues/{int(league_id)}",
-        params={"api_token": token, "include": "currentSeason"},
-        timeout=45,
-    )
-    if league_response.status_code != 200:
-        raise StandingsError(
-            f"ScoutWise league data request failed (HTTP {league_response.status_code})"
-        )
-    league = league_response.json().get("data") or {}
+    league = provider_get(f'leagues/{int(league_id)}', api_token=token, include='currentSeason').get('data') or {}
     season = (
         league.get("currentSeason")
         or league.get("currentseason")
@@ -41,18 +44,8 @@ def get_league_standings(league_id: int) -> dict[str, Any]:
     if not season_id:
         raise StandingsError("ScoutWise current season data is unavailable for this league")
 
-    response = requests.get(
-        f"{SPORTMONKS_BASE_URL}/standings/seasons/{season_id}",
-        params={
-            "api_token": token,
-            "include": "participant;details.type;form;season;stage;group;rule.type",
-        },
-        timeout=45,
-    )
-    if response.status_code != 200:
-        raise StandingsError(
-            f"ScoutWise standings request failed (HTTP {response.status_code})"
-        )
+    response = provider_get(f'standings/seasons/{season_id}', api_token=token,
+                            include='participant;details.type;form;season;stage;group;rule.type')
 
     aliases = {
         "games_played": "played", "played": "played", "overall_matches_played": "played",
@@ -64,7 +57,9 @@ def get_league_standings(league_id: int) -> dict[str, Any]:
         "goal_difference": "goalDifference", "goal difference": "goalDifference",
     }
     tables: dict[tuple[int | None, int | None], dict[str, Any]] = {}
-    for standing in response.json().get("data") or []:
+    for standing in response.get("data") or []:
+        if league_id in EUROPEAN_LEAGUES and stage_scope(standing.get("stage") or {}) != "league":
+            continue
         participant = standing.get("participant") or {}
         values: dict[str, Any] = {}
         for detail in standing.get("details") or []:
@@ -97,4 +92,8 @@ def get_league_standings(league_id: int) -> dict[str, Any]:
     for table in result_tables:
         table["rows"].sort(key=lambda row: (row["position"] is None, row["position"] or 9999))
     result_tables.sort(key=lambda table: (table["label"].casefold(), table["stageId"] or 0, table["groupId"] or 0))
-    return {"leagueId": int(league_id), "seasonId": season_id, "seasonName": season.get("name"), "tables": result_tables}
+    extra = {}
+    if league_id in EUROPEAN_LEAGUES:
+        stages = provider_get(f'schedules/seasons/{season_id}', api_token=token).get('data') or []
+        extra = {"stageScoped": True, "qualifyingRounds": knockout_rounds(stages, 'qualifying'), "knockoutRounds": knockout_rounds(stages)}
+    return {**extra, "leagueId": int(league_id), "seasonId": season_id, "seasonName": season.get("name"), "tables": result_tables}
