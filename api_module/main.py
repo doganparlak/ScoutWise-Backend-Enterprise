@@ -25,6 +25,7 @@ from scoutwise_pro_module.discovery import DiscoveryIn, discovery_config, discov
 from scoutwise_pro_module.strategy_fit import StrategyFitIn, strategy_fit
 from scoutwise_pro_module.league_fit import LeagueFitIn, LeagueFitInsightsIn, league_fit_data, league_fit_insights
 from api_module.database import SessionLocal, get_db
+from api_module.nec import router as nec_router
 from api_module.models import (
     LoginIn,
     LoginOut,
@@ -217,6 +218,7 @@ def require_enterprise_admin(db: Session, user_id: str, accept_language: str | N
         raise HTTPException(status_code=403, detail=msg("admin_only", accept_language))
 
 app = FastAPI(title="ScoutWise Enterprise Backend")
+app.include_router(nec_router)
 app.include_router(team_portfolio_router)
 
 origins_env = os.environ.get("CORS_ORIGINS")
