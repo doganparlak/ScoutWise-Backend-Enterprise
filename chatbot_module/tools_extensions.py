@@ -359,6 +359,7 @@ def fetch_player_nonzero_stats(
         "contract_team_name": doc_meta.get("contract_team_name"),
         "loan_end_date": doc_meta.get("loan_end_date"),
         "contract_end_date": doc_meta.get("contract_end_date"),
+        "end_date": doc_meta.get("end_date"),
         "id": doc.get("id"),
     }
     # Remove None (and empty-string) fields so caller never overwrites with blanks
@@ -450,6 +451,7 @@ def build_player_payload_new(meta: Dict[str, Any]) -> Dict[str, Any]:
                     "contract_team_name": resolved.get("contract_team_name", m.get("contract_team_name")),
                     "loan_end_date": resolved.get("loan_end_date", m.get("loan_end_date")),
                     "contract_end_date": resolved.get("contract_end_date", m.get("contract_end_date")),
+                    "end_date": resolved.get("end_date", m.get("end_date")),
                 },
                 "stats": stats or []
             })

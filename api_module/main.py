@@ -1346,6 +1346,7 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
         contractTeamName=data.get("contract_team_name"),
         loanEndDate=data.get("loan_end_date"),
         contractEndDate=data.get("contract_end_date"),
+        endDate=data.get("end_date"),
     )
 
 
@@ -1491,7 +1492,8 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
                    END AS contract_team_id,
                    pd.metadata->>'contract_team_name' AS contract_team_name,
                    pd.metadata->>'loan_end_date' AS loan_end_date,
-                   pd.metadata->>'contract_end_date' AS contract_end_date
+                   pd.metadata->>'contract_end_date' AS contract_end_date,
+                   pd.metadata->>'end_date' AS end_date
             FROM enterprise_favorite_players efp
             {favorite_join}
             WHERE efp.id = :favorite_id
@@ -2898,7 +2900,8 @@ def list_enterprise_favorite_players(
                END AS contract_team_id,
                pd.metadata->>'contract_team_name' AS contract_team_name,
                pd.metadata->>'loan_end_date' AS loan_end_date,
-               pd.metadata->>'contract_end_date' AS contract_end_date
+               pd.metadata->>'contract_end_date' AS contract_end_date,
+                   pd.metadata->>'end_date' AS end_date
         FROM enterprise_favorite_players efp
         {favorite_join}
         WHERE efp.user_id = :user_id
@@ -3070,7 +3073,8 @@ def save_enterprise_favorite_player(
                END AS contract_team_id,
                pd.metadata->>'contract_team_name' AS contract_team_name,
                pd.metadata->>'loan_end_date' AS loan_end_date,
-               pd.metadata->>'contract_end_date' AS contract_end_date
+               pd.metadata->>'contract_end_date' AS contract_end_date,
+                   pd.metadata->>'end_date' AS end_date
         FROM enterprise_favorite_players efp
         {favorite_join}
         WHERE efp.id = :id
@@ -3251,6 +3255,7 @@ def _apply_enterprise_club_row_to_report_payload(
     next_payload["contract_team_name"] = _metadata_text(metadata, "contract_team_name")
     next_payload["loan_end_date"] = _metadata_text(metadata, "loan_end_date")
     next_payload["contract_end_date"] = _metadata_text(metadata, "contract_end_date")
+    next_payload["end_date"] = _metadata_text(metadata, "end_date")
 
     roles = _metadata_roles(metadata)
     if roles:

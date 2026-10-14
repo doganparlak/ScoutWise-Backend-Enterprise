@@ -457,6 +457,7 @@ class EnterpriseFavoritePlayerOut(BaseModel):
     contractTeamName: Optional[str] = None
     loanEndDate: Optional[str] = None
     contractEndDate: Optional[str] = None
+    endDate: Optional[str] = None
 
 
 class EnterpriseScoutingReportIn(BaseModel):
