@@ -10,14 +10,15 @@ from typing import Any
 
 import requests
 
-from report_module.metric_validation import nonzero_evidence, percentage, rate_counts, valid_metric
+from report_module.metric_validation import is_percentage, is_standard_count, zero_fill_counts, nonzero_evidence, percentage, rate_counts, valid_metric
 from report_module.metric_cells import bind_metric_cells
 
 
 SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
-MATCH_REPORT_VERSION = 45
+MATCH_REPORT_VERSION = 47
+TEAM_ANALYSIS_REPORT_VERSION = 50
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -208,6 +209,8 @@ def _categorize(
             categories[group].append(item)
         else:
             extras.append(item)
+    if mapping is TEAM_METRIC_CATEGORY:
+        zero_fill_counts(categories, set(mapping.values()))
     return categories, extras
 
 
@@ -1403,7 +1406,9 @@ def build_team_report_metrics(
         if not team:
             continue
         match_values: dict[str, dict[str, float]] = {}
-        sources = dict(team.get("categories") or {})
+        from copy import deepcopy
+        sources = deepcopy(team.get("categories") or {})
+        zero_fill_counts(sources, set(TEAM_METRIC_CATEGORY.values()))
         if team.get("expected_metrics"):
             sources["expected"] = team.get("expected_metrics") or []
         for group, metrics in sources.items():
@@ -1479,17 +1484,14 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
     """Prepare player evidence without changing raw single-match reports.
 
     Infer omitted counts only when another participant has that metric in the
-    same fixture. Require 90 covered minutes per metric, including rate inputs.
+    same fixture. Advanced metrics stay unknown. Require 90 covered minutes
+    per metric, including rate inputs.
     """
     from copy import deepcopy
     from math import isfinite
 
     reports = deepcopy(reports)
     players = defaultdict(list)
-
-    def rate(name):
-        return "%" in name or any(word in name.casefold() for word in
-            ("rating", "percentage", "performance", "captain"))
 
     def sources(row):
         return {**(row.get("categories") or {}), "expected": row.get("expected_metrics") or []}
@@ -1513,15 +1515,12 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
                 continue
             participants.append((row, metrics, minutes))
             covered.update(key for key, item in metrics.items()
-                           if key[1] != "Minutes Played" and not rate(key[1])
+                           if is_standard_count(key[1], key[0])
                            and numeric(item.get("value")) is not None)
         for row, metrics, minutes in participants:
             for group, name in covered - metrics.keys():
                 item = {"name": name, "value": 0.0, "_inferred_zero": True}
-                if group == "expected":
-                    row.setdefault("expected_metrics", []).append(item)
-                else:
-                    row.setdefault("categories", {}).setdefault(group, []).append(item)
+                row.setdefault("categories", {}).setdefault(group, []).append(item)
                 metrics[group, name] = item
             players[(row.get("team_id"), row.get("player_id") or row.get("player_name"))].append((row, metrics, minutes))
 
@@ -1537,8 +1536,8 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
         for group in groups:
             for name, (numerator, denominator) in DERIVED_PERCENTAGE_METRICS.items():
                 pairs = [(rate_counts(name, {metric_name: item.get("value")
-                                              for (_, metric_name), item in metrics.items()
-                                              if not item.get("_inferred_zero")}, numerator, denominator), minutes)
+                                              for (metric_group, metric_name), item in metrics.items()
+                                              if metric_group == group and not item.get("_inferred_zero")}, numerator, denominator), minutes)
                          for _, metrics, minutes in samples]
                 pairs = [(pair[0], pair[1], minutes) for pair, minutes in pairs if pair is not None]
                 covered_minutes = sum(minutes for _, _, minutes in pairs)
@@ -1842,7 +1841,7 @@ def build_team_report_attack_profile(
                 value = raw_value if average else raw_value / sum(minutes for _, minutes in samples) * 90
                 if not valid_metric(name, round(value, 2), nonzero=True):
                     continue
-                compact[group][name] = {"value": round(value, 2), "basis": "rate" if average else "per90"}
+                compact[group][name] = {"value": round(value, 2), "basis": "rate" if is_percentage(name) else "average" if average else "per90"}
                 if any(word in normalized for word in ("goal", "assist", "shot", "key pass", "chance", "expected goal", "expected assist", "xg", "xa")):
                     weight = 5 if "goal" in normalized and "expected" not in normalized else 3 if "assist" in normalized else 1
                     attack_score += max(0, raw_value) * weight
@@ -2364,7 +2363,7 @@ def build_team_report_strengths(
     """Identify three evidence-supported team strengths from all metric categories."""
     team_name = next((str(team.get("name") or "") for report in reports for team in report.get("teams") or [] if int(team.get("id") or 0) == int(team_id)), "Takım" if lang == "tr" else "The team")
     evidence = {
-        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": row.get("aggregation") in {"average", "derived_rate"}} for row in rows if row.get("name") and row.get("perMatch") is not None]
+        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": is_percentage(str(row.get("name") or ""))} for row in rows if row.get("name") and row.get("perMatch") is not None]
         for group, rows in team_metrics.items() if rows
     }
     flat = [(group, str(row["name"]), row["valuePerMatch"], "rate" if row["isRate"] else "perMatch") for group, rows in evidence.items() for row in rows]
@@ -2441,7 +2440,7 @@ def build_team_report_weaknesses(
     """Identify three evidence-supported team vulnerabilities from all metric categories."""
     team_name = next((str(team.get("name") or "") for report in reports for team in report.get("teams") or [] if int(team.get("id") or 0) == int(team_id)), "Takım" if lang == "tr" else "The team")
     evidence = {
-        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": row.get("aggregation") in {"average", "derived_rate"}, "evidenceDirection": (
+        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": is_percentage(str(row.get("name") or "")), "evidenceDirection": (
             "adverse" if any(word in str(row.get("name") or "").casefold() for word in ("missed", "lost", "error", "foul", "card", "off target", "conceded")) else
             "positive_output" if any(word in str(row.get("name") or "").casefold() for word in ("expected goal", "expected assist", "goals", "assists", "accurate", "won", "on target", "chances created")) else
             "contextual"
@@ -2456,9 +2455,15 @@ def build_team_report_weaknesses(
         for metric in theme.get("metrics") or [] if isinstance(metric, dict)
         if str(metric.get("label") or "").strip()
     }
+    adverse_metric_names = {
+        row["name"] for rows in evidence.values() for row in rows
+        if row["evidenceDirection"] == "adverse"
+    }
     weakness_visible_flat = [
         row for row in flat
-        if row[1] not in strength_metric_names
+        if valid_metric(row[1], row[2])
+        and not (row[1] in adverse_metric_names and float(row[2]) <= 0)
+        and row[1] not in strength_metric_names
         and not any(word in row[1].casefold() for word in ("expected goal", "expected assist", "xg", "xa"))
     ]
 
@@ -2479,7 +2484,7 @@ def build_team_report_weaknesses(
         chosen = []
         for row in ranked:
             key = (row[0], row[1])
-            if key in used:
+            if key in used or not any(word in row[1].casefold() for word in keywords):
                 continue
             chosen.append(row)
             used.add(key)
@@ -2496,14 +2501,14 @@ def build_team_report_weaknesses(
                 "The weakness is shaped not only by negative-event volume, but by difficulty restoring balance after the first action. When success rates and loss indicators separate, the issue becomes more repeatable and limits secure progression into the next phase.",
             ]),
         })
-    fallback = {"themes": fallback_themes}
+    fallback = {"themes": [theme for theme in fallback_themes if theme["metrics"]]}
     if not flat or not os.getenv("OPENAI_API_KEY"):
         return fallback
     try:
         from langchain_openai import ChatOpenAI
         response = ChatOpenAI(model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")), api_key=os.environ["OPENAI_API_KEY"], temperature=.25).invoke([
-            ("system", "You are ScoutWise Enterprise's senior team-performance analyst. Return only valid JSON with exactly themes. themes must be an array of exactly THREE dynamically named, non-overlapping team weaknesses inferred from ALL supplied metric categories. CONFIRMED_STRENGTHS is binding editorial context: never describe a confirmed strength, its visible metrics, or the same causal relationship as a weakness. A genuine trade-off may be discussed only when distinct adverse evidence explicitly proves its separate cost. Do not use fixed generic headings. Every theme must contain exactly title, metrics and analysis. metrics must contain exactly FOUR objects with exactly label and value; copy each metric label EXACTLY from the supplied evidence and use one numeric value only. Select the four most diagnostic visible metrics for that weakness, but use every related supplied metric internally when interpreting it. evidenceDirection is binding: adverse metrics may directly support a weakness; contextual metrics require a demonstrated relationship; positive_output metrics must NEVER be treated as weak merely because their value seems low or high without an external benchmark. Expected-goal production—including set-play expected goals—is positive chance-production evidence and must not appear as weakness evidence unless a directly supplied matching outcome proves under-conversion. Do not combine low crossing accuracy with strong set-play expected-goal production and call both evidence of the same weakness. analysis MUST be a JSON array of 2-3 complete professional strings, each 45-70 words. Lead with a direct team-specific conclusion about the recurring vulnerability, connect volume, efficiency, errors and outcome where supported, and explain its practical football cost. At least 80% of each bullet must be inference; use at most one short numerical fact per bullet and never enumerate a statistical line. Diagnose weaknesses directly without praise, recommendations or softening language. Do not claim inferiority to external teams or leagues because no benchmark is supplied; identify internal inefficiency, imbalance, dependency or repeated exposure from relationships within the supplied evidence. Never invent tactics, roles, causation or unavailable context. Team volume metrics are per-match averages, not per 90 minutes; never write /90. Rate metrics retain percentages. In Turkish use established professional football terminology. Never use 'teslimat' for a cross or set-piece service; use 'servis', 'orta' or 'topun doğru bölgeye gönderilmesi'. Never use 'sürtünme'; use 'verim kaybı', 'üretim kopukluğu' or 'tehdide dönüşüm sorunu'. Never explain missing or irrelevant metrics. No markdown."),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam: {team_name}\nCONFIRMED_STRENGTHS: {json.dumps(confirmed_strengths, ensure_ascii=False)}\nAll aggregated team metrics: {json.dumps(evidence, ensure_ascii=False)}"),
+            ("system", "You are ScoutWise Enterprise's senior team-performance analyst. Return only valid JSON with exactly themes. themes must be an array of exactly THREE dynamically named, non-overlapping team weaknesses inferred from ALL supplied metric categories. CONFIRMED_STRENGTHS is binding editorial context: never describe a confirmed strength, its visible metrics, or the same causal relationship as a weakness. A genuine trade-off may be discussed only when distinct adverse evidence explicitly proves its separate cost. Do not use fixed generic headings. Every theme must contain exactly title, metrics and analysis. metrics must contain ONE to FOUR objects with exactly label and value; never pad a theme with irrelevant metrics. Zero adverse events (for example, zero red cards, errors or fouls) cannot support a weakness. Visible metrics must be chosen only from VISIBLE_WEAKNESS_METRICS, and the title and analysis must be supported by those same visible metrics. Other supplied metrics may provide context but cannot be the sole evidence for the headline conclusion; copy each metric label EXACTLY from the supplied evidence and use one numeric value only. Select up to four diagnostic visible metrics for that weakness, but use every related supplied metric internally when interpreting it. evidenceDirection is binding: adverse metrics may directly support a weakness; contextual metrics require a demonstrated relationship; positive_output metrics must NEVER be treated as weak merely because their value seems low or high without an external benchmark. Expected-goal production—including set-play expected goals—is positive chance-production evidence and must not appear as weakness evidence unless a directly supplied matching outcome proves under-conversion. Do not combine low crossing accuracy with strong set-play expected-goal production and call both evidence of the same weakness. analysis MUST be a JSON array of 2-3 complete professional strings, each 45-70 words. Lead with a direct team-specific conclusion about the recurring vulnerability, connect volume, efficiency, errors and outcome where supported, and explain its practical football cost. At least 80% of each bullet must be inference; use at most one short numerical fact per bullet and never enumerate a statistical line. Diagnose weaknesses directly without praise, recommendations or softening language. Do not claim inferiority to external teams or leagues because no benchmark is supplied; identify internal inefficiency, imbalance, dependency or repeated exposure from relationships within the supplied evidence. Never invent tactics, roles, causation or unavailable context. Team volume metrics are per-match averages, not per 90 minutes; never write /90. Rate metrics retain percentages. In Turkish use established professional football terminology. Never use 'teslimat' for a cross or set-piece service; use 'servis', 'orta' or 'topun doğru bölgeye gönderilmesi'. Never use 'sürtünme'; use 'verim kaybı', 'üretim kopukluğu' or 'tehdide dönüşüm sorunu'. Never explain missing or irrelevant metrics. No markdown."),
+            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam: {team_name}\nCONFIRMED_STRENGTHS: {json.dumps(confirmed_strengths, ensure_ascii=False)}\nVISIBLE_WEAKNESS_METRICS: {json.dumps([metric_cell(name, value, basis) for _, name, value, basis in weakness_visible_flat], ensure_ascii=False)}\nAll aggregated team metrics: {json.dumps(evidence, ensure_ascii=False)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
         generated = parsed.get("themes") if isinstance(parsed, dict) and isinstance(parsed.get("themes"), list) else []
@@ -2523,11 +2528,23 @@ def build_team_report_weaknesses(
             }, 4)
             analysis_value = item.get("analysis")
             analysis = [naturalize(text) for text in analysis_value[:3] if isinstance(text, str) and text.strip()] if isinstance(analysis_value, list) else []
-            metrics_valid = len(metrics) == 4 and all(metric["label"] in valid_metric_names for metric in metrics)
-            themes.append({"title": naturalize(item.get("title") or fallback_theme["title"]), "metrics": metrics if metrics_valid else fallback_theme["metrics"], "analysis": analysis if len(analysis) >= 2 else fallback_theme["analysis"]})
+            selected_metrics = item.get("metrics")
+            metrics_valid = (
+                isinstance(selected_metrics, list)
+                and 1 <= len(selected_metrics) <= 4
+                and len(metrics) == len(selected_metrics)
+                and all(metric["label"] in valid_metric_names for metric in metrics)
+            )
+            title = naturalize(item.get("title"))
+            # A theme is one evidence-backed unit. Never keep model prose when
+            # substituting a different metric set underneath it.
+            if metrics_valid and title and len(analysis) >= 2:
+                themes.append({"title": title, "metrics": metrics, "analysis": analysis})
+            else:
+                themes.append(fallback_theme)
         if len(generated) != 3:
             print(f"[enterprise_team_report] event=weaknesses_validation_repair themes={len(generated)}")
-        return {"themes": themes}
+        return {"themes": [theme for theme in themes if theme["metrics"]]}
     except Exception as exc:
         print(f"[enterprise_team_report] event=weaknesses_fallback error={exc}")
         return fallback

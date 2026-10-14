@@ -115,7 +115,7 @@ from match_analysis_module.pre_match_report import build_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
 from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
 from report_module.metric_validation import sanitize_percentages, sanitize_player_highlights
-from match_report_module import MATCH_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
+from match_report_module import MATCH_REPORT_VERSION, TEAM_ANALYSIS_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
     get_player_season_rows,
@@ -2217,7 +2217,7 @@ def team_analysis_report_data(
         return stream_report(lambda db: team_analysis_report_data(payload, user_id, accept_language, db))
     fixture_ids = list(dict.fromkeys(payload.fixtureIds))
     lang = normalize_lang(accept_language) or "en"
-    job = begin_report(db, user_id, payload, lang, MATCH_REPORT_VERSION)
+    job = begin_report(db, user_id, payload, lang, TEAM_ANALYSIS_REPORT_VERSION)
     if job['content'] is not None:
         return TeamAnalysisReportOut(**{**job['content'], 'reportId': job['id']})
     def save_partial(content):

@@ -15,6 +15,45 @@ def is_percentage(name: str) -> bool:
     return '%' in name or 'percentage' in name.casefold()
 
 
+def is_standard_count(name: str, group: str = "") -> bool:
+    """Missing event counts are zero; advanced indices/rates remain unknown."""
+    lower = name.casefold()
+    return bool(name) and group != "expected" and not is_percentage(name) and not any(
+        word in lower for word in ("expected", "performance", "rating", "captain", "minutes played")
+    ) and not lower.startswith(("xg", "xa", "npxg"))
+
+
+def has_team_statistics(categories: dict[str, list[dict[str, Any]]]) -> bool:
+    """Require a recorded standard statistic before interpreting omissions as zero.
+
+    Advanced-only feeds and previously inferred zeros do not establish coverage.
+    An explicitly recorded zero is a valid statistic.
+    """
+    return any(
+        not row.get("_inferred_zero")
+        and valid_metric(str(row.get("name") or ""), row.get("value"))
+        and (is_standard_count(str(row.get("name") or ""), group)
+             or (group != "expected" and is_percentage(str(row.get("name") or ""))))
+        for group, rows in categories.items() for row in rows
+    )
+
+
+def zero_fill_counts(categories: dict[str, list[dict[str, Any]]],
+                     names: set[tuple[str, str]]) -> None:
+    """Fill omitted counts only when usable standard team statistics exist."""
+    if not has_team_statistics(categories):
+        return
+    for group, name in sorted(names):
+        if not is_standard_count(name, group):
+            continue
+        rows = categories.setdefault(group, [])
+        existing = next((row for row in rows if row.get("name") == name), None)
+        if existing is None:
+            rows.append({"name": name, "value": 0.0, "_inferred_zero": True})
+        elif numeric(existing.get("value")) is None:
+            existing["value"] = 0.0
+
+
 def valid_metric(name: str, value: Any, *, nonzero: bool = False) -> bool:
     number = numeric(value)
     return number is not None and (not nonzero or number != 0) and (

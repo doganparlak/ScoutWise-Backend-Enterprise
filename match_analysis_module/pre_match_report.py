@@ -19,7 +19,7 @@ from typing import Any
 
 import requests
 
-from report_module.metric_validation import nonzero_evidence, percentage, rate_counts, valid_metric
+from report_module.metric_validation import is_standard_count, nonzero_evidence, percentage, rate_counts, valid_metric
 
 from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
@@ -239,6 +239,7 @@ def _lineup_numeric_metrics(row: dict[str, Any]) -> dict[str, float]:
             and valid_metric(name, value)
             and name in PLAYER_METRIC_CATEGORY
             and name.casefold() not in _PLAYER_INSIGHT_EXCLUDED_METRICS
+            and is_standard_count(PLAYER_METRIC_CATEGORY[name][1], PLAYER_METRIC_CATEGORY[name][0])
             and "%" not in name
             and not any(term in name.casefold() for term in _PLAYER_RATE_METRIC_TERMS)
         ):
@@ -249,8 +250,7 @@ def _lineup_numeric_metrics(row: dict[str, Any]) -> dict[str, float]:
 def _match_covered_count_metrics(row: dict[str, Any], covered_names: set[str]) -> dict[str, float]:
     """Zero-fill omitted counts only when another player records them in this match.
 
-    This is our match-level coverage assumption, not a provider guarantee.
-    Explicit null/invalid values remain unknown; percentages are never zero-filled.
+    Explicit null/invalid values, advanced metrics and percentages stay unknown.
     """
     values = _lineup_numeric_metrics(row)
     present = {
@@ -359,7 +359,8 @@ def _aggregate_team_comparison(
 ) -> dict[str, list[dict[str, Any]]]:
     """Aggregate only metrics available in a team's selected fixtures.
 
-    Count metrics are summed and then shown per available match. Known rate
+    Standard counts include omitted zero events across all selected fixtures.
+    Advanced values retain their recorded-match denominator. Known rate
     metrics are recalculated from their aggregate numerator and denominator;
     other provider rates are averaged. Keeping matches_covered per metric makes
     the comparison robust when the provider omits a metric in part of a sample.
@@ -401,7 +402,8 @@ def _aggregate_team_comparison(
         for name, values in metrics.items():
             total = sum(values)
             average = total / len(values)
-            rate = "%" in name or "percentage" in name.casefold() or "performance" in name.casefold()
+            # Averaging an index does not make its unit a percentage.
+            is_average = "%" in name or "percentage" in name.casefold() or "performance" in name.casefold()
             numerator_denominator = DERIVED_PERCENTAGE_METRICS.get(name)
             pairs = [rate_counts(name, fixture_values.get(group, {}), *numerator_denominator)
                      for fixture_values in match_values] if numerator_denominator else []
@@ -413,8 +415,8 @@ def _aggregate_team_comparison(
                 "name": name,
                 # Per-match is the comparison default for multi-match samples.
                 "value": round(derived_rate, 2) if derived_rate is not None else round(average, 2),
-                "total": round(derived_rate if derived_rate is not None else average if rate else total, 2),
-                "aggregation": "derived_rate" if derived_rate is not None else "average" if rate else "per_match",
+                "total": round(derived_rate if derived_rate is not None else average if is_average else total, 2),
+                "aggregation": "derived_rate" if derived_rate is not None else "average" if is_average else "per_match",
                 "matches_covered": len(pairs) if numerator_denominator else len(values),
             })
         if rows:
@@ -561,11 +563,8 @@ def _team_recent_squad_usage(
         if formation_name:
             formation_counts[formation_name] += 1
 
-        # Only player-level statistics establish player-metric coverage.
-        # A metric seen solely in team totals is not sufficient evidence.
         covered_count_names = {
-            name
-            for lineup in fixture.get("lineups") or []
+            name for lineup in fixture.get("lineups") or []
             if (_metric_value(lineup, "Minutes Played") or 0) > 0
             for name in _lineup_numeric_metrics(lineup)
         }
@@ -604,8 +603,7 @@ def _team_recent_squad_usage(
                 count_metrics = _match_covered_count_metrics(row, covered_count_names)
                 for metric_name, metric_value in count_metrics.items():
                     player_metric_totals[player_id][metric_name] += metric_value
-                    # Include minutes for recorded values and match-covered
-                    # omitted counts, but not entirely unavailable metrics.
+                    # Include recorded and peer-covered omitted counts only.
                     player_metric_minutes[player_id][metric_name] += minutes
                 recorded_counts = _lineup_numeric_metrics(row)
                 for rate_name, (numerator_name, denominator_name) in _DERIVED_PLAYER_PERCENTAGES.items():
