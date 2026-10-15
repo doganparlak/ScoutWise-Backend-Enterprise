@@ -17,8 +17,8 @@ from report_module.metric_cells import bind_metric_cells
 SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
-MATCH_REPORT_VERSION = 47
-TEAM_ANALYSIS_REPORT_VERSION = 50
+MATCH_REPORT_VERSION = 49
+TEAM_ANALYSIS_REPORT_VERSION = 53
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -361,21 +361,28 @@ def _build_summary(teams: list[dict[str, Any]], events: list[dict[str, Any]], la
     away = next((team for team in teams if team.get("location") == "away"), teams[1])
     hi, ai = _team_stat_index(home), _team_stat_index(away)
     home_name, away_name = home.get("name"), away.get("name")
+    points = []
+    for name in ("Shots Total", "Ball Possession %", "Accurate Passes (%)"):
+        left, right = hi.get(name), ai.get(name)
+        if not (valid_metric(name, left, nonzero=True) and valid_metric(name, right, nonzero=True)):
+            continue
+        if lang == "tr":
+            if name == "Shots Total":
+                points.append(f"Toplam şut sayısı {home_name} için {left:g}, {away_name} için {right:g} oldu.")
+            elif name == "Ball Possession %":
+                points.append(f"Topa sahip olma dağılımı {home_name} %{left:g}, {away_name} %{right:g} olarak gerçekleşti.")
+            else:
+                points.append(f"Pas başarısı {home_name} için %{left:g}, {away_name} için %{right:g} oldu.")
+        elif name == "Shots Total":
+            points.append(f"{home_name} recorded {left:g} total shots and {away_name} recorded {right:g}.")
+        elif name == "Ball Possession %":
+            points.append(f"Possession finished at {left:g}% for {home_name} and {right:g}% for {away_name}.")
+        else:
+            points.append(f"Pass accuracy was {left:g}% for {home_name} and {right:g}% for {away_name}.")
     if lang == "tr":
-        points = [
-            f"{home_name} toplam şutlarda {hi.get('Shots Total', 0):g}-{ai.get('Shots Total', 0):g} üstünlük kurdu.",
-            f"Topa sahip olma dağılımı {home_name} %{hi.get('Ball Possession %', 0):g}, {away_name} %{ai.get('Ball Possession %', 0):g} olarak gerçekleşti.",
-            f"Pas başarısı {home_name} için %{hi.get('Accurate Passes (%)', 0):g}, {away_name} için %{ai.get('Accurate Passes (%)', 0):g} oldu.",
-        ]
         red_events = [event for event in events if str(event.get("type", "")).lower() == "redcard"]
         if red_events:
-            points.append(f"Maçta {len(red_events)} kırmızı kart olayı kaydedildi ve oyun dengesi değişti.")
-        return points
-    points = [
-        f"{home_name} led total shots {hi.get('Shots Total', 0):g}-{ai.get('Shots Total', 0):g}.",
-        f"Possession finished at {hi.get('Ball Possession %', 0):g}% for {home_name} and {ai.get('Ball Possession %', 0):g}% for {away_name}.",
-        f"Pass accuracy was {hi.get('Accurate Passes (%)', 0):g}% for {home_name} and {ai.get('Accurate Passes (%)', 0):g}% for {away_name}.",
-    ]
+            points.append(f"Maçta {len(red_events)} kırmızı kart olayı kaydedildi.")
     return points
 
 
@@ -390,7 +397,7 @@ def _build_scoutwise_perspective(report: dict[str, Any], lang: str) -> list[str]
             {
                 "name": team.get("name"),
                 "location": team.get("location"),
-                "metrics": _team_stat_index(team),
+                "metrics": nonzero_evidence({"all": _team_stat_index(team)})["all"],
             }
             for team in teams
         ],
@@ -555,7 +562,7 @@ def _build_team_analysis_perspectives(
                     item.get("name"): item.get("value")
                     for item in team.get("expected_metrics") or []
                 }
-            compact[scope][team.get("name")] = team_values
+            compact[scope][team.get("name")] = nonzero_evidence(team_values)
     fallback_label = "Genel ve yarı bazındaki değerler, iki takımın bu alandaki performans farklarını gösterir."
     fallback = {
         group: fallback_label
@@ -883,7 +890,7 @@ def _build_team_deep_analyses(report: dict[str, Any], lang: str) -> dict[str, li
                 item.get("name"): item.get("value")
                 for item in team.get("expected_metrics") or []
             }
-        return values
+        return nonzero_evidence(values)
 
     compact: dict[str, Any] = {"match": report.get("fixture"), "teams": {}}
     fallback_headers_tr = ["Oyun Kimliği", "Üretim ve Verimlilik", "Kadro Kullanımı", "Maçın Kırılma Anları", "Maç Yönetimi"]
@@ -1446,7 +1453,19 @@ def build_team_report_metrics(
                 "aggregation": "derived_rate" if derived_rate is not None else "average" if is_average else "total",
                 "matchesCovered": len(pairs) if numerator_denominator else len(values),
             })
-        aggregate[group].sort(key=lambda row: row["name"])
+        # Keep zero samples in the calculations, but hide zero aggregate rows.
+        aggregate[group] = sorted(
+            (row for row in aggregate[group] if valid_metric(row["name"], row["value"], nonzero=True)),
+            key=lambda row: row["name"],
+        )
+    aggregate = {group: rows for group, rows in aggregate.items() if rows}
+    # Narrative evidence is filtered after arithmetic, so zero samples still
+    # contribute to denominators without becoming analytical highlights.
+    narrative_match_rows = []
+    for row in match_rows:
+        metrics = {group: values for group, values in nonzero_evidence(row["metrics"]).items() if values}
+        if metrics:
+            narrative_match_rows.append({"fixture": row["fixture"], "metrics": metrics})
     emit_progress({"teamMetrics": aggregate}, "teamMetrics")
     available = list(aggregate)
     fallback_text = (
@@ -1465,7 +1484,7 @@ def build_team_report_metrics(
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
             ("system", "You are ScoutWise Enterprise's senior football team analyst. Return only one valid JSON object whose top-level keys MUST be copied character-for-character from REQUIRED_JSON_KEYS. Never translate, rename, title-case or omit those machine keys. Translate metric concepts only inside each string value. For every required key, write one evidence-led interpretation of 50-75 words in the requested language. Analyse only the named team across the selected matches; never compare it with opponents. The output must prioritise football conclusions, not recite the data: use at most two short numerical facts as evidence, then immediately explain what their relationship indicates about efficiency, consistency, risk, control, or recurring performance structure. Never state both the total and per-match version of the same metric; choose whichever is more informative. Do not enumerate metrics, repeat card values, report coverage counts, or walk through match-by-match ranges unless that variation directly supports the main conclusion. When the language is Turkish, every football term inside the values must be natural Turkish; the required JSON keys are the sole exception because they are machine identifiers and are not displayed. Use 2-3 cohesive sentences, with the evidence brief and the interpretation dominant. Never invent causation, tactical intent, external benchmarks, opponent comparisons, or unavailable facts. Do not use markdown or headings."),
-            ("human", f"Language: {language}\nREQUIRED_JSON_KEYS: {json.dumps(available, ensure_ascii=False)}\nAggregated team categories: {json.dumps(aggregate, ensure_ascii=False)}\nPer-match team values: {json.dumps(match_rows, ensure_ascii=False)}"),
+            ("human", f"Language: {language}\nREQUIRED_JSON_KEYS: {json.dumps(available, ensure_ascii=False)}\nAggregated team categories: {json.dumps(aggregate, ensure_ascii=False)}\nNon-zero per-match team values: {json.dumps(narrative_match_rows, ensure_ascii=False)}"),
         ])
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I)
         parsed = json.loads(raw)
@@ -1775,7 +1794,7 @@ def build_team_report_attack_profile(
             "name": row.get("name"),
             "valuePerMatch": row.get("perMatch"),
             "isRate": "%" in str(row.get("name") or "") or "percentage" in str(row.get("name") or "").casefold(),
-        } for row in rows]
+        } for row in rows if valid_metric(str(row.get("name") or ""), row.get("perMatch"), nonzero=True)]
         for group, rows in team_metrics.items()
         if group in attacking_groups and rows
     }
@@ -2051,7 +2070,7 @@ def build_team_report_defense_profile(
         return bool(name) and not any(word in str(name).casefold() for word in excluded)
 
     team_evidence = {
-        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": "%" in str(row.get("name") or "") or "percentage" in str(row.get("name") or "").casefold()} for row in rows if allowed(row.get("name"))]
+        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": "%" in str(row.get("name") or "") or "percentage" in str(row.get("name") or "").casefold()} for row in rows if allowed(row.get("name")) and valid_metric(str(row.get("name") or ""), row.get("perMatch"), nonzero=True)]
         for group, rows in team_metrics.items() if group in groups
     }
     team_evidence = {group: rows for group, rows in team_evidence.items() if rows}
@@ -2363,7 +2382,7 @@ def build_team_report_strengths(
     """Identify three evidence-supported team strengths from all metric categories."""
     team_name = next((str(team.get("name") or "") for report in reports for team in report.get("teams") or [] if int(team.get("id") or 0) == int(team_id)), "Takım" if lang == "tr" else "The team")
     evidence = {
-        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": is_percentage(str(row.get("name") or ""))} for row in rows if row.get("name") and row.get("perMatch") is not None]
+        group: [{"name": row.get("name"), "valuePerMatch": row.get("perMatch"), "isRate": is_percentage(str(row.get("name") or ""))} for row in rows if row.get("name") and valid_metric(str(row["name"]), row.get("perMatch"), nonzero=True)]
         for group, rows in team_metrics.items() if rows
     }
     flat = [(group, str(row["name"]), row["valuePerMatch"], "rate" if row["isRate"] else "perMatch") for group, rows in evidence.items() for row in rows]
@@ -2444,7 +2463,7 @@ def build_team_report_weaknesses(
             "adverse" if any(word in str(row.get("name") or "").casefold() for word in ("missed", "lost", "error", "foul", "card", "off target", "conceded")) else
             "positive_output" if any(word in str(row.get("name") or "").casefold() for word in ("expected goal", "expected assist", "goals", "assists", "accurate", "won", "on target", "chances created")) else
             "contextual"
-        )} for row in rows if row.get("name") and row.get("perMatch") is not None]
+        )} for row in rows if row.get("name") and valid_metric(str(row["name"]), row.get("perMatch"), nonzero=True)]
         for group, rows in team_metrics.items() if rows
     }
     flat = [(group, str(row["name"]), row["valuePerMatch"], "rate" if row["isRate"] else "perMatch") for group, rows in evidence.items() for row in rows]

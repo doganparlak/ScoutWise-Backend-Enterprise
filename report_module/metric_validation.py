@@ -86,6 +86,39 @@ def nonzero_evidence(groups: dict[str, Any]) -> dict[str, Any]:
             for group, metrics in groups.items()}
 
 
+def nonzero_metric_rows(groups: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Copy non-zero metric rows for interpretation, preserving raw calculations."""
+    result = {}
+    for group, rows in groups.items():
+        kept = [dict(row) for row in rows or [] if isinstance(row, dict)
+                and valid_metric(str(row.get("name") or ""), row.get("value"), nonzero=True)]
+        if kept:
+            result[group] = kept
+    return result
+
+
+def nonzero_report_metric_evidence(content: Any) -> Any:
+    """Filter metric collections in narrative snapshots; keep result/event context."""
+    if isinstance(content, list):
+        return [nonzero_report_metric_evidence(item) for item in content]
+    if not isinstance(content, dict):
+        return content
+    result = {}
+    for key, value in content.items():
+        if key in {"categories", "team_comparison"} and isinstance(value, dict):
+            result[key] = nonzero_metric_rows(value)
+        elif key in {"expected_metrics", "per90_metrics", "standout_metrics", "development_metrics"}:
+            if isinstance(value, list):
+                result[key] = nonzero_metric_rows({key: value}).get(key, [])
+            elif isinstance(value, dict):
+                result[key] = nonzero_evidence({key: value})[key]
+            else:
+                result[key] = value
+        else:
+            result[key] = nonzero_report_metric_evidence(value)
+    return result
+
+
 def sanitize_percentages(content: Any) -> Any:
     """Remove invalid percentage values from structured report snapshots."""
     if isinstance(content, list):

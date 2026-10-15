@@ -19,7 +19,7 @@ from typing import Any
 
 import requests
 
-from report_module.metric_validation import is_standard_count, nonzero_evidence, percentage, rate_counts, valid_metric
+from report_module.metric_validation import is_standard_count, nonzero_evidence, nonzero_metric_rows, nonzero_report_metric_evidence, percentage, rate_counts, valid_metric
 
 from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
@@ -1052,7 +1052,7 @@ def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str,
     for usage, team in zip(usages, teams):
         team_id = _as_int(team.get("id"))
         summary = usage.get("summary") or {}
-        categories = usage.get("team_comparison") or {}
+        categories = nonzero_metric_rows(usage.get("team_comparison") or {})
         compact.append({"team_id": team_id, "team_name": team.get("name"), "fixture_location": team.get("location"), "form": summary, "metrics": categories})
         fallback[str(team_id)] = {
             "positive": "Seçili maçlardaki üretim, takımın tekrar eden güçlü oyun alanlarını gösteriyor." if lang == "tr" else "The selected-match output reveals the team's recurring strengths.",
@@ -1111,16 +1111,17 @@ def _pre_match_team_comparison_perspectives(
     lang: str,
 ) -> dict[str, str]:
     """Create one evidence-led comparison interpretation for every category."""
+    comparisons = [nonzero_metric_rows(usage.get("team_comparison") or {}) for usage in usages]
     categories = sorted({
         category
-        for usage in usages
-        for category, metrics in (usage.get("team_comparison") or {}).items()
+        for comparison in comparisons
+        for category, metrics in comparison.items()
         if metrics
     })
     evidence = {
         category: {
-            str(team.get("name") or "Team"): (usage.get("team_comparison") or {}).get(category, [])
-            for usage, team in zip(usages, teams)
+            str(team.get("name") or "Team"): comparison.get(category, [])
+            for comparison, team in zip(comparisons, teams)
         }
         for category in categories
     }
@@ -1303,8 +1304,8 @@ def _pre_match_overview_summary(
     try:
         from langchain_openai import ChatOpenAI
         evidence = {
-            "teams": teams,
-            "recent_usage": usages,
+            "teams": nonzero_report_metric_evidence(teams),
+            "recent_usage": nonzero_report_metric_evidence(usages),
             "team_analysis": team_analysis,
             "momentum": momentum,
             "score_flow": score_flow,
