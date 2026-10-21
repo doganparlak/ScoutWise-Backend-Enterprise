@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from player_pool_module.utilities import player_name_pattern
+
 from report_module.metric_validation import percentage, sanitize_percentages, valid_metric
 
 from report_module.progress import emit_progress, is_streaming
@@ -1540,8 +1542,8 @@ def fetch_docs_for_favorite(
 
     name_raw = str(name).strip()
     name_norm = norm_name(name_raw)
-    name_raw_q = f"%{name_raw}%"
-    name_norm_q = f"%{name_norm}%"
+    name_raw_q = player_name_pattern(name_raw)
+    name_norm_q = player_name_pattern(name_norm)
 
     nat = player_identity.get("nationality")
     nat_raw = nat.strip() if isinstance(nat, str) else ""
