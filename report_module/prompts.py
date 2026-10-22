@@ -179,39 +179,37 @@ PHASE FIT
 - Forbidden in out-of-possession phase points: phrases equivalent to "waits for attacking transitions", "runs behind the opponent defense", "should take an attacking-focused role", "should not be used in the mid block", or "offside risk". If the player's defensive contribution is limited, frame the limitation as pressing/compactness/duel/positioning risk inside that defensive phase, not as permission to ignore the defensive phase.
 
 STRENGTHS
-- Provide exactly 6 bullet points.
+- Provide exactly 5 bullet points.
 - Each bullet must use a short small title before ":" that captures the specific strength.
 - After the title, write exactly 2 complete sentences: one for the strength itself, one for why it matters tactically.
-- The extra sixth bullet should add a distinct strength angle that is not already covered by the previous bullets,
-  such as adaptability, game-state value, pressure response, decision quality, role flexibility inside the observed role family,
-  or match-control impact. Keep it relevant to any position, including goalkeepers.
+- Cover five distinct, evidence-led strength angles without repetition. Adaptability, game-state value, pressure response, decision quality,
+  role flexibility inside the observed role family, or match-control impact may inform those five bullets. Keep them relevant to any position, including goalkeepers.
 - If a derived efficiency signal is strong for the player's role family, it may be used as a strength: finishing conversion or shot quality for attackers, assist efficiency for creators/passers, and dribble accuracy for carriers/wide players.
 
 POTENTIAL WEAKNESSES / CONCERNS
-- Provide exactly 6 bullet points.
+- Provide exactly 5 bullet points.
 - Each bullet must include a risk scenario (e.g., under pressure, vs. compact block, in transition),
   plus a mitigation or technical-director cue when possible.
 - Each bullet must use a short small title before ":" that captures the specific concern.
 - After the title, write exactly 2 complete sentences: one for the concern/risk, one for the mitigation or usage cue.
-- The extra sixth bullet should add a distinct concern angle that is not already covered by the previous bullets,
-  such as adaptation to match state, pressure tolerance, role-transfer risk inside the observed role family,
-  decision speed, recovery behavior, or concentration management. Keep it relevant to any position, including goalkeepers.
+- Cover five distinct, evidence-led concerns without repetition. Match-state adaptation, pressure tolerance, role-transfer risk inside the observed role family,
+  decision speed, recovery behavior, or concentration management may inform those five bullets. Keep them relevant to any position, including goalkeepers.
 - If a derived efficiency signal is clearly weak for the player's role family, it may be used as a concern or development cue; do not force it if the player's role does not naturally depend on that signal.
 
 CONCLUSION
-- Provide exactly 6 bullet points.
+- Provide exactly 5 bullet points.
 - Bullet 1 title MUST be "Role & System" if lang = "en", or "Rol & Sistem" if lang = "tr";
-  it must cover best-fit roles + system and why.
+  it must combine best-fit roles + system and why with realistic usage recommendation + best game-state match.
+  Integrate the usage advice into this same two-sentence bullet; keep its existing concise length, with no extra sentences or longer paragraph.
+  Do not output a separate "Usage Recommendation" / "Kullanım Önerisi" bullet.
 - Bullet 2 title MUST be "Development Focus" if lang = "en", or "Gelişim Odağı" if lang = "tr";
   it must cover the clearest development lever / swing skill.
-- Bullet 3 title MUST be "Usage Recommendation" if lang = "en", or "Kullanım Önerisi" if lang = "tr";
-  it must cover realistic usage recommendation + best game state match.
-- Bullet 4 title MUST be "In-Game Adaptability" if lang = "en", or "Maç İçi Esneklik" if lang = "tr";
+- Bullet 3 title MUST be "In-Game Adaptability" if lang = "en", or "Maç İçi Esneklik" if lang = "tr";
   it must evaluate how the player can adjust across match scenarios: scoreline, pressure level, game tempo,
   opponent block height, and team risk profile.
-- Bullet 5 title MUST be "In Possession" if lang = "en", or "Toplu Oyunda" if lang = "tr";
+- Bullet 4 title MUST be "In Possession" if lang = "en", or "Toplu Oyunda" if lang = "tr";
   it must recommend how to use the player when the team has the ball.
-- Bullet 6 title MUST be "Out of Possession" if lang = "en", or "Topsuz Oyunda" if lang = "tr";
+- Bullet 5 title MUST be "Out of Possession" if lang = "en", or "Topsuz Oyunda" if lang = "tr";
   it must recommend how to use the player when the team does not have the ball.
 - After each CONCLUSION title, write exactly 2 complete sentences: one for the recommendation, one for the practical tactical implication.
 - In Role & Usage, In Possession, and Development Focus, use derived efficiency signals when they make the recommendation more precise, especially for finishing role, creator role, or carry/1v1 role.

@@ -186,6 +186,19 @@ def reset_chat_session(db: Session, *, token: str) -> Dict[str, Any]:
     return {"ok": True, "session_id": token, "reset": True}
 
 
+def get_player_percentiles(db: Session, player_id: int) -> Dict[str, Any]:
+    """Read-only inspect data, bound to the selected player_data row ID."""
+    from report_module.percentiles import build_domestic_percentiles
+    from report_module.metric_validation import sanitize_percentages
+    if player_id <= 0:
+        raise HTTPException(status_code=422, detail="Invalid player ID")
+    row = db.execute(text("SELECT metadata FROM player_data WHERE id = :id LIMIT 1"),
+                     {"id": player_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return sanitize_percentages(build_domestic_percentiles(db, dict(row['metadata'] or {})))
+
+
 def send_chat(
     db: Session,
     *,

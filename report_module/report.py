@@ -4,6 +4,7 @@ from player_pool_module.utilities import player_name_pattern
 
 from report_module.metric_validation import percentage, sanitize_percentages, valid_metric
 
+from report_module.percentiles import build_domestic_percentiles
 from report_module.progress import emit_progress, is_streaming
 import time
 
@@ -44,7 +45,6 @@ _CONCLUSION_TITLES: Dict[str, Tuple[str, ...]] = {
     "en": (
         "Role & System",
         "Development Focus",
-        "Usage Recommendation",
         "In-Game Adaptability",
         "In Possession",
         "Out of Possession",
@@ -52,7 +52,6 @@ _CONCLUSION_TITLES: Dict[str, Tuple[str, ...]] = {
     "tr": (
         "Rol & Sistem",
         "Gelişim Odağı",
-        "Kullanım Önerisi",
         "Maç İçi Esneklik",
         "Toplu Oyunda",
         "Topsuz Oyunda",
@@ -85,7 +84,7 @@ def _normalize_report_narrative_titles(report_text: str, lang: str) -> str:
     """Make machine-owned conclusion labels deterministic before persistence.
 
     The LLM owns the narrative, but it must not own UI terminology. Replacing the
-    six ordered labels here also protects clients that do not translate report
+    five ordered labels here also protects clients that do not translate report
     labels themselves. Removing aliases from the body prevents output such as
     ``Topsuz Oyunda: Topsuz Oyunda: ...`` when the model repeats a label.
     """
@@ -1718,6 +1717,7 @@ def generate_report_content(
     version: int = 1,
     player_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    generation_started = time.perf_counter()
     identity = player_identity or {}
     docs = fetch_docs_for_favorite(db, player_identity=identity, limit_docs=30)
     player_card = build_player_card_from_docs(docs)
@@ -1753,6 +1753,8 @@ def generate_report_content(
         "player_identity": identity, "player_card": player_card,
         "metrics_docs": sanitize_percentages(docs), "report_text": "",
     }
+    source_metadata = (docs[0].get("metadata") or {}) if docs else {}
+    content_json["domestic_percentiles"] = build_domestic_percentiles(db, source_metadata)
     emit_progress(content_json, "statistics")
     inputs = {"input_text": _build_llm_input(player_card, docs), "lang": lang}
     if is_streaming():
@@ -1767,5 +1769,7 @@ def generate_report_content(
         report_text = report_chain.invoke(inputs) or ""
     report_text = _normalize_report_narrative_titles(report_text.strip(), lang)
     content_json["report_text"] = report_text
+    content_json["timing"] = {"generationMs": round((time.perf_counter() - generation_started) * 1000, 2),
+                              "percentileMs": content_json["domestic_percentiles"]["computationMs"]}
     emit_progress(content_json, "narrative")
     return {"content": report_text, "content_json": content_json}

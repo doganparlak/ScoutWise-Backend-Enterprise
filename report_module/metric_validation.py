@@ -135,7 +135,8 @@ def sanitize_percentages(content: Any) -> Any:
         return kept
     if isinstance(content, dict):
         return {key: sanitize_percentages(value) for key, value in content.items()
-                if not is_percentage(str(key)) or valid_metric(str(key), value)}
+                if not is_percentage(str(key)) or valid_metric(
+                    str(key), value.get("value") if isinstance(value, dict) and "value" in value else value)}
     return content
 
 
