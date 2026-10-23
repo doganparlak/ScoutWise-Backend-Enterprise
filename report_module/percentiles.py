@@ -2,7 +2,7 @@
 
 No metric is zero-filled. A player's league stints are combined before rates
 are derived. Percentiles use equal player weights, tied midranks, and the same
-450-minute and top-two/20-percentage-point position rules on both sides.
+300-minute and top-two/20-percentage-point position rules on both sides.
 """
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
@@ -13,9 +13,9 @@ from time import perf_counter
 from sqlalchemy import text
 from scoutwise_pro_module.team_fit import eligible_roles
 
-MIN_MINUTES = 450
+MIN_MINUTES = 300
 MIN_PEERS = 5
-BENCHMARK_VERSION = 3
+BENCHMARK_VERSION = 4
 POSITION_GROUPS = {
     'central_midfield': ('CDM', 'CM', 'CAM'),
     'full_back': ('LB', 'RB'),
