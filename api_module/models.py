@@ -433,6 +433,7 @@ class EnterpriseFavoritePlayerIn(BaseModel):
 
 
 class EnterpriseFavoritePlayerOut(BaseModel):
+    performanceMetadata: Dict[str, Any] = Field(default_factory=dict)
     id: str
     playerId: Optional[int] = None
     clubPlayerId: Optional[int] = None

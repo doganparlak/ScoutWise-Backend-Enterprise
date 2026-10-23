@@ -1331,6 +1331,7 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
         id=str(data["id"]),
         playerId=_metadata_int({"player_id": data.get("player_id")}, "player_id"),
         clubPlayerId=data.get("club_player_id"),
+        performanceMetadata=data.get("performance_metadata") or {},
         imageUrl=data.get("image_url"),
         name=data["name"],
         nationality=data.get("nationality"),
@@ -1499,7 +1500,8 @@ def _get_owned_enterprise_favorite(db: Session, favorite_id: str, user_id: str) 
                    pd.metadata->>'contract_team_name' AS contract_team_name,
                    pd.metadata->>'loan_end_date' AS loan_end_date,
                    pd.metadata->>'contract_end_date' AS contract_end_date,
-                   pd.metadata->>'end_date' AS end_date
+                   pd.metadata->>'end_date' AS end_date,
+                   pd.metadata AS performance_metadata
             FROM enterprise_favorite_players efp
             {favorite_join}
             WHERE efp.id = :favorite_id
@@ -2907,7 +2909,8 @@ def list_enterprise_favorite_players(
                pd.metadata->>'contract_team_name' AS contract_team_name,
                pd.metadata->>'loan_end_date' AS loan_end_date,
                pd.metadata->>'contract_end_date' AS contract_end_date,
-                   pd.metadata->>'end_date' AS end_date
+                   pd.metadata->>'end_date' AS end_date,
+                   pd.metadata AS performance_metadata
         FROM enterprise_favorite_players efp
         {favorite_join}
         WHERE efp.user_id = :user_id
@@ -3080,7 +3083,8 @@ def save_enterprise_favorite_player(
                pd.metadata->>'contract_team_name' AS contract_team_name,
                pd.metadata->>'loan_end_date' AS loan_end_date,
                pd.metadata->>'contract_end_date' AS contract_end_date,
-                   pd.metadata->>'end_date' AS end_date
+                   pd.metadata->>'end_date' AS end_date,
+                   pd.metadata AS performance_metadata
         FROM enterprise_favorite_players efp
         {favorite_join}
         WHERE efp.id = :id
