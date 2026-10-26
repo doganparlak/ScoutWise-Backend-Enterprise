@@ -114,6 +114,7 @@ from match_analysis_module.match_analysis import SportMonksError
 from match_analysis_module.pre_match_report import build_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
 from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
+from report_module.crossing_metrics import normalize_crossing_metrics
 from report_module.metric_validation import sanitize_percentages, sanitize_player_highlights
 from match_report_module import MATCH_REPORT_VERSION, TEAM_ANALYSIS_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
 from player_comp_season_module import (
@@ -665,7 +666,7 @@ def get_enterprise_dashboard_report(
         "favorite_player_id": str(row.get("cache_key") or row["id"]),
         "status": row["status"],
         "content": row["content"],
-        "content_json": sanitize_percentages(content_json),
+        "content_json": sanitize_percentages(normalize_crossing_metrics(content_json)),
         "language": row.get("language") or "en",
         "version": int(row.get("version") or 1),
     }
@@ -2701,7 +2702,7 @@ def open_enterprise_match_report(
     content = dict(row['report_content'])
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
-        content_json=sanitize_player_highlights(sanitize_percentages(content)),
+        content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(content))),
         language=content.get('language') or 'en', version=int(content.get('version') or 1),
     )
 
@@ -2748,7 +2749,7 @@ def create_enterprise_match_report(
         return EnterpriseMatchReportOut(
             favorite_match_id=str(row["id"]),
             status="ready",
-            content_json=sanitize_player_highlights(sanitize_percentages(cached)),
+            content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(cached))),
             language=lang,
             version=MATCH_REPORT_VERSION,
         )
