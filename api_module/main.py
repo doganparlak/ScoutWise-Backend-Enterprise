@@ -2250,22 +2250,35 @@ def team_analysis_report_data(
         emit_progress({"momentumPerspectives": momentum_perspectives}, "momentumPerspectives")
         regional_perspective = build_team_report_regional_perspective(reports, payload.teamId, lang)
         emit_progress({"regionalPerspective": regional_perspective}, "regionalPerspective")
+        from report_module.profile_evidence import profile_snapshot
         attack_profile = build_team_report_attack_profile(reports, payload.teamId, team_metrics, lang)
-        emit_progress({"attackProfile": attack_profile}, "attackProfile")
+        emit_progress({"attackProfile": profile_snapshot(attack_profile)}, "attackProfile")
         defense_profile = build_team_report_defense_profile(reports, payload.teamId, team_metrics, lang)
-        emit_progress({"defenseProfile": defense_profile}, "defenseProfile")
+        emit_progress({"defenseProfile": profile_snapshot(defense_profile)}, "defenseProfile")
         score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang)
         emit_progress({"scoreFlowProfile": score_flow_profile}, "scoreFlowProfile")
         strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang)
-        emit_progress({"strengths": strengths}, "strengths")
+        emit_progress({"strengths": profile_snapshot(strengths)}, "strengths")
         weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang)
-        emit_progress({"weaknesses": weaknesses}, "weaknesses")
+        emit_progress({"weaknesses": profile_snapshot(weaknesses)}, "weaknesses")
+        from report_module.profile_editor import review_team_profiles
+        reviewed = review_team_profiles({
+            "attackProfile": attack_profile, "defenseProfile": defense_profile,
+            "strengths": strengths, "weaknesses": weaknesses,
+        }, lang)
+        attack_profile, defense_profile = reviewed["attackProfile"], reviewed["defenseProfile"]
+        strengths, weaknesses = reviewed["strengths"], reviewed["weaknesses"]
+        emit_progress(reviewed, "profileReview")
         overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, momentum_perspectives, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
         emit_progress({"overview": overview}, "overview")
         result = TeamAnalysisReportOut(reportId=job['id'], reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
         finish_report(db, user_id, job, result.model_dump())
         return result
     except Exception as exc:
+        import traceback
+        frames = [f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
+                  for frame in traceback.extract_tb(exc.__traceback__)]
+        print(f"[enterprise_team_report] event=generation_failed error_type={type(exc).__name__} frames={frames}", flush=True)
         db.rollback()
         finish_report(db, user_id, job)
         if isinstance(exc, HTTPException):

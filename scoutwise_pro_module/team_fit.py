@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from report_module.analysis_quality import generate_grounded
+
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
 import math
@@ -372,7 +374,7 @@ def get_team_fit(db, payload: TeamFitIn, accept_language):
     evidence['discovery_context'] = payload.discoveryContext.model_dump() if payload.discoveryContext else None
     try:
         output = team_fit_insight_model(candidate_stats, team_stats, peers)
-        result = CHAT_LLM.with_structured_output(output).invoke([('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))])
+        result = generate_grounded(CHAT_LLM, output, [('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))], evidence)
         result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
         response = build_result(result, candidate_stats, team_stats, peers, evidence['player']['name'], evidence['team']['name'], positional_stats,
                                 f"{evidence['team']['name']} · {'Rol ortalaması' if lang == 'tr' else 'Role average'}")

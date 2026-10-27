@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from report_module.analysis_quality import generate_grounded
+
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
 from typing import Literal, Union, get_args
@@ -93,7 +95,7 @@ def strategy_fit(db, user_id, payload, language):
     evidence['discovery_context'] = payload.discoveryContext.model_dump() if payload.discoveryContext else None
     try:
         output = strategy_insight_model(available)
-        result = CHAT_LLM.with_structured_output(output).invoke([('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))])
+        result = generate_grounded(CHAT_LLM, output, [('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))], evidence)
         result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
         return {**resolve_insights(result, available), 'strategy': strategy}
     except Exception as exc:

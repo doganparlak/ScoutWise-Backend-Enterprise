@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from report_module.analysis_quality import generate_grounded
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
 from typing import Literal
@@ -82,7 +84,7 @@ def league_fit_insights(db, payload, language):
     evidence = {'output_language': 'Turkish' if normalize_lang(language) == 'tr' else 'English', 'player': context['playerName'], 'league': context['league']['content']['league_name'], 'roles': context['roles'], 'cohortPlayers': context['league']['content']['player_count'], 'metric_value_order': ['candidate', 'positional league average'], 'categories': [c.model_dump() for c in payload.categories]}
     evidence['discovery_context'] = payload.discoveryContext.model_dump() if payload.discoveryContext else None
     try:
-        result = CHAT_LLM.with_structured_output(output).invoke([('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))])
+        result = generate_grounded(CHAT_LLM, output, [('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))], evidence)
         result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
         values = result.model_dump()
         categories = []

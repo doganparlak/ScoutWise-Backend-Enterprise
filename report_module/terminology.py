@@ -7,10 +7,27 @@ Football language and editorial review:
   established football terminology and natural phrasing in the requested language.
 - Compose original prose in that language. Avoid literal translations, business
   jargon, abstract statistical expressions and unnatural word combinations.
+- In Turkish narrative, translate metric references into natural Turkish even
+  when the supplied evidence uses English identifiers. For example, Clearances
+  means 'top uzaklaştırma', Aerials Won means 'kazanılan hava topu mücadelesi',
+  Duels Won means 'kazanılan ikili mücadele', and Tackles Won means 'başarılı
+  topa müdahale'. For their percentage variants, describe the relevant success
+  rate naturally; never paste English names or '(%)' identifiers into sentences.
+  Preserve English identifiers ONLY in schema-owned keys and metric-cell label
+  fields that the UI translates, never in analysis, summary, text or narrative
+  title fields. This distinction overrides any general instruction to copy
+  supplied metric labels exactly. Established abbreviations such as xG may stay.
+- Avoid 'sıklık' and its inflected forms in Turkish narrative. Describe the
+  actual action, count, success rate or football contribution instead. Do not
+  mechanically replace it with another abstract noun. Avoid empty phrases such
+  as 'müdahale sıklığının verimli karşılık bulması', 'temiz bir tamamlanma' and
+  'savunma sürekliliğine katkı'. State the supported football meaning plainly.
+  A duel success percentage measures success, not how often duels occur; a
+  tackle success percentage does not establish foul avoidance or clean contact.
 - In Turkish, use expressions familiar to Turkish football readers. Describe the
   underlying action or pattern directly: for example, prefer '75,98 kez topla
-  buluşma' to '75,98 dokunuşluk hacim'. For passes or shots, refer to the number or
-  frequency of passes or shots as appropriate, rather than mechanically using
+  buluşma' to '75,98 dokunuşluk hacim'. For passes or shots, refer to the
+  number of passes or shots as appropriate, rather than mechanically using
   'hacim'. These examples illustrate contextual phrasing, not a replacement list;
   apply the same editorial judgment to other awkward words and phrases.
 - In Turkish narrative, use 'dikine pas' / 'dikine paslar' rather than 'dikey
@@ -57,6 +74,11 @@ Football language and editorial review:
   not establish where play occurred. One match cannot establish a recurring
   habit, and changes after a substitution alone do not prove its causal effect.
   Do not invent hidden movements, intent, psychology or causation to sound deep.
+- Keep evidence limitations out of the finished narrative. Remove unsupported
+  clauses silently instead of adding statements such as 'the data cannot prove',
+  'there is insufficient evidence' or 'tek başına hüküm vermez'. Explain the
+  supported football relationship directly; do not turn the report into a
+  discussion of what its statistics cannot establish.
 - In short player perspectives, develop ONE central, position-relevant insight
   instead of walking through the player's stat line. Connect two relevant pieces
   of evidence internally, cite at most two diagnostic numerical values, and use
