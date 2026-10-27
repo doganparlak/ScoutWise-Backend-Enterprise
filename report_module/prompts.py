@@ -1,5 +1,7 @@
 # report_module/prompts.py
 
+from report_module.terminology import FOOTBALL_TERMINOLOGY_GUIDANCE
+
 report_system_prompt = """
 You are an expert football scouting analyst writing a premium, Pro-level report.
 
@@ -271,3 +273,5 @@ Rules:
 
 Now produce the report.
 """
+
+report_system_prompt += FOOTBALL_TERMINOLOGY_GUIDANCE
