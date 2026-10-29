@@ -2455,7 +2455,7 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
 
     content = {
         "report_type": "pre_match",
-        "pre_match_schema_version": 7,
+        "pre_match_schema_version": 8,
         "language": lang,
         "version": MATCH_REPORT_VERSION,
         "fixture": {
@@ -2755,7 +2755,7 @@ def create_enterprise_match_report(
         and cached.get("language") == lang
         and (
             report_type != "pre_match"
-            or cached.get("pre_match_schema_version") == 7
+            or cached.get("pre_match_schema_version") == 8
             or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
         )
     ):
