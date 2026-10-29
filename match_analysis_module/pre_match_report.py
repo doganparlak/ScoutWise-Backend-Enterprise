@@ -27,6 +27,8 @@ from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
 
 
+PRE_MATCH_SCHEMA_VERSION = 9
+
 _COMPLETED_STATES = {"FT", "AET", "PEN", "WO", "AP"}
 
 

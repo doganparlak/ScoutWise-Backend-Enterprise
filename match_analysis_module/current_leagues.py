@@ -126,3 +126,17 @@ def get_team_filter_options(db, country=None, league=None):
         'leagues': sorted({t['league_name'] for t in teams if t['league_name'] and (not country or t['league_country_name'] == country)}),
         'teams': sorted({t['team_name'] for t in teams if (not country or t['league_country_name'] == country) and (not league or t['league_name'] == league)}),
     }
+
+
+def get_team_selector_options(db):
+    teams = load_current_teams(db)
+    leagues = {team['league_id']: {'id':team['league_id'], 'name':team['league_name'],
+                                 'country':team['league_country_name'] or ''}
+               for team in teams if team['league_id'] is not None}
+    return {'leagueChoices':sorted(leagues.values(),key=lambda row:(row['country'],row['name'])),
+            'teamChoices':[{'id':team['team_id'],'name':team['team_name'],
+                            'leagueId':team['league_id'],
+                            'leagueIds':[team['league_id']] if team['league_id'] else []} for team in teams],
+            'countries':sorted({row['country'] for row in leagues.values() if row['country']}),
+            'leagues':sorted({row['name'] for row in leagues.values()}),
+            'teams':sorted({team['team_name'] for team in teams})}

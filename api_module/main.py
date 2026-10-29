@@ -111,7 +111,7 @@ from team_portfolio_module.portfolio import router as team_portfolio_router, beg
 from standings_module.search import get_league_performance_options, search_league_performance
 from match_analysis_module import get_fixture, get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
-from match_analysis_module.pre_match_report import build_recent_squad_usage
+from match_analysis_module.pre_match_report import PRE_MATCH_SCHEMA_VERSION, build_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
 from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
 from report_module.crossing_metrics import normalize_crossing_metrics
@@ -1344,6 +1344,7 @@ def _favorite_out(row: Any) -> EnterpriseFavoritePlayerOut:
         weight=data.get("weight"),
         team=data.get("team"),
         league=data.get("league"),
+        leagueCountry=data.get("league_country_name"),
         roles=[str(role) for role in roles_raw if str(role).strip()],
         positionCounts=position_counts,
         positionCountTotal=int(position_count_total or 0),
@@ -2155,6 +2156,9 @@ def match_analysis_options(
     db: Session = Depends(get_db),
 ):
     del user_id
+    if payload.includeChoices:
+        from match_analysis_module.fixture_search import fixture_choices
+        return fixture_choices(db)
     return get_match_filter_options(db, payload.country, payload.league)
 
 
@@ -2167,6 +2171,9 @@ def match_analysis_search(
     del user_id
     try:
         filters = payload.model_dump(exclude_none=True)
+        if payload.seasonSearch:
+            from match_analysis_module.fixture_search import search_season_fixtures
+            return search_season_fixtures(db, filters)
         if not filters.get("leagueId"):
             filters["leagueId"] = resolve_league_id(db, payload.league, payload.country)
         filters["homeTeamId"] = resolve_team_id(db, payload.homeTeam)
@@ -2184,7 +2191,9 @@ def team_pool_options(
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
-    from match_analysis_module.current_leagues import get_team_filter_options
+    from match_analysis_module.current_leagues import get_team_filter_options, get_team_selector_options
+    if payload.includeChoices:
+        return get_team_selector_options(db)
     return get_team_filter_options(db, payload.country, payload.league)
 
 
@@ -2196,7 +2205,7 @@ def team_pool_search(
 ):
     del user_id
     try:
-        return search_team_pool(db, payload.team, payload.country, payload.league, payload.limit)
+        return search_team_pool(db, payload.team, payload.country, payload.league, payload.limit, team_id=payload.teamId)
     except SportMonksError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -2455,7 +2464,7 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
 
     content = {
         "report_type": "pre_match",
-        "pre_match_schema_version": 8,
+        "pre_match_schema_version": PRE_MATCH_SCHEMA_VERSION,
         "language": lang,
         "version": MATCH_REPORT_VERSION,
         "fixture": {
@@ -2707,7 +2716,7 @@ def open_enterprise_match_report(
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
-    row = db.execute(text("""SELECT id, report_content FROM enterprise_favorite_matches
+    row = db.execute(text("""SELECT id, report_content, report_type, fixture_payload FROM enterprise_favorite_matches
         WHERE id=:id AND user_id=:user_id AND report_status='ready' AND report_content IS NOT NULL"""),
         {"id": str(favorite_id), "user_id": user_id}).mappings().first()
     if not row:
@@ -2715,6 +2724,10 @@ def open_enterprise_match_report(
     content = dict(row['report_content'])
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
+        requires_regeneration=(row['report_type'] == 'pre_match'
+            and _is_not_started_enterprise_fixture(dict(row['fixture_payload'] or {}))
+            and (content.get('pre_match_schema_version') != PRE_MATCH_SCHEMA_VERSION
+                 or content.get('version') != MATCH_REPORT_VERSION)),
         content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(content))),
         language=content.get('language') or 'en', version=int(content.get('version') or 1),
     )
@@ -2755,7 +2768,7 @@ def create_enterprise_match_report(
         and cached.get("language") == lang
         and (
             report_type != "pre_match"
-            or cached.get("pre_match_schema_version") == 8
+            or cached.get("pre_match_schema_version") == PRE_MATCH_SCHEMA_VERSION
             or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
         )
     ):
@@ -2932,7 +2945,28 @@ def list_enterprise_favorite_players(
         """.format(favorite_join=FAVORITE_PLAYER_DATA_IDENTITY_JOIN)),
         {"user_id": user_id},
     ).mappings().all()
-    return [_favorite_out(row) for row in rows]
+    league_names = list({row["league"] for row in rows if row.get("league")})
+    countries_by_league = {}
+    countries_by_team = {}
+    if league_names:
+        contexts = db.execute(text("""
+            SELECT DISTINCT league_name, team_name, league_country_name
+            FROM player_comp_data
+            WHERE league_name = ANY(CAST(:leagues AS text[]))
+              AND NULLIF(TRIM(league_country_name), '') IS NOT NULL
+        """), {"leagues": league_names}).mappings().all()
+        for context in contexts:
+            league = context["league_name"]
+            country = context["league_country_name"]
+            countries_by_league.setdefault(league, set()).add(country)
+            countries_by_team.setdefault((league, context["team_name"]), set()).add(country)
+    result = []
+    for row in rows:
+        data = dict(row)
+        countries = countries_by_team.get((row.get("league"), row.get("team"))) or countries_by_league.get(row.get("league"), set())
+        data["league_country_name"] = next(iter(countries)) if len(countries) == 1 else None
+        result.append(_favorite_out(data))
+    return result
 
 
 @app.post("/favorite-players", response_model=EnterpriseFavoritePlayerOut)

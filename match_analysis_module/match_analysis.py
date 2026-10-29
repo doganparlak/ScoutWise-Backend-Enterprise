@@ -99,9 +99,10 @@ def search_team_pool(
     country: str | None = None,
     league: str | None = None,
     limit: int = 50,
+    team_id: int | None = None,
 ) -> list[dict[str, Any]]:
     from .current_leagues import load_current_teams, fetch_current_league
-    candidates = [row for row in load_current_teams(db) if _matches(row['team_name'], team)]
+    candidates = [row for row in load_current_teams(db) if (team_id is None or int(row['team_id']) == team_id) and _matches(row['team_name'], team)]
     rows = []
     for candidate in candidates:
         row = dict(candidate)

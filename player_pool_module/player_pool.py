@@ -482,7 +482,7 @@ def fetch_player_rows_by_ids(db: Session, player_ids: List[int]) -> List[Dict[st
     return _player_rows(rows)
 
 
-def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) -> Dict[str, List[str]]:
+def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) -> Dict[str, Any]:
     table_name = player_pool_table(world_cup_mode)
 
     def distinct_metadata_values(field_name: str) -> List[str]:
@@ -535,7 +535,25 @@ def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) ->
             league_name for league_name in league_options if league_name not in countries_by_league
         ]
 
+    teams_by_league = {}
+    if not world_cup_mode:
+        memberships = db.execute(text(f"""
+            SELECT DISTINCT p.metadata->>'team_name' AS team,
+                p.metadata->>'league_name' AS league, c.league_country_name AS country
+            FROM {table_name} p
+            LEFT JOIN player_comp_data c ON c.player_id::text=p.metadata->>'player_id'
+                AND c.league_name=p.metadata->>'league_name'
+            WHERE COALESCE(p.metadata->>'team_name','') <> ''
+                AND COALESCE(p.metadata->>'league_name','') <> ''
+        """)).mappings().all()
+        for row in memberships:
+            labels = {row['league']}
+            if row['country']:
+                labels.add(f"{row['league']} | {row['country']}")
+            for label in labels:
+                teams_by_league.setdefault(label, set()).add(row['team'])
     return {
+        "teamsByLeague": {league:sorted(teams) for league,teams in teams_by_league.items()},
         "teams": distinct_metadata_values("team_name"),
         "leagues": league_options,
         "nationalities": distinct_metadata_values("nationality_name"),

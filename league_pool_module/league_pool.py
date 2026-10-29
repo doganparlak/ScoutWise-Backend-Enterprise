@@ -14,7 +14,7 @@ def get_league_pool_options(
     db: Session,
     leagues: List[str] | None = None,
     countries: List[str] | None = None,
-) -> Dict[str, List[str]]:
+) -> Dict[str, Any]:
     selected_leagues = _clean_many(leagues)
     selected_countries = _clean_many(countries)
     query = text("""
@@ -46,7 +46,11 @@ def get_league_pool_options(
             ) AS positions
     """)
     row = db.execute(query, {"leagues": selected_leagues, "countries": selected_countries}).mappings().one()
-    return {key: list(row[key] or []) for key in ("leagues", "countries", "positions")}
+    choices = db.execute(text("""SELECT DISTINCT league_name AS name, league_country_name AS country
+        FROM player_comp_data WHERE COALESCE(league_name,'') <> ''
+        AND COALESCE(league_country_name,'') <> '' ORDER BY country,name""")).mappings().all()
+    return {**{key:list(row[key] or []) for key in ("leagues", "countries", "positions")},
+            "leagueChoices":[dict(choice) for choice in choices]}
 
 
 def search_league_pool(db: Session, filters: Dict[str, Any], *, role_gap_filter: bool = False, excluded_player_id: int | None = None, min_total_minutes: float = 0) -> List[Dict[str, Any]]:

@@ -92,6 +92,7 @@ class PlayerPoolWeeklyPopularIn(BaseModel):
 
 
 class PlayerPoolFilterOptionsOut(BaseModel):
+    teamsByLeague: Dict[str, List[str]] = Field(default_factory=dict)
     teams: List[str]
     leagues: List[str]
     nationalities: List[str]
@@ -109,6 +110,7 @@ class LeaguePoolSearchIn(LeaguePoolFilterIn):
 
 
 class LeaguePoolFilterOptionsOut(BaseModel):
+    leagueChoices: List[Dict[str, str]] = Field(default_factory=list)
     leagues: List[str]
     countries: List[str]
     positions: List[str]
@@ -177,17 +179,21 @@ class LeagueStandingsOut(BaseModel):
 
 
 class MatchAnalysisOptionsIn(BaseModel):
+    includeChoices: bool = False
     country: Optional[str] = None
     league: Optional[str] = None
 
 
 class MatchAnalysisOptionsOut(BaseModel):
+    leagueChoices: List[Dict[str, Any]] = Field(default_factory=list)
+    teamChoices: List[Dict[str, Any]] = Field(default_factory=list)
     countries: List[str]
     leagues: List[str]
     teams: List[str]
 
 
 class TeamPoolSearchIn(BaseModel):
+    teamId: Optional[int] = Field(default=None, gt=0)
     team: Optional[str] = None
     country: Optional[str] = None
     league: Optional[str] = None
@@ -224,6 +230,8 @@ class TeamPlayedMatchRow(BaseModel):
 
 
 class MatchAnalysisSearchIn(BaseModel):
+    seasonSearch: bool = False
+    teamId: Optional[int] = Field(default=None, gt=0)
     country: Optional[str] = None
     league: Optional[str] = None
     leagueId: Optional[int] = None
@@ -254,6 +262,7 @@ class EnterpriseFavoriteMatchOut(BaseModel):
 
 
 class EnterpriseMatchReportOut(BaseModel):
+    requires_regeneration: bool = False
     favorite_match_id: str
     status: str
     content_json: Optional[Dict[str, Any]] = None
@@ -448,6 +457,7 @@ class EnterpriseFavoritePlayerOut(BaseModel):
     weight: Optional[str] = None
     team: Optional[str] = None
     league: Optional[str] = None
+    leagueCountry: Optional[str] = None
     roles: List[str] = Field(default_factory=list)
     positionCounts: Dict[str, int] = Field(default_factory=dict)
     positionCountTotal: int = 0
