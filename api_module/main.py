@@ -616,6 +616,8 @@ def delete_enterprise_dashboard_note(
 @app.get("/dashboard/reports", response_model=list[EnterpriseDashboardReportOut])
 def list_enterprise_dashboard_reports(
     limit: int = FastAPIQuery(default=12, ge=1, le=50),
+    offset: int = FastAPIQuery(default=0, ge=0),
+    ready_only: bool = False,
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -625,11 +627,12 @@ def list_enterprise_dashboard_reports(
             SELECT id, player_name, player_payload, content_json, status, language, version, ready_at, created_at, updated_at
             FROM enterprise_player_pool_scouting_reports
             WHERE user_id = :user_id
-            ORDER BY updated_at DESC
-            LIMIT :limit
+              AND (:ready_only = FALSE OR status = 'ready')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT :limit OFFSET :offset
             """
         ),
-        {"user_id": user_id, "limit": limit},
+        {"user_id": user_id, "limit": limit, "offset": offset, "ready_only": ready_only},
     ).fetchall()
     return [_dashboard_report_out(row) for row in rows]
 
@@ -675,6 +678,7 @@ def get_enterprise_dashboard_report(
 @app.get("/dashboard/match-reports")
 def list_enterprise_dashboard_match_reports(
     limit: int = FastAPIQuery(default=12, ge=1, le=50),
+    offset: int = FastAPIQuery(default=0, ge=0),
     report_type: str = FastAPIQuery(default="post_match", pattern="^(pre_match|post_match)$"),
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
@@ -689,11 +693,11 @@ def list_enterprise_dashboard_match_reports(
               AND COALESCE(report_type, 'post_match') = :report_type
               AND report_status = 'ready'
               AND report_content IS NOT NULL
-            ORDER BY report_ready_at DESC NULLS LAST, updated_at DESC
-            LIMIT :limit
+            ORDER BY report_ready_at DESC NULLS LAST, updated_at DESC, id DESC
+            LIMIT :limit OFFSET :offset
             """
         ),
-        {"user_id": user_id, "limit": limit, "report_type": report_type},
+        {"user_id": user_id, "limit": limit, "offset": offset, "report_type": report_type},
     ).mappings().all()
     return [
         {
