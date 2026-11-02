@@ -62,6 +62,13 @@ def save_team(db, user_id, team):
     return favorite_out(row)
 
 
+@router.get('/favorite-teams/ids')
+def favorite_team_ids(user_id: str = Depends(require_auth), db=Depends(get_db)):
+    ids = execute(db, 'SELECT team_id FROM enterprise_favorite_teams WHERE user_id=:user_id ORDER BY team_id',
+                  {'user_id': user_id}).scalars().all()
+    return {'teamIds': ids}
+
+
 @router.get('/favorite-teams')
 def list_teams(user_id: str = Depends(require_auth), db=Depends(get_db)):
     rows = execute(db, '''SELECT f.id,f.team_payload,f.created_at,f.updated_at, r.id AS latest_report_id

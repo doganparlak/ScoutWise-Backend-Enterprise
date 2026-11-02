@@ -2149,6 +2149,40 @@ def league_standings(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/match-analysis/calendar")
+def match_calendar(timezone: str = "Europe/Istanbul", user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from match_analysis_module.daily import calendar_bounds
+    try:
+        return calendar_bounds(db, timezone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/match-analysis/daily")
+def daily_matches(day: dt.date = FastAPIQuery(...), timezone: str = "Europe/Istanbul", user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from match_analysis_module.daily import daily_fixtures
+    try:
+        return daily_fixtures(db, day, timezone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.on_event("startup")
+def start_daily_match_cache():
+    from match_analysis_module.daily import start_daily_warmer
+    start_daily_warmer()
+
+
+@app.on_event("shutdown")
+def stop_daily_match_cache():
+    from match_analysis_module.daily import stop_daily_warmer
+    stop_daily_warmer()
+
+
 @app.post("/match-analysis/options", response_model=MatchAnalysisOptionsOut)
 def match_analysis_options(
     payload: MatchAnalysisOptionsIn = Body(default=MatchAnalysisOptionsIn()),
@@ -2381,7 +2415,7 @@ def _is_completed_enterprise_fixture(fixture: dict[str, Any]) -> bool:
 def _is_live_enterprise_fixture(fixture: dict[str, Any]) -> bool:
     state = fixture.get("state") or {}
     code = str(state.get("code") or state.get("short_name") or "").strip().upper().replace(" ", "_")
-    if code in {"LIVE", "HT", "1ST", "2ND", "ET", "PEN_LIVE", "BREAK", "INT", "SUSP"}:
+    if code in {"LIVE", "HT", "1ST", "2ND", "ET", "PEN_LIVE", "BREAK", "INT", "SUSP", "INPLAY_1ST_HALF", "INPLAY_2ND_HALF", "INPLAY_ET"}:
         return True
     name = str(state.get("name") or "").strip().casefold()
     return any(marker in name for marker in ("live", "in progress", "half time", "extra time", "penalty shootout"))
@@ -2392,7 +2426,7 @@ def _is_not_started_enterprise_fixture(fixture: dict[str, Any]) -> bool:
         return False
     state = fixture.get("state") or {}
     code = str(state.get("code") or state.get("short_name") or "").strip().upper().replace(" ", "_")
-    if code in {"NS", "TBA", "POSTP", "DELAYED"}:
+    if code in {"NS", "TBA", "POST", "POSTP", "DELAYED"}:
         return True
     name = str(state.get("name") or "").strip().casefold()
     return any(marker in name for marker in ("not started", "scheduled", "to be announced", "postponed", "delayed"))
@@ -2588,7 +2622,7 @@ def save_enterprise_favorite_match(
     db: Session = Depends(get_db),
 ):
     fixture = payload.fixture
-    if payload.reportType == "pre_match" and not _is_not_started_enterprise_fixture(fixture):
+    if payload.reportType == "pre_match" and not (_is_not_started_enterprise_fixture(fixture) or _is_live_enterprise_fixture(fixture)):
         raise HTTPException(
             status_code=409,
             detail="A pre-match report can only be saved before the match starts",
