@@ -35,7 +35,7 @@ def _artifact(key, load):
 def _load_model(cutoff):
     with engine.connect() as db:
         model_id = db.execute(text("""SELECT id FROM mobile_match_forecast_models
-            WHERE model_version=5 AND training_cutoff<:cutoff
+            WHERE model_version IN (6,5) AND training_cutoff<:cutoff
               AND validation_metrics->>'promotionApproved'='true'
             ORDER BY is_active DESC,training_cutoff DESC LIMIT 1"""), {'cutoff': cutoff}).scalar()
         if model_id is None:
@@ -57,7 +57,7 @@ def _load_model(cutoff):
                 model = {**model, **history}
     except SQLAlchemyError:
         _LOG.warning('Enterprise model profile: daily snapshot unavailable; using trained history')
-    if model.get('version') != 5 or model.get('featureSchema') != 3:
+    if model.get('version') not in (5,6) or model.get('featureSchema') != 3:
         return None
     return model
 
@@ -98,7 +98,7 @@ def build_model_profile(fixture, now=None):
             halves = {side: {'home': home['projectedGoals'] * (shares[0] if side == 'first' else 1 - shares[0]),
                              'away': away['projectedGoals'] * (shares[1] if side == 'first' else 1 - shares[1])}
                       for side in ('first', 'second')}
-        return {'status': 'ready', 'modelId': model['modelId'], 'modelVersion': 5,
+        return {'status': 'ready', 'modelId': model['modelId'], 'modelVersion': model.get('version', 5),
                 'asOf': forecast['asOf'], 'generatedAt': forecast['generatedAt'],
                 'home': {**{key: home.get(key) for key in ('id', 'name', 'imageUrl', 'projectedGoals')},
                          'observed': _observed(own)},
@@ -157,6 +157,8 @@ def enrich_model_profile(content, fixture):
     if content.get('report_type') != 'pre_match':
         return content
     profile = content.get('model_match_profile')
+    if f.utc(fixture['startingAt']) > datetime.now(timezone.utc):
+        return {**content, 'model_match_profile': build_model_profile(fixture)}
     if not profile:
         return {**content, 'model_match_profile': build_model_profile(fixture)}
     extended = _extend_saved_profile(profile)

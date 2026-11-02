@@ -1,4 +1,4 @@
-"""Serving-only v5 transforms; keep numerical parity with mobile runtime."""
+"""Serving-only v5/v6 transforms; keep numerical parity with mobile runtime."""
 from datetime import datetime, timezone
 import math
 
@@ -138,8 +138,10 @@ def build_forecast(fixture, cutoff, model):
     totals = {int(k): v for k, v in model['leagueTotals'].items()}
     ratings = {int(k): v for k, v in model['ratings'].items()}
     league = fixture['league']['id']
-    a = _rate(model, own, opponent, True, {**_context(totals, ratings, league, home['id'], away['id']), 'kickoff': fixture['startingAt']})
-    b = _rate(model, opponent, own, False, {**_context(totals, ratings, league, away['id'], home['id']), 'kickoff': fixture['startingAt']})
+    from .forecast_league_offsets import fixture_elo_gap, adjust_elo_context
+    gap = fixture_elo_gap(model, fixture)
+    a = _rate(model, own, opponent, True, {**adjust_elo_context(_context(totals, ratings, league, home['id'], away['id']), gap, True), 'kickoff': fixture['startingAt']})
+    b = _rate(model, opponent, own, False, {**adjust_elo_context(_context(totals, ratings, league, away['id'], home['id']), gap, False), 'kickoff': fixture['startingAt']})
     if model.get('refinedEnsemble'):
         from .forecast_refined import predict_rates
         a, b = (float(value) for value in predict_rates(model, fixture, cutoff, (a, b)))

@@ -361,7 +361,7 @@ def ensure_enterprise_sessions_table() -> None:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True}
+    return {"ok": True, "forecastRuntimeVersion": 6}
 
 
 def _dashboard_note_out(row: Any) -> EnterpriseDashboardNoteOut:

@@ -50,5 +50,7 @@ def predict_rates(model, fixture, cutoff, base_rates):
         raise ValueError('Insufficient refined history')
     raw = np.array([c.features(state, home, away, True, fixture['league']['id'], fixture['startingAt'], model['strategy']),
                     c.features(state, away, home, False, fixture['league']['id'], fixture['startingAt'], model['strategy'])], float)
+    from .forecast_league_offsets import fixture_elo_gap, apply_elo_gap
+    raw = apply_elo_gap(raw, component['featureNames'], [fixture_elo_gap(model, fixture)])
     tree_rates = c.tree_predict(component['nonlinear'], raw)
     return weights['incumbent'] * np.asarray(base_rates) + weights['nonlinear'] * tree_rates
