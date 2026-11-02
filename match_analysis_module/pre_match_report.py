@@ -71,7 +71,7 @@ def _recent_team_fixtures(
     competition_id: int,
     reference_date: str,
 ) -> list[dict[str, Any]]:
-    """Return the five latest completed matches from the active season."""
+    """Return the ten latest completed matches from the active season."""
     token = os.getenv("SPORTMONKS_API_KEY")
     if not token:
         raise SportMonksError("ScoutWise data service is not configured")
@@ -113,14 +113,14 @@ def _recent_team_fixtures(
     # Form represents the current season across all competitions. Competition
     # schedules can expose different season IDs for the same season label, so
     # use the union rather than treating the name match as a fallback. This
-    # keeps domestic-league and European matches in one latest-five sequence.
+    # keeps domestic-league and European matches in one latest-ten sequence.
     source_by_id = {
         _as_int(item.get("id")): item
         for item in [*season_fixtures, *same_named_season_fixtures]
         if _as_int(item.get("id"))
     }
     source = list(source_by_id.values())
-    return sorted(source, key=lambda item: item.get("starting_at") or "", reverse=True)[:5]
+    return sorted(source, key=lambda item: item.get("starting_at") or "", reverse=True)[:10]
 
 
 def _fixture_lineup_usage(fixture_id: int, team_id: int) -> dict[str, Any]:
@@ -1082,7 +1082,7 @@ def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str,
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON keyed by team_id. Every team value MUST contain exactly positive, strategy, weakness. Each team's fixture_location specifies whether this upcoming match is home or away. Treat it as mandatory context: do not mention, rely on, or infer from that team's opposite-venue form. For example, an away team must never be described through home strength. positive and weakness must each be a 50-60 word, insight-led analysis; strategy must be a 70-80 word opponent-specific match plan. In positive and weakness, use at most two carefully chosen numbers only when they materially support the conclusion; prioritise tactical meaning, recurring behaviour, matchup implications and risk over metric recitation. strategy is STRICTLY plan and recommendations: do not mention any number, percentage, metric name, stat, or data value. For each team_id, strategy is advice for THAT team and must explicitly refer to the other supplied team by its name as the opponent. In Turkish, never use direct commands or second-person imperatives such as 'kurun', 'sıkıştırın', 'bırakın'; use formal analytical recommendations such as 'daraltılmalı', 'yönlendirilmelidir', 'korunmalıdır', 'uygulanmalı'. State how to defend, progress, press, create advantages and manage likely game states against this specific opponent. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, facts, benchmarks or certainty. No markdown, headings, bullets, or leading dashes." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON keyed by team_id. Every team value MUST contain exactly positive, strategy, weakness. Each team's fixture_location specifies whether this upcoming match is home or away. Treat it as mandatory context: do not mention, rely on, or infer from that team's opposite-venue form. For example, an away team must never be described through home strength. positive and weakness must each be a 50-60 word, insight-led analysis; strategy must be a 50-60 word opponent-specific match plan. In positive and weakness, use at most two carefully chosen numbers only when they materially support the conclusion; prioritise tactical meaning, recurring behaviour, matchup implications and risk over metric recitation. strategy is STRICTLY plan and recommendations: do not mention any number, percentage, metric name, stat, or data value. For each team_id, strategy is advice for THAT team and must explicitly refer to the other supplied team by its name as the opponent. In Turkish, never use direct commands or second-person imperatives such as 'kurun', 'sıkıştırın', 'bırakın'; use formal analytical recommendations such as 'daraltılmalı', 'yönlendirilmelidir', 'korunmalıdır', 'uygulanmalı'. State how to defend, progress, press, create advantages and manage likely game states against this specific opponent. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, facts, benchmarks or certainty. No markdown, headings, bullets, or leading dashes." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam evidence: {json.dumps(compact, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1091,7 +1091,7 @@ def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str,
             not isinstance(value, dict)
             or len(str(value.get("positive") or "").split()) < 60
             or len(str(value.get("weakness") or "").split()) < 60
-            or len(str(value.get("strategy") or "").split()) < 85
+            or len(str(value.get("strategy") or "").split()) < 60
             or bool(re.search(r"\d", str(value.get("strategy") or "")))
             for value in parsed.values()
         )
@@ -1101,7 +1101,7 @@ def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str,
                     model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
                     api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
                 ).invoke([
-                    ("system", "Rewrite the supplied pre-match analysis as valid JSON only. Preserve the exact team_id / positive / strategy / weakness schema. Respect each team's fixture_location strictly: do not mention or derive conclusions from the opposite venue; an away team must not be described through home form. positive and weakness must each contain 60-75 words; focus on interpretation and use at most two numbers only if essential. strategy must contain 85-100 words and be a pure opponent-specific action plan: it must contain no numbers, percentages, metric names, statistics or data values. Every strategy must advise the team identified by its own team_id and explicitly name the other team as opponent. In Turkish use only formal analytical recommendation language such as 'yapılmalı', 'edilmeli', 'korunmalıdır'—never direct commands or second-person imperatives. Explain pressing, progression, defending, chance creation and game-state management in tactical terms. Do not pad by restating data. Do not use markdown, headings, bullets, leading dashes, invented facts, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+                    ("system", "Rewrite the supplied pre-match analysis as valid JSON only. Preserve the exact team_id / positive / strategy / weakness schema. Respect each team's fixture_location strictly: do not mention or derive conclusions from the opposite venue; an away team must not be described through home form. positive and weakness must each contain 60-75 words; focus on interpretation and use at most two numbers only if essential. strategy must contain 60-75 words and be a pure opponent-specific action plan: it must contain no numbers, percentages, metric names, statistics or data values. Every strategy must advise the team identified by its own team_id and explicitly name the other team as opponent. In Turkish use only formal analytical recommendation language such as 'yapılmalı', 'edilmeli', 'korunmalıdır'—never direct commands or second-person imperatives. Explain pressing, progression, defending, chance creation and game-state management in tactical terms. Do not pad by restating data. Do not use markdown, headings, bullets, leading dashes, invented facts, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
                     ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam evidence: {json.dumps(compact, ensure_ascii=False, default=str)}\nDraft to expand: {json.dumps(parsed, ensure_ascii=False, default=str)}"),
                 ])
                 revised = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(revision.content or "").strip(), flags=re.I))
@@ -1332,7 +1332,7 @@ def _pre_match_overview_summary(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 28-45 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, left/right, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. For Regional Play Distribution, use neutral football language such as centre, wide corridors, central lanes and penalty-area proximity; never imply a fixed attacking direction. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, left/right, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. For Regional Play Distribution, use neutral football language such as centre, wide corridors, central lanes and penalty-area proximity; never imply a fixed attacking direction. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if tr else 'English'}\nREQUIRED_CATEGORY: {json.dumps(required, ensure_ascii=False)}\nEvidence: {json.dumps(evidence, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1425,7 +1425,7 @@ def _pre_match_regional_perspective(usages: list[dict[str, Any]], teams: list[di
 def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[str, Any]:
     """Aggregate each side's most recent completed matches in the fixture season.
 
-    Each team is intentionally sampled independently: five completed matches if
+    Each team is intentionally sampled independently: ten completed matches if
     available, otherwise every completed match from that season.
     """
     season_id = _as_int((fixture.get("season") or {}).get("id"))

@@ -9,3 +9,5 @@ langchain-classic
 langchain-openai
 langchain-community
 supabase
+
+numpy>=1.26,<3

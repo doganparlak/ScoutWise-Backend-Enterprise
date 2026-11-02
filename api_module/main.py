@@ -2550,6 +2550,9 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
         "temporary_extra_team_metrics": [],
     }
     emit_progress(content, "fixture")
+    from match_analysis_module.model_profile import enrich_model_profile
+    content = enrich_model_profile(content, fixture)
+    emit_progress(content, "model_match_profile")
     try:
         content["recent_squad_usage"] = build_recent_squad_usage(fixture, lang)
     except (SportMonksError, TypeError, ValueError, requests.RequestException):
@@ -2756,6 +2759,8 @@ def open_enterprise_match_report(
     if not row:
         raise HTTPException(status_code=404, detail="Saved match report not found")
     content = dict(row['report_content'])
+    from match_analysis_module.model_profile import enrich_model_profile
+    content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
         requires_regeneration=(row['report_type'] == 'pre_match'
@@ -2806,6 +2811,8 @@ def create_enterprise_match_report(
             or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
         )
     ):
+        from match_analysis_module.model_profile import enrich_model_profile
+        cached = enrich_model_profile(cached, dict(row.get("fixture_payload") or {}))
         return EnterpriseMatchReportOut(
             favorite_match_id=str(row["id"]),
             status="ready",
