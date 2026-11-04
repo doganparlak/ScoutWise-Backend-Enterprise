@@ -1440,7 +1440,8 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
                 teams,
             )
         )
-    result = {"teams": usages}
+    from standings_module.comparison_ranks import enrich_comparison_ranks
+    result = enrich_comparison_ranks({"teams": usages}, fixture)
     def publish(section):
         emit_progress({"recent_squad_usage": result}, section)
     publish("recent_statistics")

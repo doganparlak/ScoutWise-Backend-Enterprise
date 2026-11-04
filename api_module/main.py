@@ -2765,6 +2765,8 @@ def open_enterprise_match_report(
     content = dict(row['report_content'])
     from match_analysis_module.model_profile import enrich_model_profile
     content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
+    from standings_module.comparison_ranks import enrich_report_comparison_ranks
+    content = enrich_report_comparison_ranks(content, dict(row['fixture_payload'] or {}))
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
         requires_regeneration=(row['report_type'] == 'pre_match'
@@ -2786,136 +2788,141 @@ def create_enterprise_match_report(
 ):
     if streaming_requested(request):
         return stream_report(lambda db: create_enterprise_match_report(favorite_id, user_id, accept_language, db))
-    lang = normalize_lang(accept_language) or "en"
-    row = db.execute(
-        text(
-            """
-            SELECT id, fixture_id, fixture_payload, report_type, state_code, state_name,
-                   report_status, report_content,
-                   (report_status='processing' AND updated_at<NOW()-INTERVAL '30 minutes') AS stale
-            FROM enterprise_favorite_matches
-            WHERE id = :favorite_id AND user_id = :user_id
-            LIMIT 1
-            """
-        ),
-        {"favorite_id": favorite_id, "user_id": user_id},
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Favorite match not found")
-    report_type = str(row.get("report_type") or "post_match")
-    cached = dict(row["report_content"] or {})
-    if (
-        row["report_status"] == "ready"
-        and (cached.get("version") == MATCH_REPORT_VERSION
-             or (report_type == "pre_match" and not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))))
-        and cached.get("language") == lang
-        and (
-            report_type != "pre_match"
-            or cached.get("pre_match_schema_version") == PRE_MATCH_SCHEMA_VERSION
-            or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
-        )
-    ):
-        from match_analysis_module.model_profile import enrich_model_profile
-        cached = enrich_model_profile(cached, dict(row.get("fixture_payload") or {}))
-        return EnterpriseMatchReportOut(
-            favorite_match_id=str(row["id"]),
-            status="ready",
-            content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(cached))),
-            language=lang,
-            version=MATCH_REPORT_VERSION,
-        )
-    fixture = dict(row.get("fixture_payload") or {})
-    if report_type == "pre_match" and not _is_not_started_enterprise_fixture(fixture):
-        raise HTTPException(
-            status_code=409,
-            detail="A pre-match report can only be created before the match starts",
-        )
-    if report_type == "post_match" and not _is_completed_enterprise_fixture(
-        {"state": {"code": row["state_code"], "name": row["state_name"]}}
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="A post-match report can only be created after the match is completed",
-        )
-    if row["report_status"] == "processing" and not row.get("stale"):
-        return EnterpriseMatchReportOut(
-            favorite_match_id=str(row["id"]),
-            status="processing",
-            content_json=cached or None,
-            language=lang,
-            version=MATCH_REPORT_VERSION,
-        )
+    from report_module.generation_lease import match_report_lease
+    with match_report_lease(favorite_id, user_id) as owner:
+        if not owner:
+            pending = db.execute(text("SELECT id,report_content FROM enterprise_favorite_matches WHERE id=:id AND user_id=:uid"),
+                {'id':favorite_id,'uid':user_id}).mappings().first()
+            if not pending:
+                raise HTTPException(404, "Favorite match not found")
+            return EnterpriseMatchReportOut(favorite_match_id=str(pending['id']), status='processing',
+                content_json=pending['report_content'], language=normalize_lang(accept_language) or 'en', version=MATCH_REPORT_VERSION)
+        lang = normalize_lang(accept_language) or "en"
+        row = db.execute(
+            text(
+                """
+                SELECT id, fixture_id, fixture_payload, report_type, state_code, state_name,
+                       report_status, report_content,
+                       (report_status='processing' AND updated_at<NOW()-INTERVAL '30 minutes') AS stale
+                FROM enterprise_favorite_matches
+                WHERE id = :favorite_id AND user_id = :user_id
+                LIMIT 1
+                """
+            ),
+            {"favorite_id": favorite_id, "user_id": user_id},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Favorite match not found")
+        report_type = str(row.get("report_type") or "post_match")
+        cached = dict(row["report_content"] or {})
+        if (
+            row["report_status"] == "ready"
+            and (cached.get("version") == MATCH_REPORT_VERSION
+                 or (report_type == "pre_match" and not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))))
+            and cached.get("language") == lang
+            and (
+                report_type != "pre_match"
+                or cached.get("pre_match_schema_version") == PRE_MATCH_SCHEMA_VERSION
+                or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
+            )
+        ):
+            from match_analysis_module.model_profile import enrich_model_profile
+            cached = enrich_model_profile(cached, dict(row.get("fixture_payload") or {}))
+            from standings_module.comparison_ranks import enrich_report_comparison_ranks
+            cached = enrich_report_comparison_ranks(cached, dict(row.get("fixture_payload") or {}))
+            return EnterpriseMatchReportOut(
+                favorite_match_id=str(row["id"]),
+                status="ready",
+                content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(cached))),
+                language=lang,
+                version=MATCH_REPORT_VERSION,
+            )
+        fixture = dict(row.get("fixture_payload") or {})
+        if report_type == "pre_match" and not _is_not_started_enterprise_fixture(fixture):
+            raise HTTPException(
+                status_code=409,
+                detail="A pre-match report can only be created before the match starts",
+            )
+        if report_type == "post_match" and not _is_completed_enterprise_fixture(
+            {"state": {"code": row["state_code"], "name": row["state_name"]}}
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="A post-match report can only be created after the match is completed",
+            )
+        # Owning the database lease proves no current worker owns this report.
+        # A processing row left by an interrupted process can resume immediately.
 
-    db.execute(
-        text(
-            """
-            UPDATE enterprise_favorite_matches
-            SET report_status = 'processing', report_error = NULL, updated_at = NOW()
-            WHERE id = :favorite_id AND user_id = :user_id
-            """
-        ),
-        {"favorite_id": favorite_id, "user_id": user_id},
-    )
-    db.commit()
-    def save_partial(content):
-        db.execute(text("""UPDATE enterprise_favorite_matches SET report_content=CAST(:content AS jsonb),updated_at=NOW()
-            WHERE id=:id AND user_id=:user_id AND report_status='processing'"""),
-            {'content': json.dumps(content), 'id': favorite_id, 'user_id': user_id})
-        db.commit()
-    configure_progress(lambda content: {
-        'favorite_match_id': favorite_id, 'status': 'processing', 'content_json': content,
-        'language': lang, 'version': MATCH_REPORT_VERSION,
-    }, save_partial)
-    try:
-        content = (
-            _build_pre_match_report(fixture, lang)
-            if report_type == "pre_match"
-            else generate_match_report(int(row["fixture_id"]), lang)
-        )
         db.execute(
             text(
                 """
                 UPDATE enterprise_favorite_matches
-                SET report_status = 'ready',
-                    report_content = CAST(:content AS jsonb),
-                    report_error = NULL,
-                    report_ready_at = NOW(),
-                    updated_at = NOW()
+                SET report_status = 'processing', report_error = NULL, updated_at = NOW()
                 WHERE id = :favorite_id AND user_id = :user_id
                 """
             ),
-            {
-                "favorite_id": favorite_id,
-                "user_id": user_id,
-                "content": json.dumps(content, ensure_ascii=False, default=str),
-            },
+            {"favorite_id": favorite_id, "user_id": user_id},
         )
         db.commit()
-        return EnterpriseMatchReportOut(
-            favorite_match_id=str(row["id"]),
-            status="ready",
-            content_json=content,
-            language=lang,
-            version=MATCH_REPORT_VERSION,
-        )
-    except Exception as exc:
-        db.rollback()
-        db.execute(
-            text(
-                """
-                UPDATE enterprise_favorite_matches
-                SET report_status = 'failed', report_error = :error, updated_at = NOW()
-                WHERE id = :favorite_id AND user_id = :user_id
-                """
-            ),
-            {"favorite_id": favorite_id, "user_id": user_id, "error": str(exc)},
-        )
-        db.commit()
-        print(
-            f"[enterprise_match_report] event=failed favorite_id={favorite_id} fixture_id={row['fixture_id']} error={exc}",
-            flush=True,
-        )
-        raise HTTPException(status_code=502, detail="Match report generation failed") from exc
+        def save_partial(content):
+            db.execute(text("""UPDATE enterprise_favorite_matches SET report_content=CAST(:content AS jsonb),updated_at=NOW()
+                WHERE id=:id AND user_id=:user_id AND report_status='processing'"""),
+                {'content': json.dumps(content), 'id': favorite_id, 'user_id': user_id})
+            db.commit()
+        configure_progress(lambda content: {
+            'favorite_match_id': favorite_id, 'status': 'processing', 'content_json': content,
+            'language': lang, 'version': MATCH_REPORT_VERSION,
+        }, save_partial)
+        try:
+            content = (
+                _build_pre_match_report(fixture, lang)
+                if report_type == "pre_match"
+                else generate_match_report(int(row["fixture_id"]), lang)
+            )
+            db.execute(
+                text(
+                    """
+                    UPDATE enterprise_favorite_matches
+                    SET report_status = 'ready',
+                        report_content = CAST(:content AS jsonb),
+                        report_error = NULL,
+                        report_ready_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = :favorite_id AND user_id = :user_id
+                    """
+                ),
+                {
+                    "favorite_id": favorite_id,
+                    "user_id": user_id,
+                    "content": json.dumps(content, ensure_ascii=False, default=str),
+                },
+            )
+            db.commit()
+            return EnterpriseMatchReportOut(
+                favorite_match_id=str(row["id"]),
+                status="ready",
+                content_json=content,
+                language=lang,
+                version=MATCH_REPORT_VERSION,
+            )
+        except Exception as exc:
+            db.rollback()
+            db.execute(
+                text(
+                    """
+                    UPDATE enterprise_favorite_matches
+                    SET report_status = 'failed', report_error = :error, updated_at = NOW()
+                    WHERE id = :favorite_id AND user_id = :user_id
+                    """
+                ),
+                {"favorite_id": favorite_id, "user_id": user_id, "error": str(exc)},
+            )
+            db.commit()
+            print(
+                f"[enterprise_match_report] event=failed favorite_id={favorite_id} fixture_id={row['fixture_id']} error={exc}",
+                flush=True,
+            )
+            raise HTTPException(status_code=502, detail="Match report generation failed") from exc
 
 
 @app.get("/tactic-boards", response_model=list[EnterpriseTacticBoardOut])
