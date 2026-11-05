@@ -271,10 +271,10 @@ class EnterpriseMatchReportOut(BaseModel):
 
 
 class TeamAnalysisReportIn(BaseModel):
-    fixtureIds: List[int] = Field(min_length=1, max_length=10)
+    fixtureIds: List[int] = Field(min_length=1, max_length=30)
     teamId: int = Field(gt=0)
     team: TeamPoolSearchRow
-    matches: List[TeamPlayedMatchRow] = Field(min_length=1, max_length=10)
+    matches: List[TeamPlayedMatchRow] = Field(min_length=1, max_length=30)
 
 
 class TeamAnalysisReportOut(BaseModel):

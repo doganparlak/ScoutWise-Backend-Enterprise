@@ -1,5 +1,6 @@
 """Full competition-season ranks for pre-match metrics; recent values stay intact."""
 from collections import OrderedDict
+from concurrent.futures import Future
 from datetime import datetime, timezone
 import logging
 import os
@@ -33,6 +34,7 @@ def canonical_metric_name(name):
 _LOG = logging.getLogger(__name__)
 _CACHE = OrderedDict()
 _LOCK = RLock()
+_IN_FLIGHT = {}
 
 
 def rank_metrics(teams):
@@ -61,8 +63,7 @@ def _provider_rows(league, season, cutoff, scope):
     """Fallback for a competition not yet opened in League Analysis Center."""
     token = os.getenv('SPORTMONKS_API_KEY')
     if not token:
-        return []
-    rows = []
+        return
     base = os.getenv('SPORTMONKS_BASE_URL', 'https://api.sportmonks.com/v3/football').rstrip('/')
     for page in range(1, 101):
         response = requests.get(base + '/fixtures', params={
@@ -81,9 +82,9 @@ def _provider_rows(league, season, cutoff, scope):
                 phase = stage_scope(fixture.get('stage') or {})
                 if (scope == 'qualifying' and phase != 'qualifying') or (scope == 'overall' and phase not in ('league', 'knockout')):
                     continue
-            rows.append(normalize_fixture(fixture))
+            yield normalize_fixture(fixture)
         if not (payload.get('pagination') or {}).get('has_more'):
-            return rows
+            return
     raise RuntimeError('Competition rank pagination limit exceeded')
 
 
@@ -93,8 +94,35 @@ def competition_ranks(league, season, cutoff, scope='overall'):
         cached = _CACHE.get(key)
         if cached and monotonic() - cached[0] < 300:
             return cached[1]
+        pending = _IN_FLIGHT.get(key)
+        owner = pending is None
+        if owner:
+            pending = _IN_FLIGHT[key] = Future()
+    if not owner:
+        return pending.result()
+    try:
+        result = _calculate_competition_ranks(league, season, cutoff, scope)
+        with _LOCK:
+            _CACHE[key] = (monotonic(), result)
+            _CACHE.move_to_end(key)
+            while len(_CACHE) > 64:
+                _CACHE.popitem(last=False)
+        pending.set_result(result)
+        return result
+    except BaseException as exc:
+        # Release every waiting request even when the owner is interrupted.
+        pending.set_exception(exc)
+        raise
+    finally:
+        with _LOCK:
+            _IN_FLIGHT.pop(key, None)
+
+
+def _calculate_competition_ranks(league, season, cutoff, scope):
     # Use the exact same contributions as League Analysis Center. Filtering by
     # kickoff prevents later season matches leaking into an earlier report.
+    aggregate = Aggregate()
+    found = False
     with engine.connect() as db:
         rows = db.execute(text('''SELECT team_contributions, kickoff_at, included_in_aggregation
             FROM league_match_contributions WHERE league_id=:league AND season_id=:season
@@ -102,22 +130,17 @@ def competition_ranks(league, season, cutoff, scope='overall'):
             AND (:european=FALSE OR
                 (:scope='qualifying' AND coverage->>'scope'='qualifying') OR
                 (:scope='overall' AND coverage->>'scope' IN ('league','knockout')))
-            ORDER BY kickoff_at,fixture_id'''), {
+            ORDER BY kickoff_at,fixture_id''').execution_options(stream_results=True, yield_per=20), {
                 'league': league, 'season': season, 'cutoff': cutoff,
                 'european': league in EUROPEAN_LEAGUES, 'scope': scope,
-            }).mappings().all()
-    if not rows:
-        rows = _provider_rows(league, season, cutoff, scope)
-    aggregate = Aggregate()
-    for row in rows:
-        aggregate.add({**row, 'player_contributions': []})
-    result = rank_metrics(aggregate.finish()['team_metrics'])
-    with _LOCK:
-        _CACHE[key] = (monotonic(), result)
-        _CACHE.move_to_end(key)
-        while len(_CACHE) > 64:
-            _CACHE.popitem(last=False)
-    return result
+            }).mappings()
+        for row in rows:
+            found = True
+            aggregate.add({**row, 'player_contributions': []})
+    if not found:
+        for row in _provider_rows(league, season, cutoff, scope):
+            aggregate.add({**row, 'player_contributions': []})
+    return rank_metrics(aggregate.finish()['team_metrics'])
 
 
 def enrich_comparison_ranks(usage, fixture, now=None):
