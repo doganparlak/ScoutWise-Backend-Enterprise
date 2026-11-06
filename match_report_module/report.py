@@ -23,7 +23,7 @@ SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
 MATCH_REPORT_VERSION = 49
-TEAM_ANALYSIS_REPORT_VERSION = 58
+TEAM_ANALYSIS_REPORT_VERSION = 60
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -470,6 +470,10 @@ def _build_scoutwise_perspective(report: dict[str, Any], lang: str) -> list[str]
 
 
 def _build_regional_play_perspective(report: dict[str, Any], lang: str) -> str:
+    if report.get("teams"):
+        from match_analysis_module.regional_play import match_regional_perspective
+
+        return match_regional_perspective(report, lang)
     rows = report.get("ball_coordinates") or []
     counts = [0] * 9
     for row in rows:
@@ -1775,33 +1779,10 @@ def build_team_report_momentum_perspectives(
 def build_team_report_regional_perspective(
     reports: list[dict[str, Any]], team_id: int, lang: str = "en"
 ) -> str:
-    del team_id
-    aggregated = {"ball_coordinates": []}
-    for report in reports:
-        rows = report.get("ball_coordinates") or []
-        if rows:
-            aggregated["ball_coordinates"].extend(rows)
-    fallback = (
-        "Birleşik konum dağılımı, takımın yer aldığı oyunlarda topun tekrar eden biçimde yoğunlaştığı bölgeleri ve yerleşik alan kullanım karakterini gösteriyor."
-        if lang == "tr"
-        else "The combined location distribution reveals the recurring areas of concentration and established spatial character in matches involving the team."
-    )
-    if not aggregated["ball_coordinates"]:
-        return fallback
-    perspective = _build_regional_play_perspective(aggregated, lang)
-    generic = (
-        "Kaydedilen top konumları, sahanın belirli bölgelerinde daha yoğun bir dağılım gösterdi."
-        if lang == "tr"
-        else "Recorded ball locations showed a greater concentration in specific pitch zones."
-    )
-    if not perspective or perspective == generic:
-        return fallback
-    prefix = (
-        "Takımın seçili maçlar boyunca tekrar eden alan kullanım karakterinde "
-        if lang == "tr"
-        else "Within the team's recurring spatial character across the selected matches, "
-    )
-    return prefix + perspective[:1].lower() + perspective[1:]
+    from match_analysis_module.regional_play import aggregate_team_regional_play, team_regional_perspective
+
+    name = next((team.get("name") for report in reports for team in report.get("teams") or [] if int(team.get("id") or 0) == team_id), str(team_id))
+    return team_regional_perspective(aggregate_team_regional_play(reports, team_id), name, lang)
 
 
 def build_team_report_attack_profile(

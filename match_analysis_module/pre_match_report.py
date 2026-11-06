@@ -24,10 +24,11 @@ import requests
 from report_module.metric_validation import is_standard_count, nonzero_evidence, nonzero_metric_rows, nonzero_report_metric_evidence, percentage, rate_counts, valid_metric
 
 from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError
+from .regional_play import aggregate_regional_play, regional_perspective
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
 
 
-PRE_MATCH_SCHEMA_VERSION = 9
+PRE_MATCH_SCHEMA_VERSION = 10
 
 _COMPLETED_STATES = {"FT", "AET", "PEN", "WO", "AP"}
 
@@ -131,7 +132,7 @@ def _fixture_lineup_usage(fixture_id: int, team_id: int) -> dict[str, Any]:
         f"{SPORTMONKS_BASE_URL}/fixtures/{fixture_id}",
         params={
             "api_token": token,
-            "include": "participants;formations;lineups.player;lineups.position;lineups.details.type;events.type;pressure;ballCoordinates;statistics.type;xGFixture.type",
+            "include": "participants;formations;lineups.player;lineups.position;lineups.details.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type",
         },
         timeout=35,
     )
@@ -534,6 +535,7 @@ def _team_recent_squad_usage(
         "current_squad_count": 0,
         "players": [],
         "formations": [],
+        **aggregate_regional_play([], team_id, str(team.get("location") or "home")),
     }
     if not team_id:
         return fallback
@@ -562,7 +564,6 @@ def _team_recent_squad_usage(
     player_derived_rate_minutes: dict[int, Counter[str]] = defaultdict(Counter)
     pressure_samples: dict[int, list[float]] = {}
     momentum_events: list[dict[str, Any]] = []
-    territory_counts = [0] * 9
     for fixture_index, fixture in enumerate(full_fixtures):
         # Formation is recorded per participant. A fixture without formation
         # data still contributes to the player sample, not its formation rate.
@@ -700,17 +701,6 @@ def _team_recent_squad_usage(
                 "goals_against": 0 if is_for else 1,
             })
 
-        # Ball-coordinate data does not identify a participant. As in the
-        # team-analysis report, this is the spatial character of this team's
-        # selected match sample, aggregated independently for each side.
-        for coordinate in fixture.get("ballcoordinates") or []:
-            try:
-                x = min(0.999999, max(0.0, float(coordinate.get("x") or 0)))
-                y = min(0.999999, max(0.0, float(coordinate.get("y") or 0)))
-            except (TypeError, ValueError):
-                continue
-            territory_counts[int(y * 3) * 3 + int(x * 3)] += 1
-
     # Player-specific sections must reflect the club's current squad, rather
     # than historical appearances by players who have since transferred.
     current_players = {
@@ -837,7 +827,6 @@ def _team_recent_squad_usage(
             "goals_for": sum(event["goals_for"] for event in scoped_events),
             "goals_against": sum(event["goals_against"] for event in scoped_events),
         })
-    territory_total = sum(territory_counts) or 1
     sample_size = len(fixtures)
     results: list[dict[str, Any]] = []
     # The request is newest-first and the report follows that order.
@@ -909,14 +898,7 @@ def _team_recent_squad_usage(
             "development": development,
         },
         "momentum": momentum_rows,
-        "territory": [
-            {
-                "index": index,
-                "count": count,
-                "percentage": round((count / territory_total) * 100, 1),
-            }
-            for index, count in enumerate(territory_counts)
-        ],
+        **aggregate_regional_play(full_fixtures, team_id, str(team.get("location") or "home")),
         "team_comparison": _aggregate_team_comparison(full_fixtures, team_id),
         "score_flow": _aggregate_score_flow(full_fixtures, team_id),
         "summary": {
@@ -1332,7 +1314,7 @@ def _pre_match_overview_summary(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, left/right, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. For Regional Play Distribution, use neutral football language such as centre, wide corridors, central lanes and penalty-area proximity; never imply a fixed attacking direction. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if tr else 'English'}\nREQUIRED_CATEGORY: {json.dumps(required, ensure_ascii=False)}\nEvidence: {json.dumps(evidence, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1351,75 +1333,8 @@ def _pre_match_overview_summary(
         return fallback
 
 
-def _pre_match_regional_perspective(usages: list[dict[str, Any]], teams: list[dict[str, Any]], lang: str) -> str:
-    """Apply the match-report regional classification to each team sample.
-
-    The three horizontal bands contain equal areas.  A band is only called
-    clearly more intense when it is at least five percentage points ahead,
-    preventing a minor distribution difference from becoming a tactical claim.
-    """
-    compact = []
-    for usage, team in zip(usages, teams):
-        zones = usage.get("territory") or []
-        values = [
-            float(next((row.get("percentage") for row in zones if _as_int(row.get("index")) == index), 0) or 0)
-            for index in range(9)
-        ]
-        upper_band = round(sum(values[index] for index in (0, 1, 2)), 1)
-        central_band = round(sum(values[index] for index in (3, 4, 5)), 1)
-        lower_band = round(sum(values[index] for index in (6, 7, 8)), 1)
-        margin = 5.0
-        upper_clear = upper_band - central_band >= margin
-        lower_clear = lower_band - central_band >= margin
-        central_clear = central_band - upper_band >= margin and central_band - lower_band >= margin
-        concentration = (
-            "central_area_more_intense" if central_clear else
-            "both_outer_bands_more_intense" if upper_clear and lower_clear else
-            "one_outer_band_more_intense" if upper_clear or lower_clear else
-            "balanced_no_clear_advantage"
-        )
-        compact.append({
-            "team": team.get("name"),
-            "zones": values,
-            "semantic_spatial_aggregates": {
-                "upper_band_pct": upper_band,
-                "central_band_pct": central_band,
-                "lower_band_pct": lower_band,
-                "middle_field_band_pct": round(sum(values[index] for index in (1, 4, 7)), 1),
-                "penalty_area_vicinity_proxy_pct": round(sum(values[index] for index in (0, 3, 6, 2, 5, 8)), 1),
-                "minimum_clear_difference_percentage_points": margin,
-                "channel_concentration": concentration,
-            },
-        })
-    fallback = (
-        "İki takımın bölgesel dağılımı, merkez ve geniş alanların kullanımındaki ortaklıkların topun dolaşımını şekillendireceğini gösteriyor. Ceza alanlarına yakın bölgelerdeki yoğunluklar ile merkez çevresindeki ikinci toplar, yerleşim mücadelesinin ana odağı olabilir."
-        if lang == "tr" else
-        "The two regional distributions indicate that central connections and concentration near the penalty areas will shape the ball's direction. Second balls and positional battles should stand out in the corridors where their shares overlap."
-    )
-    if len(compact) != 2 or not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    try:
-        from langchain_openai import ChatOpenAI
-        response = ChatOpenAI(
-            model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-            api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match spatial analyst. Write one 45-65 word ScoutWise perspective in the requested language. Use the same strict regional logic as the match report. The three supplied bands have equal area. Obey each team's channel_concentration exactly: central_area_more_intense means the central band exceeds both outer bands by at least five percentage points; both_outer_bands_more_intense means both outer bands exceed the centre by at least five points; one_outer_band_more_intense means only one does; balanced_no_clear_advantage means do not claim clear centre-versus-wide superiority. Never compare both outer bands combined against the central band. The band calculation is internal: never mention upper, lower, top, bottom, vertical lanes, zone numbers, or any coordinate wording in the output. Compare the two teams only with symmetric football language such as centre, wide areas, central connections and penalty-area proximity. Identify overlaps or contrasts and infer where the ball is likely to be contested. Never use K1, K2, left, right, home side, away side, or any fixed attacking direction. Do not merely list percentages, invent certainty, tactics, unavailable facts, or use the Turkish word 'örneklem'. No markdown or heading." + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nRegional distributions: {json.dumps(compact, ensure_ascii=False)}"),
-        ])
-        text = str(response.content or "").strip()
-        # The UI owns the ScoutWise Perspektifi heading.  Keep generated copy
-        # to the spatial reading only, even when the model adds a heading.
-        text = re.sub(
-            r"^\s*(?:scoutwise\s+(?:perspektifi|perspective)\s*:\s*)+",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip()
-        return text or fallback
-    except Exception as exc:
-        print(f"[pre_match_report] event=regional_perspective_fallback error={exc}")
-        return fallback
+def _pre_match_regional_perspective(usages: list[dict[str, Any]], teams: list[dict[str, Any]], lang: str, scope: str = "overall") -> str:
+    return regional_perspective(usages, teams, lang, scope)
 
 
 def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[str, Any]:
@@ -1432,7 +1347,7 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
     season_name = str((fixture.get("season") or {}).get("name") or "")
     competition_id = _as_int((fixture.get("league") or {}).get("id"))
     reference_date = str(fixture.get("startingAt") or "")
-    teams = [dict(fixture.get("homeTeam") or {}), dict(fixture.get("awayTeam") or {})]
+    teams = [{**dict(fixture.get("homeTeam") or {}), "location": "home"}, {**dict(fixture.get("awayTeam") or {}), "location": "away"}]
     with ThreadPoolExecutor(max_workers=2) as executor:
         usages = list(
             executor.map(
@@ -1455,7 +1370,8 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
     publish("pre_momentum")
     result["score_flow_perspectives"] = _pre_match_score_flow_perspectives(usages, teams, lang)
     publish("pre_score_flow")
-    result["regional_perspective"] = _pre_match_regional_perspective(usages, teams, lang)
+    result["regional_perspectives"] = {scope: _pre_match_regional_perspective(usages, teams, lang, scope) for scope in ("overall", "first_half", "second_half")}
+    result["regional_perspective"] = result["regional_perspectives"]["overall"]
     publish("pre_regional")
     result["player_perspectives"] = _pre_match_player_perspectives(usages, lang)
     publish("pre_players")
