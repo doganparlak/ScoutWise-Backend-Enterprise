@@ -29,7 +29,7 @@ from .regional_play import aggregate_regional_play, regional_perspective
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
 
 
-PRE_MATCH_SCHEMA_VERSION = 12
+PRE_MATCH_SCHEMA_VERSION = 13
 
 _COMPLETED_STATES = {"FT", "AET", "PEN", "WO", "AP"}
 
@@ -312,7 +312,24 @@ def _lineup_rate_metrics(row: dict[str, Any]) -> dict[str, float]:
     return values
 
 
-def _attach_player_highlight_metrics(players: list[dict[str, Any]]) -> None:
+def _highlight_metric_eligible(metric: dict[str, Any], sample_size: int) -> bool:
+    return int(metric.get("matches_covered") or 0) * 5 >= max(1, sample_size)
+
+
+def _player_highlight_evidence(value: Any, sample_size: int) -> Any:
+    """Keep thinly covered detailed statistics out of the overview AI evidence."""
+    if isinstance(value, list):
+        return [_player_highlight_evidence(item, sample_size) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: ([item for item in items if _highlight_metric_eligible(item, sample_size)]
+                  if key == "per90_metrics" else _player_highlight_evidence(items, sample_size))
+            for key, items in value.items()
+        }
+    return value
+
+
+def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size: int) -> None:
     """Pick three role-output metrics from each eligible player's per-90 sample.
 
     Positive selections are the player's strongest relative outputs in the
@@ -322,13 +339,14 @@ def _attach_player_highlight_metrics(players: list[dict[str, Any]]) -> None:
     metric_population: dict[str, list[float]] = defaultdict(list)
     for player in players:
         for metric in player.get("per90_metrics") or []:
-            metric_population[str(metric["name"])].append(float(metric["value"]))
+            if _highlight_metric_eligible(metric, sample_size):
+                metric_population[str(metric["name"])].append(float(metric["value"]))
 
     for player in players:
         scored = []
         risk_scored = []
         for metric in player.get("per90_metrics") or []:
-            if str(metric.get("name") or "") in _PLAYER_HIGHLIGHT_EXCLUDED_METRICS:
+            if not _highlight_metric_eligible(metric, sample_size) or str(metric.get("name") or "") in _PLAYER_HIGHLIGHT_EXCLUDED_METRICS:
                 continue
             values = metric_population.get(str(metric["name"]), [])
             if not values:
@@ -576,8 +594,11 @@ def _team_recent_squad_usage(
     player_rating_minutes: Counter[int] = Counter()
     player_metric_totals: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     player_metric_minutes: dict[int, Counter[str]] = defaultdict(Counter)
+    player_metric_matches: dict[int, Counter[str]] = defaultdict(Counter)
     player_rate_weighted_totals: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     player_rate_minutes: dict[int, Counter[str]] = defaultdict(Counter)
+    player_rate_matches: dict[int, Counter[str]] = defaultdict(Counter)
+    player_derived_matches: dict[int, Counter[str]] = defaultdict(Counter)
     player_count_samples: dict[int, list[tuple[dict[str, float], float]]] = defaultdict(list)
     player_derived_rates: dict[int, dict[str, tuple[float, float, float]]] = defaultdict(dict)
     pressure_samples: dict[int, list[float]] = {}
@@ -639,6 +660,7 @@ def _team_recent_squad_usage(
                     player_metric_totals[player_id][metric_name] += metric_value
                     # Include recorded and peer-covered omitted counts only.
                     player_metric_minutes[player_id][metric_name] += minutes
+                    player_metric_matches[player_id][metric_name] += 1
                 player_count_samples[player_id].append((_lineup_rate_inputs(row), minutes))
             # Rates without known count components retain the provider average.
             if minutes > 0:
@@ -647,6 +669,7 @@ def _team_recent_squad_usage(
                         continue
                     player_rate_weighted_totals[player_id][metric_name] += metric_value * minutes
                     player_rate_minutes[player_id][metric_name] += minutes
+                    player_rate_matches[player_id][metric_name] += 1
 
         # In SportMonks substitution events, player_id is the player entering
         # the field and related_player_id is the player leaving it.
@@ -746,6 +769,13 @@ def _team_recent_squad_usage(
             pooled = pooled_rate_counts(rate_name, count_samples, *components)
             if pooled is not None:
                 player_derived_rates[player_id][rate_name] = pooled
+                # A percentage is observed only where its denominator is positive.
+                # Zero successes with recorded attempts remain valid observations.
+                player_derived_matches[player_id][rate_name] = sum(
+                    single is not None and single[1] > 0
+                    for counts, _ in count_samples
+                    for single in [pooled_rate_counts(rate_name, [(counts, 1)], *components)]
+                )
     eligible_performers = []
     for player_id, player in current_players.items():
         minutes = float(player_minutes[player_id])
@@ -763,6 +793,7 @@ def _team_recent_squad_usage(
                     "value": round(value * 90 / player_metric_minutes[player_id][name], 2),
                     "is_percentage": False,
                     "recorded_minutes": player_metric_minutes[player_id][name],
+                    "matches_covered": player_metric_matches[player_id][name],
                 }
                 for name, value in player_metric_totals[player_id].items()
                 if player_metric_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES and value >= 0
@@ -772,6 +803,7 @@ def _team_recent_squad_usage(
                     "name": name,
                     "value": round(numerator * 100 / denominator, 2),
                     "recorded_minutes": covered_minutes,
+                    "matches_covered": player_derived_matches[player_id][name],
                     "is_percentage": True,
                 }
                 for name, (numerator, denominator, covered_minutes) in player_derived_rates[player_id].items()
@@ -781,13 +813,14 @@ def _team_recent_squad_usage(
                     "name": name,
                     "value": round(weighted_value / player_rate_minutes[player_id][name], 2),
                     "recorded_minutes": player_rate_minutes[player_id][name],
+                    "matches_covered": player_rate_matches[player_id][name],
                     "is_percentage": True,
                 }
                 for name, weighted_value in player_rate_weighted_totals[player_id].items()
                 if player_rate_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
             ],
         })
-    _attach_player_highlight_metrics(eligible_performers)
+    _attach_player_highlight_metrics(eligible_performers, len(fixtures))
     rating_order = sorted(
         eligible_performers,
         key=lambda item: (-item["average_rating"], -item["minutes"], item["player_name"]),
@@ -1318,7 +1351,10 @@ def _pre_match_overview_summary(
         from langchain_openai import ChatOpenAI
         evidence = {
             "teams": nonzero_report_metric_evidence(teams),
-            "recent_usage": nonzero_report_metric_evidence(usages),
+            "recent_usage": nonzero_report_metric_evidence([
+                _player_highlight_evidence(usage, int(usage.get("sample_size") or 0))
+                for usage in usages
+            ]),
             "team_analysis": team_analysis,
             "momentum": momentum,
             "score_flow": score_flow,

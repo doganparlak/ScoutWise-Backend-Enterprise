@@ -9,7 +9,7 @@ from report_module.profile_generation import generate_profile_json
 import os
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 import requests
@@ -24,7 +24,7 @@ SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
 MATCH_REPORT_VERSION = 50
-TEAM_ANALYSIS_REPORT_VERSION = 62
+TEAM_ANALYSIS_REPORT_VERSION = 63
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -1538,12 +1538,14 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
 
     Infer omitted counts only when another participant has that metric in the
     same fixture. Advanced metrics stay unknown. Require 90 covered minutes
-    per count metric and 90 covered denominator minutes for rates.
+    and observations in 20% of selected matches, rounded up and capped at three.
+    Rates count only fixtures with usable inputs and a positive denominator.
     """
     from copy import deepcopy
     from math import isfinite
 
     reports = deepcopy(reports)
+    minimum_matches = min(3, max(1, (len(reports) + 4) // 5))
     players = defaultdict(list)
 
     def sources(row):
@@ -1582,10 +1584,12 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
 
     for samples in players.values():
         coverage = defaultdict(float)
+        match_coverage = Counter()
         for _, metrics, minutes in samples:
             for key, item in metrics.items():
                 if numeric(item.get("value")) is not None:
                     coverage[key] += minutes
+                    match_coverage[key] += 1
         protected = set().union(*(missing_attempt_names({name: item.get("value") for (_, name), item in metrics.items() if not item.get("_inferred_zero")}) for _, metrics, _ in samples))
         for group, metric in list(coverage):
             if rate_key(metric) in protected:
@@ -1596,7 +1600,14 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
         for name, components in DERIVED_PERCENTAGE_METRICS.items():
             pooled = pooled_rate_counts(name, count_samples, *components)
             covered_minutes = pooled[2] if pooled else 0
-            value = percentage(pooled[0], pooled[1]) if pooled and covered_minutes >= 90 else None
+            covered_matches = sum(
+                single is not None and single[1] > 0
+                for counts, _ in count_samples
+                for single in [pooled_rate_counts(name, [(counts, 1)], *components)]
+            ) if pooled else 0
+            value = percentage(pooled[0], pooled[1]) if (
+                pooled and covered_minutes >= 90 and covered_matches >= minimum_matches
+            ) else None
             group = next((group for group, canonical in PLAYER_METRIC_CATEGORY.values()
                           if canonical == components[0]), None)
             if "Shot Quality" in name:
@@ -1612,10 +1623,13 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
                 elif item is not None:
                     item["value"] = value
             coverage[group, name] = covered_minutes if value is not None else 0
+            match_coverage[group, name] = covered_matches if value is not None else 0
         for row, metrics, _ in samples:
             for group, items in sources(row).items():
                 filtered = [item for item in items if item.get("name") == "Minutes Played"
-                            or coverage[group, str(item.get("name") or "")] >= 90]
+                            or (coverage[group, str(item.get("name") or "")] >= 90
+                                and (item.get("name") == "Rating"
+                                     or match_coverage[group, str(item.get("name") or "")] >= minimum_matches))]
                 for item in filtered:
                     item.pop("_inferred_zero", None)
                 if group == "expected":
