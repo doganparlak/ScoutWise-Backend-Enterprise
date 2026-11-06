@@ -111,7 +111,7 @@ from team_portfolio_module.portfolio import router as team_portfolio_router, beg
 from standings_module.search import get_league_performance_options, search_league_performance
 from match_analysis_module import get_fixture, get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
-from match_analysis_module.pre_match_report import PRE_MATCH_SCHEMA_VERSION, build_recent_squad_usage
+from match_analysis_module.pre_match_report import PRE_MATCH_SCHEMA_VERSION, build_recent_squad_usage, has_recent_squad_usage
 from standings_module import StandingsError, get_league_standings
 from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
 from report_module.crossing_metrics import normalize_crossing_metrics
@@ -2559,10 +2559,21 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
     emit_progress(content, "model_match_profile")
     try:
         content["recent_squad_usage"] = build_recent_squad_usage(fixture, lang)
-    except (SportMonksError, TypeError, ValueError, requests.RequestException):
-        # The pre-match report remains usable if a historical lineup request is
-        # temporarily unavailable; the UI renders an explicit no-data state.
-        content["recent_squad_usage"] = {"teams": []}
+        if not has_recent_squad_usage(content):
+            raise SportMonksError("Historical match sample was not loaded")
+    except (SportMonksError, TypeError, ValueError, requests.RequestException) as exc:
+        # A provider failure is not a successfully generated empty sample.
+        limited = "HTTP 429" in str(exc)
+        detail = (
+            "Veri sağlayıcısının istek sınırına ulaşıldı. Rapor şu anda yenilenemiyor; lütfen biraz sonra tekrar deneyin."
+            if lang == "tr" and limited else
+            "Maç geçmişi şu anda alınamıyor. Lütfen biraz sonra tekrar deneyin."
+            if lang == "tr" else
+            "The data provider's request limit was reached. Please retry refreshing the report shortly."
+            if limited else
+            "Historical match data is temporarily unavailable. Please try again shortly."
+        )
+        raise HTTPException(status_code=503, detail=detail) from exc
     emit_progress(content, "recent_squad_usage")
     try:
         standings = get_league_standings(int(league.get("id") or 0))
@@ -2772,7 +2783,8 @@ def open_enterprise_match_report(
         requires_regeneration=(row['report_type'] == 'pre_match'
             and _is_not_started_enterprise_fixture(dict(row['fixture_payload'] or {}))
             and (content.get('pre_match_schema_version') != PRE_MATCH_SCHEMA_VERSION
-                 or content.get('version') != MATCH_REPORT_VERSION)),
+                 or content.get('version') != MATCH_REPORT_VERSION
+                 or not has_recent_squad_usage(content))),
         content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(content))),
         language=content.get('language') or 'en', version=int(content.get('version') or 1),
     )
@@ -2817,6 +2829,7 @@ def create_enterprise_match_report(
         cached = dict(row["report_content"] or {})
         if (
             row["report_status"] == "ready"
+            and (report_type != "pre_match" or has_recent_squad_usage(cached))
             and (cached.get("version") == MATCH_REPORT_VERSION
                  or (report_type == "pre_match" and not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))))
             and cached.get("language") == lang
@@ -2864,7 +2877,14 @@ def create_enterprise_match_report(
             {"favorite_id": favorite_id, "user_id": user_id},
         )
         db.commit()
+        preserve_saved_report = bool(cached) and (
+            row["report_status"] == "ready"
+            or (report_type == "pre_match" and has_recent_squad_usage(cached))
+        )
         def save_partial(content):
+            # Stream refresh progress without overwriting the last saved report.
+            if preserve_saved_report:
+                return
             db.execute(text("""UPDATE enterprise_favorite_matches SET report_content=CAST(:content AS jsonb),updated_at=NOW()
                 WHERE id=:id AND user_id=:user_id AND report_status='processing'"""),
                 {'content': json.dumps(content), 'id': favorite_id, 'user_id': user_id})
@@ -2911,17 +2931,20 @@ def create_enterprise_match_report(
                 text(
                     """
                     UPDATE enterprise_favorite_matches
-                    SET report_status = 'failed', report_error = :error, updated_at = NOW()
+                    SET report_status = :status, report_error = :error, updated_at = NOW()
                     WHERE id = :favorite_id AND user_id = :user_id
                     """
                 ),
-                {"favorite_id": favorite_id, "user_id": user_id, "error": str(exc)},
+                {"favorite_id": favorite_id, "user_id": user_id, "error": str(exc),
+                 "status": "ready" if preserve_saved_report else "failed"},
             )
             db.commit()
             print(
                 f"[enterprise_match_report] event=failed favorite_id={favorite_id} fixture_id={row['fixture_id']} error={exc}",
                 flush=True,
             )
+            if isinstance(exc, HTTPException):
+                raise
             raise HTTPException(status_code=502, detail="Match report generation failed") from exc
 
 

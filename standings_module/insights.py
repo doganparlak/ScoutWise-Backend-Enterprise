@@ -13,7 +13,7 @@ from sqlalchemy import text
 
 from api_module.database import SessionLocal
 from .stages import EUROPEAN_LEAGUES, SCOPES, scoped_schedule
-from .metrics import Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, kickoff, normalize_fixture, period_for
+from .metrics import PLAYER_AWARD_METRICS, Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, kickoff, normalize_fixture, period_for
 
 log = logging.getLogger(__name__)
 BASE = os.getenv('SPORTMONKS_BASE_URL', 'https://api.sportmonks.com/v3/football').rstrip('/')
@@ -22,8 +22,8 @@ _wake = threading.Event()
 _thread = None
 CLAIM_LOCK = 716394820
 # Award selection changes do not invalidate compact fixture contributions.
-SEASON_SUMMARY_VERSION = 2
-SCOPED_VERSION = 5
+SEASON_SUMMARY_VERSION = 5
+SCOPED_VERSION = 8
 
 
 def provider(session, path, **params):
@@ -43,7 +43,7 @@ def provider(session, path, **params):
 def request_summary(db, league_id, season_id, period_start=None, scope=None):
     params = {'league': league_id, 'season': season_id}
     row = db.execute(text('''SELECT league_id, season_id, status, computed_at, next_refresh_at,
-        team_metrics, metric_catalog, team_best_players, league_best_player, fixture_count, coverage,
+        team_metrics, metric_catalog, team_best_players, league_best_player, metric_player_awards, fixture_count, coverage,
         calculation_version, last_error FROM league_season_summaries
         WHERE league_id=:league AND season_id=:season'''), params).mappings().first()
     if row is None:
@@ -55,7 +55,7 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
     if period_start and period_for(period_start)[0] != period_start:
         raise ValueError('Invalid two-week period')
     biweek = db.execute(text('''SELECT period_start, period_end, status, computed_at,
-        team_best_players, league_best_player, fixture_count, coverage
+        team_best_players, league_best_player, metric_player_awards, fixture_count, coverage
         FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season
         AND period_start=:period'''), {**params, 'period': chosen}).mappings().first()
     # On a new period boundary, queue a refresh once so an empty or newly played
@@ -71,7 +71,7 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
     season_result['coverage'] = coverage
     if league_id not in EUROPEAN_LEAGUES and row['calculation_version'] != SEASON_SUMMARY_VERSION:
         # Never show the previous unrestricted season winners during rebuilding.
-        season_result.update(team_best_players={}, league_best_player=None,
+        season_result.update(team_best_players={}, league_best_player=None, metric_player_awards={},
                              status='failed' if row['status'] == 'failed' else 'pending')
     scope = scope or ('league' if league_id in EUROPEAN_LEAGUES else 'overall')
     if league_id in EUROPEAN_LEAGUES:
@@ -95,7 +95,8 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
         hydrate_winner_images(db, biweekly_result)
     return {'leagueId': league_id, 'seasonId': season_id, 'season': season_result,
             'biweekly': biweekly_result,
-            'periods': [dict(p) for p in periods], 'selectedPeriodStart': chosen,
+            'periods': [{key: p[key] for key in ('period_start', 'period_end', 'fixture_count')} for p in periods], 'selectedPeriodStart': chosen,
+            'playerAwardMetrics': sorted(PLAYER_AWARD_METRICS),
             'periodTimezone': 'Europe/Istanbul',
             # A missing period can wait for the next scheduled check; do not
             # make browsers poll for hours while no refresh is running.
@@ -181,7 +182,7 @@ def refresh(job):
                         renew(db, job)
                         db.execute(text('UPDATE league_match_contributions SET included_in_aggregation=TRUE,updated_at=NOW() WHERE fixture_id=:id'), {'id': fid})
                 continue
-            detail = provider(session, f'fixtures/{fid}', include='participants;state;statistics.type;lineups.player;lineups.details.type;xGFixture.type')
+            detail = provider(session, f'fixtures/{fid}', include='participants;state;statistics.type;lineups.player;lineups.details.type;lineups.xGLineup.type;xGFixture.type')
             contribution = normalize_fixture(detail)
             contribution['coverage']['scope'] = fixture['_scope']
             if contribution['league_id'] != job['league'] or contribution['season_id'] != job['season']:
@@ -279,7 +280,8 @@ def publish(job, season):
                     periods.append({'period_start': start.isoformat(), 'period_end': (start + timedelta(days=14)).isoformat(),
                                     'status': 'ready', 'computed_at': datetime.now(timezone.utc).isoformat(),
                                     'fixture_count': summary['fixture_count'], 'coverage': summary['coverage'],
-                                    'team_best_players': summary['team_best_players'], 'league_best_player': summary['league_best_player']})
+                                    'team_best_players': summary['team_best_players'], 'league_best_player': summary['league_best_player'],
+                                    'metric_player_awards': summary['metric_player_awards']})
                 stage_summaries[scope_key] = {'season': total, 'periods': periods}
             result['coverage']['stageSummaries'] = stage_summaries
             if '_main_team_count' in season:
@@ -287,10 +289,11 @@ def publish(job, season):
         hydrate_winner_images(db, result)
         params = {**job, **result, 'version': SCOPED_VERSION if scoped else SEASON_SUMMARY_VERSION, 'season_name': season.get('name'),
                   'league_name': (season.get('league') or {}).get('name'), 'finished': bool(season.get('finished'))}
-        for field in ('team_metrics', 'metric_catalog', 'player_rating_totals', 'team_best_players', 'league_best_player', 'coverage'):
+        for field in ('team_metrics', 'metric_catalog', 'player_rating_totals', 'team_best_players', 'league_best_player', 'metric_player_awards', 'coverage'):
             params[field] = json.dumps(params[field])
         db.execute(text('''UPDATE league_season_summaries SET team_metrics=CAST(:team_metrics AS jsonb),
             metric_catalog=CAST(:metric_catalog AS jsonb),player_rating_totals=CAST(:player_rating_totals AS jsonb),
+            metric_player_awards=CAST(:metric_player_awards AS jsonb),
             team_best_players=CAST(:team_best_players AS jsonb),league_best_player=NULLIF(CAST(:league_best_player AS jsonb),'null'::jsonb),
             coverage=CAST(:coverage AS jsonb),fixture_count=:fixture_count,latest_included_kickoff_at=:latest_included_kickoff_at,
             league_name=:league_name,season_name=:season_name,calculation_version=:version,status='ready',
@@ -304,6 +307,11 @@ def hydrate_winner_images(db, result):
     players = [*winners.values()]
     if result.get('league_best_player'):
         players.append(result['league_best_player'])
+    for modes in (result.get('metric_player_awards') or {}).values():
+        for awards in modes.values():
+            players.extend(awards['team_best_players'].values())
+            if awards.get('league_best_player'):
+                players.append(awards['league_best_player'])
     ids = list({p['playerId'] for p in players})
     if not ids:
         return
@@ -316,12 +324,14 @@ def save_period(db, job, start, result):
     hydrate_winner_images(db, result)
     p = {**job, 'start': start, 'end': start + timedelta(days=14), 'version': VERSION,
          'teams': json.dumps(result['team_best_players']), 'best': json.dumps(result['league_best_player']),
-         'coverage': json.dumps(result['coverage']), 'count': result['fixture_count']}
+         'coverage': json.dumps(result['coverage']), 'count': result['fixture_count'],
+         'awards': json.dumps(result['metric_player_awards'])}
     db.execute(text('''INSERT INTO league_biweekly_summaries
-        (league_id,season_id,period_start,period_end,team_best_players,league_best_player,coverage,fixture_count,calculation_version,status,computed_at,last_checked_at)
-        VALUES (:league,:season,:start,:end,CAST(:teams AS jsonb),NULLIF(CAST(:best AS jsonb),'null'::jsonb),CAST(:coverage AS jsonb),:count,:version,'ready',NOW(),NOW())
+        (league_id,season_id,period_start,period_end,team_best_players,league_best_player,metric_player_awards,coverage,fixture_count,calculation_version,status,computed_at,last_checked_at)
+        VALUES (:league,:season,:start,:end,CAST(:teams AS jsonb),NULLIF(CAST(:best AS jsonb),'null'::jsonb),CAST(:awards AS jsonb),CAST(:coverage AS jsonb),:count,:version,'ready',NOW(),NOW())
         ON CONFLICT (league_id,season_id,period_start) DO UPDATE SET
         team_best_players=EXCLUDED.team_best_players,league_best_player=EXCLUDED.league_best_player,
+        metric_player_awards=EXCLUDED.metric_player_awards,
         coverage=EXCLUDED.coverage,fixture_count=EXCLUDED.fixture_count,calculation_version=EXCLUDED.calculation_version,
         status='ready',computed_at=NOW(),last_checked_at=NOW(),updated_at=NOW(),last_error=NULL'''), p)
 

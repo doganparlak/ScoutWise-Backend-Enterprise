@@ -21,16 +21,23 @@ from typing import Any
 
 import requests
 
-from report_module.metric_validation import is_standard_count, nonzero_evidence, nonzero_metric_rows, nonzero_report_metric_evidence, percentage, rate_counts, valid_metric
+from report_module.rate_evidence import missing_attempt_names, key as rate_key
+from report_module.metric_validation import is_standard_count, nonzero_evidence, nonzero_metric_rows, nonzero_report_metric_evidence, percentage, pooled_rate_counts, valid_metric
 
 from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError
 from .regional_play import aggregate_regional_play, regional_perspective
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
 
 
-PRE_MATCH_SCHEMA_VERSION = 10
+PRE_MATCH_SCHEMA_VERSION = 12
 
 _COMPLETED_STATES = {"FT", "AET", "PEN", "WO", "AP"}
+
+
+def has_recent_squad_usage(content: dict[str, Any]) -> bool:
+    """Distinguish a saved historical sample from a swallowed provider failure."""
+    usage = content.get("recent_squad_usage") or {}
+    return bool(usage.get("teams"))
 
 
 def _as_int(value: Any) -> int:
@@ -196,6 +203,7 @@ _PLAYER_NEGATIVE_METRIC_TERMS = (
 _PLAYER_METRIC_MIN_RECORDED_MINUTES = 90
 _PLAYER_HIGHLIGHT_EXCLUDED_METRICS = {
     "Long Balls Won Percentage",
+    "Long Balls Won (%)",
     "Tacles Won Percentage",
     "Tackles Won Percentage",
     "Tackles Won (%)",
@@ -207,13 +215,7 @@ _PLAYER_DEVELOPMENT_EXCLUDED_METRICS = {
     "fouls drawn",
 }
 _PLAYER_RATE_METRIC_TERMS = ("percentage", "accuracy", "success rate", "conversion rate")
-_DERIVED_PLAYER_PERCENTAGES: dict[str, tuple[str, str]] = {
-    "Accurate Passes Percentage": ("Accurate Passes", "Passes"),
-    "Long Balls Won Percentage": ("Long Balls Won", "Long Balls"),
-    "Aerials Won Percentage": ("Aerials Won", "Aerials"),
-    "Duels Won Percentage": ("Duels Won", "Total Duels"),
-    "Tackles Won (%)": ("Tackles Won", "Tackles"),
-}
+_DERIVED_PLAYER_PERCENTAGES = DERIVED_PERCENTAGE_METRICS
 
 # SportMonks has emitted both spellings in lineup details. Canonicalising
 # them prevents duplicate metrics and routes the value through i18n.
@@ -248,7 +250,8 @@ def _lineup_numeric_metrics(row: dict[str, Any]) -> dict[str, float]:
             and "%" not in name
             and not any(term in name.casefold() for term in _PLAYER_RATE_METRIC_TERMS)
         ):
-            values[name] = values.get(name, 0.0) + value
+            canonical = PLAYER_METRIC_CATEGORY[name][1]
+            values[canonical] = values.get(canonical, 0.0) + value
     return values
 
 
@@ -259,22 +262,36 @@ def _match_covered_count_metrics(row: dict[str, Any], covered_names: set[str]) -
     """
     values = _lineup_numeric_metrics(row)
     present = {
-        _PLAYER_METRIC_NAME_ALIASES.get(name, name)
+        PLAYER_METRIC_CATEGORY.get(_PLAYER_METRIC_NAME_ALIASES.get(name, name), (None, name))[1]
         for detail in row.get("details") or []
         for name in [str((detail.get("type") or {}).get("name") or detail.get("name") or "").strip()]
     }
+    protected = missing_attempt_names(values)
     for name in sorted(covered_names - present):
-        values[name] = 0.0
+        if rate_key(name) not in protected:
+            values[name] = 0.0
+    return values
+
+
+def _lineup_rate_inputs(row):
+    values = _lineup_numeric_metrics(row)
+    for detail in [*(row.get("xglineup") or row.get("xGLineup") or []), *(row.get("details") or [])]:
+        name = str((detail.get("type") or {}).get("name") or detail.get("name") or "")
+        if rate_key(name) not in {"expected_goals", "expected_goals_on_target"}:
+            continue
+        raw = detail.get("data")
+        raw = raw.get("value") if isinstance(raw, dict) else raw
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            values[name] = value
     return values
 
 
 def _lineup_rate_metrics(row: dict[str, Any]) -> dict[str, float]:
-    """Return rate metrics separately so they can be minute-weighted.
-
-    A rate such as Duels Won Percentage must never be added across matches or
-    run through the per-90 formula. It is a percentage for that appearance;
-    the aggregate is the minutes-weighted average of the available values.
-    """
+    """Canonicalise provider rates; known count-based rates are pooled separately."""
     values: dict[str, float] = {}
     for detail in row.get("details") or []:
         name = str((detail.get("type") or {}).get("name") or detail.get("name") or "").strip()
@@ -291,7 +308,7 @@ def _lineup_rate_metrics(row: dict[str, Any]) -> dict[str, float]:
             and name in PLAYER_METRIC_CATEGORY
             and ("%" in name or any(term in name.casefold() for term in _PLAYER_RATE_METRIC_TERMS))
         ):
-            values[name] = value
+            values[PLAYER_METRIC_CATEGORY[name][1]] = value
     return values
 
 
@@ -405,10 +422,13 @@ def _aggregate_team_comparison(
         if penalty_sample is not None:
             penalty_samples.append(penalty_sample)
         match_values.append(fixture_values)
+    protected = set().union(*(missing_attempt_names({name: value for items in values.values() for name, value in items.items()}) for values in match_values))
     aggregate: dict[str, list[dict[str, Any]]] = {}
     for group, metrics in samples.items():
         rows = []
         for name, values in metrics.items():
+            if rate_key(name) in protected:
+                continue
             if group == "expected" and name == PENALTY_XG:
                 average = penalty_xg_average(penalty_samples)
                 if average is not None:
@@ -421,10 +441,9 @@ def _aggregate_team_comparison(
             # Averaging an index does not make its unit a percentage.
             is_average = "%" in name or "percentage" in name.casefold() or "performance" in name.casefold()
             numerator_denominator = DERIVED_PERCENTAGE_METRICS.get(name)
-            pairs = [rate_counts(name, fixture_values.get(group, {}), *numerator_denominator)
-                     for fixture_values in match_values] if numerator_denominator else []
-            pairs = [pair for pair in pairs if pair is not None]
-            derived_rate = percentage(sum(a for a, _ in pairs), sum(b for _, b in pairs)) if pairs else None
+            pooled = pooled_rate_counts(name, [({name: value for items in values.values() for name, value in items.items()}, 1) for values in match_values],
+                                        *numerator_denominator) if numerator_denominator else None
+            derived_rate = percentage(pooled[0], pooled[1]) if pooled else None
             if numerator_denominator and derived_rate is None:
                 continue
             rows.append({
@@ -433,7 +452,7 @@ def _aggregate_team_comparison(
                 "value": round(derived_rate, 2) if derived_rate is not None else round(average, 2),
                 "total": round(derived_rate if derived_rate is not None else average if is_average else total, 2),
                 "aggregation": "derived_rate" if derived_rate is not None else "average" if is_average else "per_match",
-                "matches_covered": len(pairs) if numerator_denominator else len(values),
+                "matches_covered": int(pooled[2]) if pooled else len(values),
             })
         if rows:
             aggregate[group] = sorted(rows, key=lambda row: row["name"])
@@ -559,9 +578,8 @@ def _team_recent_squad_usage(
     player_metric_minutes: dict[int, Counter[str]] = defaultdict(Counter)
     player_rate_weighted_totals: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     player_rate_minutes: dict[int, Counter[str]] = defaultdict(Counter)
-    player_derived_rate_numerators: dict[int, Counter[str]] = defaultdict(Counter)
-    player_derived_rate_denominators: dict[int, Counter[str]] = defaultdict(Counter)
-    player_derived_rate_minutes: dict[int, Counter[str]] = defaultdict(Counter)
+    player_count_samples: dict[int, list[tuple[dict[str, float], float]]] = defaultdict(list)
+    player_derived_rates: dict[int, dict[str, tuple[float, float, float]]] = defaultdict(dict)
     pressure_samples: dict[int, list[float]] = {}
     momentum_events: list[dict[str, Any]] = []
     for fixture_index, fixture in enumerate(full_fixtures):
@@ -621,16 +639,8 @@ def _team_recent_squad_usage(
                     player_metric_totals[player_id][metric_name] += metric_value
                     # Include recorded and peer-covered omitted counts only.
                     player_metric_minutes[player_id][metric_name] += minutes
-                recorded_counts = _lineup_numeric_metrics(row)
-                for rate_name, (numerator_name, denominator_name) in _DERIVED_PLAYER_PERCENTAGES.items():
-                    pair = rate_counts(rate_name, recorded_counts, numerator_name, denominator_name)
-                    if pair is not None:
-                        numerator, denominator = pair
-                        player_derived_rate_numerators[player_id][rate_name] += numerator
-                        player_derived_rate_denominators[player_id][rate_name] += denominator
-                        player_derived_rate_minutes[player_id][rate_name] += minutes
-            # Percentages retain their meaning only as a minute-weighted
-            # average across appearances with that metric available.
+                player_count_samples[player_id].append((_lineup_rate_inputs(row), minutes))
+            # Rates without known count components retain the provider average.
             if minutes > 0:
                 for metric_name, metric_value in _lineup_rate_metrics(row).items():
                     if metric_name in _DERIVED_PLAYER_PERCENTAGES:
@@ -731,6 +741,11 @@ def _team_recent_squad_usage(
                 "average_rating": average_rating,
             })
     rows.sort(key=lambda item: (-item["starts"], -item["substitute_appearances"], item["player_name"]))
+    for player_id, count_samples in player_count_samples.items():
+        for rate_name, components in _DERIVED_PLAYER_PERCENTAGES.items():
+            pooled = pooled_rate_counts(rate_name, count_samples, *components)
+            if pooled is not None:
+                player_derived_rates[player_id][rate_name] = pooled
     eligible_performers = []
     for player_id, player in current_players.items():
         minutes = float(player_minutes[player_id])
@@ -751,15 +766,16 @@ def _team_recent_squad_usage(
                 }
                 for name, value in player_metric_totals[player_id].items()
                 if player_metric_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES and value >= 0
+                and not any(rate_key(name) in missing_attempt_names(counts) for counts, _ in player_count_samples[player_id])
             ] + [
                 {
                     "name": name,
-                    "value": round(player_derived_rate_numerators[player_id][name] * 100 / denominator, 2),
-                    "recorded_minutes": player_derived_rate_minutes[player_id][name],
+                    "value": round(numerator * 100 / denominator, 2),
+                    "recorded_minutes": covered_minutes,
                     "is_percentage": True,
                 }
-                for name, denominator in player_derived_rate_denominators[player_id].items()
-                if denominator > 0 and player_derived_rate_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
+                for name, (numerator, denominator, covered_minutes) in player_derived_rates[player_id].items()
+                if denominator > 0 and covered_minutes >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
             ] + [
                 {
                     "name": name,

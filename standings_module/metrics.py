@@ -1,15 +1,16 @@
 """Compact, mergeable standings statistics. No network, database or AI calls."""
 from __future__ import annotations
 
+from report_module.rate_evidence import empty, add_sample, rate_value, key as rate_key, RATES
 import hashlib
 import json
 import math
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from match_report_module.report import DERIVED_PERCENTAGE_METRICS, TEAM_METRIC_CATEGORY
+from match_report_module.report import DERIVED_PERCENTAGE_METRICS, TEAM_METRIC_CATEGORY, PLAYER_METRIC_CATEGORY
 
-VERSION = 1
+VERSION = 2
 PERIOD_ZONE = ZoneInfo('Europe/Istanbul')
 PERIOD_ANCHOR = date(2026, 1, 5)  # Monday; continuous 14-day blocks across years.
 COMPLETED_STATES = {5, 7, 8}  # FT, AET, FT after penalties; exclude walkovers.
@@ -21,6 +22,36 @@ LOWER_BETTER = {'Goals Conceded', 'Yellow Cards', 'Red Cards', 'Fouls', 'Offside
                 'Big Chances Missed', 'Shots Off Target', 'Penalties Committed',
                 'Penalties Missed', 'Possession Lost', 'Dispossessed',
                 'Error Lead To Goal', 'Error Lead To Shot', 'Duels Lost'}
+
+
+# Only semantically matching player metrics are eligible. In particular, fixture
+# Shots Blocked (58) describes the shooter's blocked attempts, not defensive blocks (97).
+PLAYER_COUNT_METRICS = frozenset({
+    'Accurate Crosses', 'Accurate Passes', 'Assists', 'Big Chances Created',
+    'Big Chances Missed', 'Blocked Shots', 'Dribble Attempts', 'Duels Won',
+    'Expected Goals', 'Expected Goals On Target', 'Fouls', 'Goals', 'Hit Woodwork',
+    'Interceptions', 'Key Passes', 'Long Balls', 'Long Balls Won', 'Offsides',
+    'Passes', 'Red Cards', 'Saves', 'Shooting Performance', 'Shots Off Target',
+    'Shots On Target', 'Shots Total', 'Successful Dribbles', 'Tackles',
+    'Tackles Won', 'Total Crosses', 'Yellow Cards',
+})
+PLAYER_RATE_METRICS = {name: pair for name, pair in DERIVED_PERCENTAGE_METRICS.items()
+                       if all(component in PLAYER_COUNT_METRICS for component in pair)}
+PLAYER_AWARD_METRICS = PLAYER_COUNT_METRICS | PLAYER_RATE_METRICS.keys()
+
+
+def player_metric_values(row):
+    values = {}
+    for detail in [*(row.get('details') or []), *(row.get('xglineup') or row.get('xGLineup') or [])]:
+        name = (detail.get('type') or {}).get('name') or ''
+        if name == 'Blocked Shots':
+            continue  # Defensive blocks are not fixture Shots Blocked.
+        canonical = PLAYER_METRIC_CATEGORY.get(name, (None, name))[1]
+        raw = detail.get('data') or {}
+        value = numeric(raw.get('value') if isinstance(raw, dict) and 'value' in raw else detail.get('value'))
+        if canonical in PLAYER_COUNT_METRICS and value is not None and (value >= 0 or canonical == 'Shooting Performance'):
+            values.setdefault(canonical, value)
+    return values
 
 
 def numeric(value):
@@ -75,7 +106,8 @@ def normalize_fixture(fixture):
         player = row.get('player') or {}
         players.append({'playerId': pid, 'teamId': tid,
                         'name': player.get('display_name') or player.get('name') or row.get('player_name') or str(pid),
-                        'imageUrl': player.get('image_path'), 'rating': rating, 'minutes': minutes})
+                        'imageUrl': player.get('image_path'), 'rating': rating, 'minutes': minutes,
+                        'metrics': player_metric_values(row)})
     result = {'fixture_id': int(fixture['id']), 'league_id': int(fixture['league_id']),
               'season_id': int(fixture['season_id']), 'kickoff_at': kickoff(fixture['starting_at']),
               'home_team_id': locations['home'], 'away_team_id': locations['away'],
@@ -85,6 +117,26 @@ def normalize_fixture(fixture):
                            'ratedPlayers': sum(p['rating'] is not None for p in players)}}
     result['source_fingerprint'] = hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()
     return result
+
+
+def _write_rates(metrics, evidence, names):
+    for name in names:
+        state = evidence['rates'].get(rate_key(name))
+        value = rate_value(name, state)
+        if value is None:
+            metrics.pop(name, None)
+            continue
+        metrics[name] = {'numerator': state['numerator'], 'denominator': state['denominator'],
+                         'matchesCovered': state['coverage'], 'numeratorMatchesCovered': state['coverage'],
+                         'rateValue': value}
+
+
+def _hide_incomplete_attempts(metrics, evidence):
+    incomplete = {RATES[name][1] for name, state in evidence.get('rates', {}).items()
+                  if state.get('missing_attempts')}
+    for name in list(metrics):
+        if rate_key(name) in incomplete:
+            metrics.pop(name)
 
 
 class Aggregate:
@@ -108,39 +160,43 @@ class Aggregate:
             if not self.include_team_metrics:
                 continue
             metrics = source['metrics']
+            add_sample(team.setdefault('_rate_inputs', empty()), metrics)
             for name, value in metrics.items():
                 if name in DERIVED_PERCENTAGE_METRICS:
                     continue  # Never average provider percentages for known ratios.
                 item = team['metrics'].setdefault(name, {'sum': 0.0, 'matchesCovered': 0})
                 item['sum'] += value
                 item['matchesCovered'] += 1
-            for name, (numerator, denominator) in DERIVED_PERCENTAGE_METRICS.items():
-                n, d = metrics.get(numerator), metrics.get(denominator)
-                if n is None or d is None or d < 0:
-                    continue
-                item = team['metrics'].setdefault(name, {'numerator': 0.0, 'denominator': 0.0, 'matchesCovered': 0})
-                item['numerator'] += n
-                item['denominator'] += d
-                item['matchesCovered'] += 1
+            _write_rates(team['metrics'], team['_rate_inputs'], DERIVED_PERCENTAGE_METRICS)
         for p in row['player_contributions']:
             key = f"{p['teamId']}:{p['playerId']}"
-            item = self.players.setdefault(key, {**p, 'ratingSum': 0.0, 'ratedAppearances': 0, 'appearances': 0, 'minutes': 0.0})
+            item = self.players.setdefault(key, {**{k: v for k, v in p.items() if k != 'metrics'}, 'ratingSum': 0.0, 'ratedAppearances': 0, 'appearances': 0, 'minutes': 0.0, 'metricTotals': {}})
             item.update(name=p['name'], imageUrl=p.get('imageUrl'))
             item['appearances'] += 1
             item['minutes'] += p.get('minutes') or 0
             if p.get('rating') is not None:
                 item['ratingSum'] += p['rating']
                 item['ratedAppearances'] += 1
+            metrics = p.get('metrics') or {}
+            add_sample(item.setdefault('_rate_inputs', empty()), metrics)
+            for name, value in metrics.items():
+                if name not in PLAYER_COUNT_METRICS or numeric(value) is None:
+                    continue
+                total = item['metricTotals'].setdefault(name, {'sum': 0.0, 'matchesCovered': 0})
+                total['sum'] += value
+                total['matchesCovered'] += 1
+            _write_rates(item['metricTotals'], item['_rate_inputs'], PLAYER_RATE_METRICS)
 
     def finish(self, *, season_awards=False):
         catalog = {}
         for team in self.teams.values():
             if not self.include_team_metrics:
                 continue
+            _hide_incomplete_attempts(team['metrics'], team.get('_rate_inputs') or empty())
             for name, metric in team['metrics'].items():
                 kind = 'derived_rate' if name in DERIVED_PERCENTAGE_METRICS else 'average' if name in AVERAGES or '%' in name or 'percentage' in name.casefold() or 'performance' in name.casefold() else 'total'
                 if kind == 'derived_rate':
-                    value = metric['numerator'] / metric['denominator'] * 100 if metric['denominator'] else None
+                    value = metric.get('rateValue')
                     per_match = value
                 else:
                     per_match = metric['sum'] / metric['matchesCovered']
@@ -149,7 +205,8 @@ class Aggregate:
                               perMatch=round(per_match, 4) if per_match is not None else None, aggregation=kind)
                 catalog[name] = {'key': name, 'label': name, 'aggregation': kind,
                                  'unit': '%' if kind == 'derived_rate' or '%' in name or 'percentage' in name.casefold() else '',
-                                 'direction': 'asc' if name in LOWER_BETTER else 'desc'}
+                                 'direction': 'asc' if name in LOWER_BETTER else 'desc',
+                                 'playerAwardSupported': name in PLAYER_AWARD_METRICS}
         def rank(p):
             return (-p['ratingSum'] / p['ratedAppearances'], -p['ratedAppearances'], -p['minutes'], p['playerId'], p['teamId'])
         winners = {}
@@ -163,10 +220,54 @@ class Aggregate:
         for player in sorted(eligible, key=rank):
             tid = str(player['teamId'])
             if tid not in winners:
-                winners[tid] = {k: v for k, v in player.items() if k not in {'rating', 'ratingSum'}}
+                winners[tid] = {k: v for k, v in player.items() if k not in {'rating', 'ratingSum', 'metricTotals', '_rate_inputs'}}
                 winners[tid].update(averageRating=round(player['ratingSum'] / player['ratedAppearances'], 2), teamName=self.teams[tid]['teamName'])
         league_best = next(iter(winners.values()), None)
         return {'team_metrics': self.teams, 'metric_catalog': sorted(catalog.values(), key=lambda m: m['label']),
                 'player_rating_totals': self.players, 'team_best_players': winners, 'league_best_player': league_best,
+                'metric_player_awards': self.metric_awards(season_awards=season_awards),
                 'fixture_count': self.fixture_count, 'latest_included_kickoff_at': self.latest,
                 'coverage': {'teamCount': len(self.teams), 'ratedPlayerCount': sum(p['ratedAppearances'] > 0 for p in self.players.values())}}
+
+
+    def metric_awards(self, *, season_awards=False):
+        awards = {}
+        for player in self.players.values():
+            _hide_incomplete_attempts(player['metricTotals'], player.get('_rate_inputs') or empty())
+        for name in sorted(PLAYER_AWARD_METRICS):
+            for mode in ('total', 'perMatch'):
+                candidates = []
+                for player in self.players.values():
+                    if season_awards and player['appearances'] * 2 < self.teams[str(player['teamId'])]['matches']:
+                        continue
+                    total = player['metricTotals'].get(name)
+                    if not total or not total['matchesCovered']:
+                        continue
+                    if name in PLAYER_RATE_METRICS:
+                        if total['denominator'] <= 0:
+                            continue
+                        value = total.get('rateValue')
+                        if value is None:
+                            continue
+                    else:
+                        value = total['sum'] / total['matchesCovered'] if mode == 'perMatch' or name in AVERAGES else total['sum']
+                    candidates.append((value, player, total))
+                def rank(candidate):
+                    value, player, total = candidate
+                    return (value if name in LOWER_BETTER else -value, -total['matchesCovered'], -player['minutes'], player['playerId'], player['teamId'])
+                winners = {}
+                for value, player, total in sorted(candidates, key=rank):
+                    tid = str(player['teamId'])
+                    if tid in winners:
+                        continue
+                    winner = {k: v for k, v in player.items() if k not in {'rating', 'ratingSum', 'metricTotals', '_rate_inputs'}}
+                    winner.update(teamName=self.teams[tid]['teamName'],
+                                  averageRating=round(player['ratingSum'] / player['ratedAppearances'], 2) if player['ratedAppearances'] else None,
+                                  awardMetric=name, awardValue=round(value, 4), awardMode=mode,
+                                  awardUnit='%' if name in PLAYER_RATE_METRICS else '', awardMatchesCovered=total['matchesCovered'])
+                    if name in PLAYER_RATE_METRICS:
+                        winner.update(awardNumerator=total['numerator'], awardDenominator=total['denominator'])
+                    winners[tid] = winner
+                # Keep empty supported entries: absence of data never falls back to ratings.
+                awards.setdefault(name, {})[mode] = {'team_best_players': winners, 'league_best_player': next(iter(winners.values()), None)}
+        return awards

@@ -16,14 +16,15 @@ import requests
 
 from report_module.crossing_metrics import CROSSING_RATE, normalize_crossing_rows
 
-from report_module.metric_validation import is_percentage, is_standard_count, zero_fill_counts, nonzero_evidence, percentage, rate_counts, valid_metric
+from report_module.rate_evidence import missing_attempt_names, key as rate_key
+from report_module.metric_validation import is_percentage, is_standard_count, zero_fill_counts, nonzero_evidence, percentage, rate_counts, pooled_rate_counts, valid_metric
 
 
 SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
-MATCH_REPORT_VERSION = 49
-TEAM_ANALYSIS_REPORT_VERSION = 60
+MATCH_REPORT_VERSION = 50
+TEAM_ANALYSIS_REPORT_VERSION = 62
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -176,6 +177,8 @@ DERIVED_PERCENTAGE_METRICS: dict[str, tuple[str, str]] = {
     "Long Balls Won (%)": ("Long Balls Won", "Long Balls"),
     "Accurate Passes (%)": ("Accurate Passes", "Passes"),
     "Accurate Crosses (%)": ("Accurate Crosses", "Total Crosses"),
+    "Shot Quality (%)": ("Expected Goals", "Shots Total"),
+    "On Target Shot Quality (%)": ("Expected Goals On Target", "Shots On Target"),
 }
 
 
@@ -239,11 +242,12 @@ def _upsert_percentage(
     denominator: float | None,
 ) -> None:
     value = percentage(numerator, denominator)
+    if name in {"Assist Efficiency (%)", "Shot Quality (%)", "On Target Shot Quality (%)"}:
+        if numerator is not None and denominator is not None and numerator >= 0 and denominator > 0:
+            value = min(100.0, numerator / denominator * 100)
     if name == CROSSING_RATE:
         rows[:] = normalize_crossing_rows(rows)
-        # Incomplete counts must not discard a valid provider-only rate.
-        if value is None:
-            return
+        # Known counts with missing attempts cannot use a provider-only fallback.
     # Other derived percentages retain their existing invalid-count behaviour.
     rows[:] = [row for row in rows if row.get("name") != name]
     if value is not None:
@@ -1445,7 +1449,8 @@ def build_team_report_metrics(
                 if not name or not valid_metric(name, value):
                     continue
                 samples[group][name].append(value)
-                match_values.setdefault(group, {})[name] = value
+                if not metric.get("_inferred_zero"):
+                    match_values.setdefault(group, {})[name] = value
         penalty_sample = penalty_xg_sample(match_values.get("expected", {}).get(PENALTY_XG), report.get("events") or [], team_id)
         if penalty_sample is not None:
             penalty_samples.append(penalty_sample)
@@ -1453,10 +1458,13 @@ def build_team_report_metrics(
             "fixture": (report.get("fixture") or {}).get("name") or (report.get("fixture") or {}).get("id"),
             "metrics": match_values,
         })
+    protected = set().union(*(missing_attempt_names({name: value for items in row["metrics"].values() for name, value in items.items()}) for row in match_rows))
     aggregate: dict[str, list[dict[str, Any]]] = {}
     for group, metrics in samples.items():
         aggregate[group] = []
         for name, values in metrics.items():
+            if rate_key(name) in protected:
+                continue
             if group == "expected" and name == PENALTY_XG:
                 average = penalty_xg_average(penalty_samples)
                 if average is not None:
@@ -1467,10 +1475,9 @@ def build_team_report_metrics(
             is_average = "%" in name or "percentage" in name.casefold() or "performance" in name.casefold()
             total = sum(values)
             numerator_denominator = DERIVED_PERCENTAGE_METRICS.get(name)
-            pairs = [rate_counts(name, row["metrics"].get(group, {}), *numerator_denominator)
-                     for row in match_rows] if numerator_denominator else []
-            pairs = [pair for pair in pairs if pair is not None]
-            derived_rate = percentage(sum(a for a, _ in pairs), sum(b for _, b in pairs)) if pairs else None
+            pooled = pooled_rate_counts(name, [({name: value for values in row["metrics"].values() for name, value in values.items()}, 1) for row in match_rows],
+                                        *numerator_denominator) if numerator_denominator else None
+            derived_rate = percentage(pooled[0], pooled[1]) if pooled else None
             if numerator_denominator and derived_rate is None:
                 continue
             aggregate[group].append({
@@ -1478,7 +1485,7 @@ def build_team_report_metrics(
                 "value": round(derived_rate, 2) if derived_rate is not None else round(total / len(values), 2) if is_average else round(total, 2),
                 "perMatch": round(derived_rate, 2) if derived_rate is not None else round(total / len(values), 2),
                 "aggregation": "derived_rate" if derived_rate is not None else "average" if is_average else "total",
-                "matchesCovered": len(pairs) if numerator_denominator else len(values),
+                "matchesCovered": int(pooled[2]) if pooled else len(values),
             })
         # Keep zero samples in the calculations, but hide zero aggregate rows.
         aggregate[group] = sorted(
@@ -1531,7 +1538,7 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
 
     Infer omitted counts only when another participant has that metric in the
     same fixture. Advanced metrics stay unknown. Require 90 covered minutes
-    per metric, including rate inputs.
+    per count metric and 90 covered denominator minutes for rates.
     """
     from copy import deepcopy
     from math import isfinite
@@ -1564,7 +1571,10 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
                            if is_standard_count(key[1], key[0])
                            and numeric(item.get("value")) is not None)
         for row, metrics, minutes in participants:
+            protected = missing_attempt_names({name: item.get("value") for (_, name), item in metrics.items() if not item.get("_inferred_zero")})
             for group, name in covered - metrics.keys():
+                if rate_key(name) in protected:
+                    continue
                 item = {"name": name, "value": 0.0, "_inferred_zero": True}
                 row.setdefault("categories", {}).setdefault(group, []).append(item)
                 metrics[group, name] = item
@@ -1576,23 +1586,32 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
             for key, item in metrics.items():
                 if numeric(item.get("value")) is not None:
                     coverage[key] += minutes
-        # Derive percentages from paired raw counts over identical fixtures,
-        # never from two per-90 values with different minute denominators.
-        groups = {group for _, metrics, _ in samples for group, _ in metrics}
-        for group in groups:
-            for name, (numerator, denominator) in DERIVED_PERCENTAGE_METRICS.items():
-                pairs = [(rate_counts(name, {metric_name: item.get("value")
-                                              for (metric_group, metric_name), item in metrics.items()
-                                              if metric_group == group and not item.get("_inferred_zero")}, numerator, denominator), minutes)
+        protected = set().union(*(missing_attempt_names({name: item.get("value") for (_, name), item in metrics.items() if not item.get("_inferred_zero")}) for _, metrics, _ in samples))
+        for group, metric in list(coverage):
+            if rate_key(metric) in protected:
+                coverage[group, metric] = 0
+        # Rate inputs retain recorded fixture coverage independently of volume counts.
+        count_samples = [({name: item.get("value") for (_, name), item in metrics.items() if not item.get("_inferred_zero")}, minutes)
                          for _, metrics, minutes in samples]
-                pairs = [(pair[0], pair[1], minutes) for pair, minutes in pairs if pair is not None]
-                covered_minutes = sum(minutes for _, _, minutes in pairs)
-                value = percentage(sum(a for a, _, _ in pairs), sum(b for _, b, _ in pairs)) if covered_minutes >= 90 else None
-                for row, metrics, _ in samples:
-                    item = metrics.get((group, name))
-                    if item is not None:
-                        item["value"] = value
-                coverage[group, name] = covered_minutes if value is not None else 0
+        for name, components in DERIVED_PERCENTAGE_METRICS.items():
+            pooled = pooled_rate_counts(name, count_samples, *components)
+            covered_minutes = pooled[2] if pooled else 0
+            value = percentage(pooled[0], pooled[1]) if pooled and covered_minutes >= 90 else None
+            group = next((group for group, canonical in PLAYER_METRIC_CATEGORY.values()
+                          if canonical == components[0]), None)
+            if "Shot Quality" in name:
+                group = "shooting"
+            if group is None:
+                continue
+            for row, metrics, _ in samples:
+                item = metrics.get((group, name))
+                if item is None and value is not None:
+                    item = {"name": name, "value": value}
+                    row.setdefault("categories", {}).setdefault(group, []).append(item)
+                    metrics[group, name] = item
+                elif item is not None:
+                    item["value"] = value
+            coverage[group, name] = covered_minutes if value is not None else 0
         for row, metrics, _ in samples:
             for group, items in sources(row).items():
                 filtered = [item for item in items if item.get("name") == "Minutes Played"
