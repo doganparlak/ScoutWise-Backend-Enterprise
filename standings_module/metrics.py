@@ -238,10 +238,13 @@ class Aggregate:
             for mode in ('total', 'perMatch'):
                 candidates = []
                 for player in self.players.values():
-                    if season_awards and player['appearances'] * 2 < self.teams[str(player['teamId'])]['matches']:
+                    team_matches = self.teams[str(player['teamId'])]['matches']
+                    if player['appearances'] * 2 < team_matches:
                         continue
                     total = player['metricTotals'].get(name)
-                    if not total or not total['matchesCovered']:
+                    # Coverage includes recorded zeroes; positive events are not
+                    # required in one-fifth of matches (important for rare stats).
+                    if not total or not total['matchesCovered'] or total['matchesCovered'] * 5 < team_matches:
                         continue
                     if name in PLAYER_RATE_METRICS:
                         if total['denominator'] <= 0:
