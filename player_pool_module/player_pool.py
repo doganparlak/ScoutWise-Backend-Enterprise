@@ -26,8 +26,8 @@ PLAYER_IMAGE_JOIN = """
         LEFT JOIN LATERAL (
             SELECT image_url FROM enterprise_player_images images
             WHERE images.player_id = CASE
-                WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+$'
-                THEN (metadata->>'player_id')::bigint ELSE NULL END
+                WHEN COALESCE(metadata->>'player_id', '') ~ '^[0-9]+([.]0+)?$'
+                THEN trunc((metadata->>'player_id')::numeric)::bigint ELSE NULL END
               AND images.image_status = 'available'
             OFFSET 0
         ) epi ON TRUE

@@ -3692,7 +3692,7 @@ def create_enterprise_player_pool_report(
     if streaming_requested(request):
         return stream_report(lambda db: create_enterprise_player_pool_report(payload, user_id, accept_language, db))
     lang = normalize_lang(accept_language) or "en"
-    version = 15
+    version = 16
     player_payload = payload.model_dump(exclude_none=True)
     return _get_or_create_enterprise_player_pool_report_from_payload(
         db,
@@ -3716,7 +3716,7 @@ def get_or_create_enterprise_scouting_report(
     if streaming_requested(request):
         return stream_report(lambda db: get_or_create_enterprise_scouting_report(favorite_id, background_tasks, payload, user_id, accept_language, db))
     lang = normalize_lang(accept_language) or "en"
-    version = 15
+    version = 16
 
     favorite_row = _get_owned_enterprise_favorite(db, favorite_id, user_id)
     player_payload = _enterprise_favorite_identity(favorite_row)

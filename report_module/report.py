@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from player_pool_module.utilities import player_name_pattern
 
+from report_module.scouting_evidence import sanitize_scouting_documents
+
 from report_module.metric_validation import percentage, sanitize_percentages, valid_metric
 
 from report_module.percentiles import build_domestic_percentiles
@@ -959,11 +961,11 @@ def _phase_taxonomy_roles(player_card: Dict[str, Any]) -> List[Tuple[str, float]
 
 def _metric_context_value(metric_docs: List[Dict[str, Any]], metric_name: str) -> Optional[Any]:
     selected: Optional[Any] = _derived_metric_value(metric_name, metric_docs)
-    if selected not in (None, "") and valid_metric(metric_name, selected):
+    if selected not in (None, "") and valid_metric(metric_name, selected, nonzero=True):
         return selected
     for doc in metric_docs or []:
         selected = _metric_value_from_metadata(doc.get("metadata") or {}, metric_name)
-        if selected not in (None, "") and valid_metric(metric_name, selected):
+        if selected not in (None, "") and valid_metric(metric_name, selected, nonzero=True):
             return selected
     return None
 
@@ -1380,7 +1382,7 @@ def _build_derived_efficiency_context(metric_docs: List[Dict[str, Any]]) -> str:
                 selected = _to_float(_metric_value_from_metadata(doc.get("metadata") or {}, metric))
                 if selected is not None:
                     break
-        if selected is not None and valid_metric(metric, selected):
+        if selected is not None and valid_metric(metric, selected, nonzero=True):
             values.append(f"- {metric}: value={selected:g}, meaning={meaning}")
 
     lines = [
@@ -1417,7 +1419,7 @@ def _build_category_metric_context(player_card: Dict[str, Any], metric_docs: Lis
                 selected = _metric_value_from_metadata(doc.get("metadata") or {}, metric)
                 if selected not in (None, ""):
                     break
-            if selected not in (None, "") and valid_metric(metric, selected):
+            if selected not in (None, "") and valid_metric(metric, selected, nonzero=True):
                 values.append(f"{metric}={selected}")
         if values:
             category_values[category] = values
@@ -1687,7 +1689,7 @@ def build_player_card_from_docs(metric_docs: List[Dict[str, Any]]) -> Dict[str, 
 
 
 def _build_llm_input(player_card: Dict[str, Any], metric_docs: List[Dict[str, Any]]) -> str:
-    metric_docs = sanitize_percentages(metric_docs)
+    metric_docs = sanitize_scouting_documents(sanitize_percentages(metric_docs))
     parts: List[str] = ["PLAYER_CARD_JSON:", str(player_card or {}), "\nMETRIC_DOCUMENTS (newest first):"]
     parts.insert(0, _role_constraint_block(player_card))
     parts.insert(1, _build_metric_significance_block(metric_docs))
@@ -1751,7 +1753,7 @@ def generate_report_content(
     content_json = {
         "favorite_player_id": favorite_id, "language": lang, "version": version,
         "player_identity": identity, "player_card": player_card,
-        "metrics_docs": sanitize_percentages(docs), "report_text": "",
+        "metrics_docs": sanitize_scouting_documents(sanitize_percentages(docs)), "report_text": "",
     }
     source_metadata = (docs[0].get("metadata") or {}) if docs else {}
     content_json["domestic_percentiles"] = build_domestic_percentiles(db, source_metadata)
