@@ -120,9 +120,14 @@ def _request_json(path, params):
 
 
 def _pages(path, leagues, timezone_name=None):
+    # Never download the unrestricted feed when coverage is empty.
+    if not leagues:
+        return []
     token = os.getenv('SPORTMONKS_API_KEY')
     if not token:
         raise SportMonksError('Fixture data service is not configured')
+
+    covered = set(leagues)
 
     def fetch(ids=None):
         rows = []
@@ -133,8 +138,18 @@ def _pages(path, leagues, timezone_name=None):
                 **({'filters': 'fixtureLeagues:' + ','.join(map(str, ids))} if ids else {}),
                 **({'timezone': timezone_name} if timezone_name else {}),
             })
-            rows.extend(payload.get('data') or [])
-            if not (payload.get('pagination') or {}).get('has_more'):
+            # Keep only compact covered fixtures between pages. Raw provider
+            # payloads include nested teams, scores and periods and otherwise
+            # accumulate across every page and concurrent league batch.
+            for raw in payload.get('data') or []:
+                if (raw.get('league') or {}).get('id') not in covered:
+                    continue
+                item = _compact(raw, timezone_name or 'UTC')
+                if item is not None:
+                    rows.append(item)
+            has_more = (payload.get('pagination') or {}).get('has_more')
+            del payload
+            if not has_more:
                 return rows
         raise SportMonksError('Fixture pagination exceeded the supported range')
 
@@ -145,7 +160,7 @@ def _pages(path, leagues, timezone_name=None):
         chunks = [leagues[index:index + 50] for index in range(0, len(leagues), 50)]
         with ThreadPoolExecutor(max_workers=3) as pool:
             rows = [row for batch in pool.map(fetch, chunks) for row in batch]
-        return list({row['id']: row for row in rows}.values())
+        return list({row['fixtureId']: row for row in rows}.values())
     return fetch()
 
 
@@ -245,8 +260,8 @@ def _refresh_day(selected: date, timezone_name: str, leagues):
             first = datetime.combine(selected, daytime.min, zone).astimezone(timezone.utc)
             last = datetime.combine(selected + timedelta(days=1), daytime.min, zone).astimezone(timezone.utc)
             rows = _pages(f'fixtures/date/{selected.isoformat()}', leagues, timezone_name)
-            fixtures = {item['fixtureId']: item for raw in rows if (item := _compact(raw, timezone_name))
-                        and item['league']['id'] in leagues and first <= _kickoff(item) < last}
+            fixtures = {item['fixtureId']: item for item in rows
+                        if item['league']['id'] in leagues and first <= _kickoff(item) < last}
             _remember(base_key, fixtures, 300 if abs((selected - today).days) <= 1 else 1800)
         fixtures = dict(fixtures)
         if selected == today or any(is_live(item) for item in fixtures.values()):
@@ -254,7 +269,7 @@ def _refresh_day(selected: date, timezone_name: str, leagues):
             with _singleflight(live_key):
                 live = _cached(live_key)
                 if live is None:
-                    live = [item for raw in _pages('livescores', leagues) if (item := _compact(raw))]
+                    live = _pages('livescores', leagues)
                     _remember(live_key, live, LIVE_REFRESH_SECONDS)
             # This feed also includes games finished in the last 15 minutes,
             # so final scores replace in-play rows rather than disappearing.
