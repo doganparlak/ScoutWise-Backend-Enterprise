@@ -11,6 +11,7 @@ import os
 
 import requests
 from sqlalchemy import text
+from api_module import shared_match_cache as shared_cache
 
 from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError, _fixture_out
 
@@ -24,8 +25,9 @@ _WARM_STOP = Event()
 _WARM_THREAD = None
 _WARM_ZONES = OrderedDict()
 _LOG = logging.getLogger(__name__)
+_PROVIDER_RETRY_AT = 0
 _INCLUDES = 'participants;league.country;season;state;scores;periods'
-LIVE_REFRESH_SECONDS = 8
+LIVE_REFRESH_SECONDS = 20
 
 LIVE_STATES = {'INPLAY_1ST_HALF', 'INPLAY_2ND_HALF', 'HT', 'INPLAY_ET', 'ET', 'BREAK', 'PEN_LIVE', 'LIVE', '1ST', '2ND', 'INT', 'SUSP'}
 
@@ -41,7 +43,14 @@ def _singleflight(key):
         entry[1] += 1
     try:
         with entry[0]:
-            yield
+            if shared_cache.supported(key):
+                try:
+                    with shared_cache.refresh_lock(key):
+                        yield
+                except TimeoutError:
+                    raise SportMonksError('Match refresh is temporarily busy') from None
+            else:
+                yield
     finally:
         with _LOCK:
             entry[1] -= 1
@@ -50,6 +59,8 @@ def _singleflight(key):
 
 
 def _remember(key, value, seconds):
+    if shared_cache.supported(key):
+        shared_cache.write(key, value, seconds)
     with _LOCK:
         _CACHE[key] = (monotonic() + seconds, value)
         _CACHE.move_to_end(key)
@@ -64,10 +75,24 @@ def _cached(key):
         if item and item[0] > monotonic():
             _CACHE.move_to_end(key)
             return item[1]
+    if shared_cache.supported(key):
+        saved = shared_cache.read(key)
+        if saved is not None and saved[1] > 0:
+            value, remaining = saved
+            with _LOCK:
+                _CACHE[key] = (monotonic() + remaining, value)
+                _CACHE.move_to_end(key)
+                while len(_CACHE) > 128:
+                    _CACHE.popitem(last=False)
+            return value
     return None
 
 
 def _previous(key):
+    if shared_cache.supported(key):
+        saved = shared_cache.read(key)
+        if saved is not None:
+            return saved[0]
     with _LOCK:
         entry = _CACHE.get(key)
         return entry[1] if entry else None
@@ -75,7 +100,7 @@ def _previous(key):
 
 def _queue_refresh(key, refresh):
     with _LOCK:
-        if key in _REFRESHES or _RETRY_AT.get(key, 0) > monotonic() or len(_REFRESHES) >= 32:
+        if key in _REFRESHES or max(_RETRY_AT.get(key, 0), _PROVIDER_RETRY_AT) > monotonic() or len(_REFRESHES) >= 32:
             return False
         _REFRESHES.add(key)
 
@@ -84,11 +109,12 @@ def _queue_refresh(key, refresh):
             refresh()
             with _LOCK:
                 _RETRY_AT.pop(key, None)
-        except Exception:
+        except Exception as exc:
             # Never log provider URLs or credentials on connection errors.
-            _LOG.warning('Daily fixture background refresh failed; retaining cached data')
+            _LOG.warning('Daily fixture background refresh failed (%s); retaining cached data',
+                         str(exc) if isinstance(exc, SportMonksError) else type(exc).__name__)
             with _LOCK:
-                _RETRY_AT[key] = monotonic() + 30
+                _RETRY_AT[key] = max(monotonic() + 30, _PROVIDER_RETRY_AT)
                 while len(_RETRY_AT) > 128:
                     _RETRY_AT.popitem(last=False)
         finally:
@@ -110,8 +136,27 @@ def _covered_leagues(db):
 
 
 def _request_json(path, params):
+    global _PROVIDER_RETRY_AT
+    with _LOCK:
+        remaining = _PROVIDER_RETRY_AT - monotonic()
+    if remaining > 0:
+        raise SportMonksError('Fixture data provider rate limit reached; waiting before retrying')
+    remaining = shared_cache.provider_cooldown()
+    if remaining > 0:
+        with _LOCK:
+            _PROVIDER_RETRY_AT = max(_PROVIDER_RETRY_AT, monotonic() + remaining)
+        raise SportMonksError('Fixture data provider rate limit reached; waiting before retrying')
     try:
         response = requests.get(f'{SPORTMONKS_BASE_URL}/{path}', params=params, timeout=25)
+        if response.status_code == 429:
+            try:
+                delay = max(1, float(response.headers.get('Retry-After', '60')))
+            except (TypeError, ValueError):
+                delay = 60
+            with _LOCK:
+                _PROVIDER_RETRY_AT = max(_PROVIDER_RETRY_AT, monotonic() + delay)
+            shared_cache.defer_provider(delay)
+            raise SportMonksError('Fixture data provider rate limit reached; waiting before retrying')
         if response.status_code != 200:
             raise SportMonksError(f'Fixture data request failed (HTTP {response.status_code})')
         return response.json()
@@ -295,9 +340,6 @@ def daily_fixtures(db, selected: date, timezone_name: str):
         while len(_WARM_ZONES) > 8:
             _WARM_ZONES.popitem(last=False)
     leagues = _covered_leagues(db)
-    bounds = calendar_bounds(db, timezone_name, leagues)
-    if not bounds['minDate'] <= selected.isoformat() <= bounds['maxDate']:
-        raise ValueError('Choose a date within the available fixture calendar')
     if not leagues:
         return {'date': selected.isoformat(), 'fixtures': [], 'refreshAfter': 300 if selected == today else None, 'stale': False}
     key = ('day', selected.isoformat(), timezone_name, leagues)
@@ -307,10 +349,12 @@ def daily_fixtures(db, selected: date, timezone_name: str):
     previous = _previous(key)
     if previous is not None:
         _queue_refresh(key, lambda: _refresh_day(selected, timezone_name, leagues))
-        with _LOCK:
-            failed = _RETRY_AT.get(key, 0) > monotonic()
-        # A short silent follow-up fetch picks up the completed refresh.
-        return {**previous, 'refreshAfter': 30 if failed else LIVE_REFRESH_SECONDS, 'stale': failed}
+        # Serve the persisted snapshot even if the calendar/provider is down.
+        # Provider failures stay internal; clients keep polling silently.
+        return {**previous, 'refreshAfter': LIVE_REFRESH_SECONDS, 'stale': False}
+    bounds = calendar_bounds(db, timezone_name, leagues)
+    if not bounds['minDate'] <= selected.isoformat() <= bounds['maxDate']:
+        raise ValueError('Choose a date within the available fixture calendar')
     return _refresh_day(selected, timezone_name, leagues)
 
 

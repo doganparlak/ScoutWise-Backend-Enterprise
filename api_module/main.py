@@ -2160,8 +2160,8 @@ def match_calendar(timezone: str = "Europe/Istanbul", user_id: str = Depends(req
         return calendar_bounds(db, timezone)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except SportMonksError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except SportMonksError:
+        raise HTTPException(status_code=502, detail="Match calendar is temporarily unavailable") from None
 
 
 @app.get("/match-analysis/daily")
@@ -2171,8 +2171,8 @@ def daily_matches(day: dt.date = FastAPIQuery(...), timezone: str = "Europe/Ista
         return daily_fixtures(db, day, timezone)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except SportMonksError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except SportMonksError:
+        raise HTTPException(status_code=502, detail="Match data is temporarily unavailable") from None
 
 
 @app.on_event("startup")
