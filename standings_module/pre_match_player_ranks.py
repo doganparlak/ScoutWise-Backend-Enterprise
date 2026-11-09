@@ -7,7 +7,7 @@ from api_module.database import engine
 from .metrics import Aggregate, VERSION, AVERAGES, PLAYER_RATE_METRICS, PLAYER_AWARD_METRICS, LOWER_BETTER, kickoff, numeric, player_metric_result
 from .stages import EUROPEAN_LEAGUES
 
-def rank_players(aggregate):
+def rank_players(aggregate, mode="per90"):
     aggregate.finish(season_awards=True)
     values = {}
     for player in aggregate.players.values():
@@ -15,7 +15,7 @@ def rank_players(aggregate):
         if player['ratedAppearances'] and player['appearances'] * 2 >= matches:
             values.setdefault('Rating', []).append((player['ratingSum'] / player['ratedAppearances'], player))
         for metric in PLAYER_AWARD_METRICS:
-            result = player_metric_result(player, matches, metric, 'per90')
+            result = player_metric_result(player, matches, metric, mode)
             if result is not None:
                 values.setdefault(metric, []).append((result[0], player))
     ranks = {}
@@ -29,14 +29,14 @@ def rank_players(aggregate):
             previous = value
             ranks.setdefault((player['teamId'], player['playerId']), {})[metric] = {
                 'position': position, 'total_players': len(candidates), 'season_value': round(value, 4),
-                'basis': 'average_rating' if metric == 'Rating' else 'rate' if metric in PLAYER_RATE_METRICS else 'average' if metric in AVERAGES else 'per90',
+                'basis': 'average_rating' if metric == 'Rating' else 'rate' if metric in PLAYER_RATE_METRICS else 'average' if metric in AVERAGES else mode,
                 'direction': 'asc' if metric in LOWER_BETTER else 'desc',
             }
     return ranks
 
 
 @lru_cache(maxsize=24)
-def cached_player_ranks(league, season, scope, minute):
+def cached_player_ranks(league, season, scope, minute, mode="per90"):
     cutoff = datetime.fromtimestamp(minute * 60, timezone.utc)
     aggregate = Aggregate(include_team_metrics=False)
     with engine.connect() as db:
@@ -51,7 +51,7 @@ def cached_player_ranks(league, season, scope, minute):
             values = {}
             for player in saved.get('players', []):
                 for metric, evidence in player.get('metrics', {}).items():
-                    value = numeric(evidence.get('per90'))
+                    value = numeric(evidence.get({'total': 'value', 'perMatch': 'perMatch', 'per90': 'per90'}[mode]))
                     if value is not None:
                         values.setdefault(metric, []).append((value, player))
             ranks = {}
@@ -64,7 +64,7 @@ def cached_player_ranks(league, season, scope, minute):
                     previous = value
                     ranks.setdefault((player['teamId'], player['playerId']), {})[metric] = {
                         'position': position, 'total_players': len(players), 'season_value': round(value, 4),
-                        'basis': 'average_rating' if metric == 'Rating' else 'rate' if metric in PLAYER_RATE_METRICS else 'average' if metric in AVERAGES else 'per90',
+                        'basis': 'average_rating' if metric == 'Rating' else 'rate' if metric in PLAYER_RATE_METRICS else 'average' if metric in AVERAGES else mode,
                         'direction': 'asc' if metric in LOWER_BETTER else 'desc',
                     }
             return ranks
@@ -88,7 +88,7 @@ def cached_player_ranks(league, season, scope, minute):
                 if phase not in ({'qualifying'} if scope == 'qualifying' else {'league', 'knockout'}):
                     continue
             aggregate.add(row)
-    return rank_players(aggregate)
+    return rank_players(aggregate, mode)
 
 
 def strip_player_ranks(usage):

@@ -109,6 +109,8 @@ from player_pool_module.weekly_popular import get_weekly_popular_players, record
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
 from team_portfolio_module.portfolio import router as team_portfolio_router, begin_report, finish_report
+from team_portfolio_module.rankings import router as team_report_rankings_router
+from team_portfolio_module.percentiles import router as team_report_percentiles_router
 from standings_module.search import get_league_performance_options, search_league_performance
 from match_analysis_module import get_fixture, get_match_filter_options, get_team_played_matches, resolve_league_id, resolve_team_id, search_fixtures, search_team_pool
 from match_analysis_module.match_analysis import SportMonksError
@@ -222,6 +224,8 @@ def require_enterprise_admin(db: Session, user_id: str, accept_language: str | N
 app = FastAPI(title="ScoutWise Enterprise Backend")
 app.include_router(nec_router)
 app.include_router(team_portfolio_router)
+app.include_router(team_report_rankings_router)
+app.include_router(team_report_percentiles_router)
 
 origins_env = os.environ.get("CORS_ORIGINS")
 origins = [origin.strip() for origin in origins_env.split(",")] if origins_env else ["*"]

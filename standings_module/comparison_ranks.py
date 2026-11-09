@@ -38,14 +38,14 @@ _LOCK = RLock()
 _IN_FLIGHT = {}
 
 
-def rank_metrics(teams):
+def rank_metrics(teams, mode="perMatch"):
     """Rank recorded full-season per-match values, with shared competition ranks."""
     values = {}
     for tid, team in teams.items():
         if not team.get('matches'):
             continue
         for name, metric in team.get('metrics', {}).items():
-            value = numeric(metric.get('perMatch'))
+            value = numeric(metric.get('perMatch' if mode == 'perMatch' or metric.get('aggregation') in {'average', 'derived_rate'} else 'value'))
             if value is not None and metric.get('matchesCovered', 0) > 0:
                 values.setdefault(canonical_metric_name(name), {})[str(tid)] = (value, metric)
     result = {}
