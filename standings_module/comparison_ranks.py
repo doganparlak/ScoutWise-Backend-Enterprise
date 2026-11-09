@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from api_module.database import engine
 from .metrics import Aggregate, LOWER_BETTER, COMPLETED_STATES, TEAM_METRIC_CATEGORY, kickoff, normalize_fixture, numeric
 from .stages import EUROPEAN_LEAGUES, stage_scope
+from .pre_match_player_ranks import strip_player_ranks
 
 _ALIASES = {name.casefold(): canonical for name, (_, canonical) in TEAM_METRIC_CATEGORY.items()}
 _ALIASES.update({
@@ -144,7 +145,8 @@ def _calculate_competition_ranks(league, season, cutoff, scope):
 
 
 def enrich_comparison_ranks(usage, fixture, now=None):
-    """Add optional metric ranks to a copy of a current pre-match sample."""
+    """Add optional team ranks; player ranks belong only in player comparison."""
+    usage = strip_player_ranks(usage)
     league = fixture.get('league') or {}
     season = fixture.get('season') or {}
     if not league.get('id') or not season.get('id'):
@@ -152,10 +154,9 @@ def enrich_comparison_ranks(usage, fixture, now=None):
     try:
         current = now or datetime.now(timezone.utc)
         start = kickoff(fixture.get('startingAt') or fixture.get('starting_at'))
-        if start <= current:  # Preserve saved historical reports.
-            return usage
+        cutoff = min(current, start)
         scope = 'qualifying' if league['id'] in EUROPEAN_LEAGUES and stage_scope(fixture.get('stage') or {}) == 'qualifying' else 'overall'
-        ranks = competition_ranks(int(league['id']), int(season['id']), current, scope)
+        ranks = competition_ranks(int(league['id']), int(season['id']), cutoff, scope)
         teams = []
         added = False
         for team in usage.get('teams') or []:
@@ -164,7 +165,7 @@ def enrich_comparison_ranks(usage, fixture, now=None):
             for category, metrics in (team.get('team_comparison') or {}).items():
                 categories[category] = []
                 for metric in metrics:
-                    value = by_metric.get(canonical_metric_name(metric['name']))
+                    value = (metric.get('competition_rank') if start <= current else None) or by_metric.get(canonical_metric_name(metric['name']))
                     clean = {k: v for k, v in metric.items() if k != 'competition_rank'}
                     if value and numeric(metric.get('value')) is not None:
                         clean['competition_rank'] = value
@@ -188,4 +189,8 @@ def enrich_comparison_ranks(usage, fixture, now=None):
 def enrich_report_comparison_ranks(content, fixture):
     if content.get('report_type') != 'pre_match' or not content.get('recent_squad_usage'):
         return content
-    return {**content, 'recent_squad_usage': enrich_comparison_ranks(content['recent_squad_usage'], fixture)}
+    from match_analysis_module.pre_match_player_comparison import enrich_player_comparison, ensure_player_comparison_overview
+    usage = enrich_comparison_ranks(content['recent_squad_usage'], fixture)
+    usage = enrich_player_comparison(usage, fixture)
+    usage = ensure_player_comparison_overview(usage, content.get('teams') or [], content.get('language') or 'en')
+    return {**content, 'recent_squad_usage': usage}

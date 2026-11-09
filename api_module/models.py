@@ -589,3 +589,15 @@ class LeagueInsightsIn(BaseModel):
     seasonId: int = Field(ge=1)
     periodStart: CalendarDate | None = None
     scope: Literal["qualifying", "league", "knockout", "overall"] | None = None
+
+
+class LeaguePlayerRankingsIn(BaseModel):
+    periodStart: CalendarDate | None = None
+    leagueId: int = Field(ge=1)
+    seasonId: int = Field(ge=1)
+    scope: Literal["qualifying", "league", "knockout", "overall"] | None = None
+    metric: str = Field(default="Rating", min_length=1, max_length=100)
+    mode: Literal["total", "perMatch", "per90"] = "total"
+    direction: Literal["asc", "desc"] | None = None
+    offset: int = Field(default=0, ge=0, le=100000)
+    limit: int = Field(default=50, ge=1, le=100)

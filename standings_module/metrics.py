@@ -40,6 +40,23 @@ PLAYER_RATE_METRICS = {name: pair for name, pair in DERIVED_PERCENTAGE_METRICS.i
 PLAYER_AWARD_METRICS = PLAYER_COUNT_METRICS | PLAYER_RATE_METRICS.keys()
 
 
+def player_metric_result(player, team_matches, name, mode='total'):
+    """Shared eligibility/value rules for metric awards and player leaderboards."""
+    if player['appearances'] * 2 < team_matches:
+        return None
+    total = player['metricTotals'].get(name)
+    if not total or not total['matchesCovered'] or total['matchesCovered'] * 5 < team_matches:
+        return None
+    if name in PLAYER_RATE_METRICS:
+        value = total.get('rateValue') if total['denominator'] > 0 else None
+    elif mode == 'per90' and name not in AVERAGES:
+        minutes = total.get('minutesCovered', 0)
+        value = total['sum'] * 90 / minutes if minutes > 0 and not total.get('missingMinutes') else None
+    else:
+        value = total['sum'] / total['matchesCovered'] if mode == 'perMatch' or name in AVERAGES else total['sum']
+    return (value, total) if value is not None else None
+
+
 def player_metric_values(row):
     values = {}
     for detail in [*(row.get('details') or []), *(row.get('xglineup') or row.get('xGLineup') or [])]:
@@ -185,6 +202,11 @@ class Aggregate:
                 total = item['metricTotals'].setdefault(name, {'sum': 0.0, 'matchesCovered': 0})
                 total['sum'] += value
                 total['matchesCovered'] += 1
+                minutes = numeric(p.get('minutes'))
+                if minutes is not None and minutes > 0:
+                    total['minutesCovered'] = total.get('minutesCovered', 0) + minutes
+                else:
+                    total['missingMinutes'] = True
             _write_rates(item['metricTotals'], item['_rate_inputs'], PLAYER_RATE_METRICS)
 
     def finish(self, *, season_awards=False):
@@ -235,25 +257,14 @@ class Aggregate:
         for player in self.players.values():
             _hide_incomplete_attempts(player['metricTotals'], player.get('_rate_inputs') or empty())
         for name in sorted(PLAYER_AWARD_METRICS):
-            for mode in ('total', 'perMatch'):
+            for mode in ('total', 'perMatch', 'per90'):
                 candidates = []
                 for player in self.players.values():
                     team_matches = self.teams[str(player['teamId'])]['matches']
-                    if player['appearances'] * 2 < team_matches:
+                    result = player_metric_result(player, team_matches, name, mode)
+                    if result is None:
                         continue
-                    total = player['metricTotals'].get(name)
-                    # Coverage includes recorded zeroes; positive events are not
-                    # required in one-fifth of matches (important for rare stats).
-                    if not total or not total['matchesCovered'] or total['matchesCovered'] * 5 < team_matches:
-                        continue
-                    if name in PLAYER_RATE_METRICS:
-                        if total['denominator'] <= 0:
-                            continue
-                        value = total.get('rateValue')
-                        if value is None:
-                            continue
-                    else:
-                        value = total['sum'] / total['matchesCovered'] if mode == 'perMatch' or name in AVERAGES else total['sum']
+                    value, total = result
                     candidates.append((value, player, total))
                 def rank(candidate):
                     value, player, total = candidate

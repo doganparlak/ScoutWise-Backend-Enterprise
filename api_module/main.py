@@ -42,6 +42,7 @@ from api_module.models import (
     LeagueStandingsIn,
     LeagueStandingsOut,
     LeagueInsightsIn,
+    LeaguePlayerRankingsIn,
     MatchAnalysisOptionsIn,
     MatchAnalysisOptionsOut,
     MatchAnalysisSearchIn,
@@ -2762,6 +2763,36 @@ def delete_enterprise_favorite_match(
     db.commit()
 
 
+@app.post("/favorite-matches/{favorite_id}/player-comparison")
+def enterprise_pre_match_player_comparison(favorite_id: uuid.UUID, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from match_analysis_module.pre_match_player_comparison import prepare_saved_comparison
+    row = db.execute(text("""SELECT report_content,fixture_payload FROM enterprise_favorite_matches
+        WHERE id=:id AND user_id=:uid AND report_type='pre_match' AND report_status='ready'"""),
+        {'id':str(favorite_id),'uid':user_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail='Saved pre-match report not found')
+    content = dict(row['report_content'] or {})
+    usage = content.get('recent_squad_usage') or {}
+    fixture = dict(row['fixture_payload'] or {})
+    original_teams = json.dumps(usage.get('teams') or [],default=str)
+    db.rollback()  # Do not hold a database connection while filling older snapshots.
+    try:
+        result = prepare_saved_comparison((str(favorite_id),original_teams),usage,fixture)
+    except (ValueError,KeyError,TypeError) as exc:
+        raise HTTPException(status_code=409, detail='The saved comparison window is incomplete; regenerate the report') from exc
+    except (SportMonksError,requests.RequestException,RuntimeError,TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail='Selected match statistics are temporarily unavailable; try again') from exc
+    changed = db.execute(text("""UPDATE enterprise_favorite_matches SET report_content=jsonb_set(
+        report_content,'{recent_squad_usage,player_comparison}',CAST(:data AS jsonb),true)
+        WHERE id=:id AND user_id=:uid AND report_type='pre_match' AND report_status='ready'
+          AND report_content->'recent_squad_usage'->'teams'=CAST(:original AS jsonb)"""),
+        {'id':str(favorite_id),'uid':user_id,'data':json.dumps(result,default=str),'original':original_teams}).rowcount
+    db.commit()
+    if not changed:
+        raise HTTPException(status_code=409, detail='The report changed; reopen it to compare players')
+    return result
+
+
 @app.get("/favorite-matches/{favorite_id}/report", response_model=EnterpriseMatchReportOut)
 def open_enterprise_match_report(
     favorite_id: uuid.UUID,
@@ -3835,6 +3866,16 @@ def league_insights(payload: LeagueInsightsIn, user_id: str = Depends(require_au
     del user_id
     try:
         return request_summary(db, payload.leagueId, payload.seasonId, payload.periodStart, payload.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/league-player-rankings")
+def league_player_rankings(payload: LeaguePlayerRankingsIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from standings_module.player_rankings import request_rankings
+    try:
+        return request_rankings(db, payload.leagueId, payload.seasonId, payload.scope,
+                                payload.metric, payload.mode, payload.direction, payload.offset, payload.limit, payload.periodStart)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

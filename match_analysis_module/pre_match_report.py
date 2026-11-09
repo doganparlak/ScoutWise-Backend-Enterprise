@@ -139,7 +139,7 @@ def _fixture_lineup_usage(fixture_id: int, team_id: int) -> dict[str, Any]:
         f"{SPORTMONKS_BASE_URL}/fixtures/{fixture_id}",
         params={
             "api_token": token,
-            "include": "participants;formations;lineups.player;lineups.position;lineups.details.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type",
+            "include": "participants;formations;lineups.player;lineups.position;lineups.details.type;lineups.xGLineup.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type",
         },
         timeout=35,
     )
@@ -564,6 +564,9 @@ def _team_recent_squad_usage(
     season_name: str,
     competition_id: int,
     reference_date: str,
+    *,
+    _comparison_fixtures: list[dict[str, Any]] | None = None,
+    _comparison_player_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     team_id = _as_int(team.get("id"))
     fallback = {
@@ -576,13 +579,16 @@ def _team_recent_squad_usage(
     }
     if not team_id:
         return fallback
-    current_player_ids = _current_team_player_ids(team_id)
-    fixtures = _recent_team_fixtures(team_id, season_id, season_name, competition_id, reference_date)
+    current_player_ids = _comparison_player_ids if _comparison_player_ids is not None else _current_team_player_ids(team_id)
+    fixtures = _comparison_fixtures if _comparison_fixtures is not None else _recent_team_fixtures(team_id, season_id, season_name, competition_id, reference_date)
     if not fixtures:
         return fallback
     fixture_ids = [_as_int(item.get("id")) for item in fixtures if _as_int(item.get("id"))]
-    with ThreadPoolExecutor(max_workers=min(5, len(fixture_ids))) as executor:
-        full_fixtures = list(executor.map(lambda fixture_id: _fixture_lineup_usage(fixture_id, team_id), fixture_ids))
+    if _comparison_fixtures is not None:
+        full_fixtures = _comparison_fixtures
+    else:
+        with ThreadPoolExecutor(max_workers=min(5, len(fixture_ids))) as executor:
+            full_fixtures = list(executor.map(lambda fixture_id: _fixture_lineup_usage(fixture_id, team_id), fixture_ids))
 
     players: dict[int, dict[str, Any]] = {}
     starts: Counter[int] = Counter()
@@ -777,15 +783,17 @@ def _team_recent_squad_usage(
                     for single in [pooled_rate_counts(rate_name, [(counts, 1)], *components)]
                 )
     eligible_performers = []
+    comparison_performers = []
     for player_id, player in current_players.items():
         minutes = float(player_minutes[player_id])
         rating_minutes = float(player_rating_minutes[player_id])
-        if minutes <= 90 or not rating_minutes:
+        if minutes <= 0:
             continue
-        eligible_performers.append({
+        performer = {
             **player,
             "minutes": round(minutes),
-            "average_rating": round(float(player_rating_weighted[player_id]) / rating_minutes, 2),
+            "average_rating": round(float(player_rating_weighted[player_id]) / rating_minutes, 2) if rating_minutes else None,
+            "appearances": int(starts[player_id] + substitute_appearances[player_id]),
             "goals": int(player_goals[player_id]),
             "per90_metrics": [
                 {
@@ -819,7 +827,16 @@ def _team_recent_squad_usage(
                 for name, weighted_value in player_rate_weighted_totals[player_id].items()
                 if player_rate_minutes[player_id][name] >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
             ],
-        })
+        }
+        comparison_performers.append(performer)
+        if minutes > 90 and rating_minutes:
+            eligible_performers.append(performer)
+    from .pre_match_player_comparison import append_comparison_role_metrics
+    comparison_performers = [{**player, "per90_metrics": list(player["per90_metrics"])} for player in comparison_performers]
+    append_comparison_role_metrics(comparison_performers, full_fixtures, team_id)
+    if _comparison_fixtures is not None:
+        return {"comparison_players": comparison_performers, "selected_fixture_ids": fixture_ids, "sample_size": len(fixtures)}
+    comparison_ids = fixture_ids
     _attach_player_highlight_metrics(eligible_performers, len(fixtures))
     rating_order = sorted(
         eligible_performers,
@@ -929,6 +946,10 @@ def _team_recent_squad_usage(
         "team_id": team_id,
         "sample_size": sample_size,
         "current_squad_count": len(current_player_ids),
+        "selected_fixture_ids": fixture_ids,
+        "comparison_players": comparison_performers,
+        "comparison_selected_fixture_ids": comparison_ids,
+        "comparison_sample_size": len(comparison_ids),
         "players": rows,
         "formations": [
             {
@@ -1068,7 +1089,7 @@ def _pre_match_player_perspectives(usages: list[dict[str, Any]], lang: str) -> d
             "player_id": player.get("player_id"), "player_name": name,
             "selection_type": selection, "position": player.get("position_name"),
             "average_rating": player.get("average_rating"),
-            "per90_metrics": metrics,
+            "per90_metrics": [{k: v for k, v in metric.items() if k != "competition_rank"} for metric in metrics],
         })
     if not compact or not os.getenv("OPENAI_API_KEY"):
         return fallback
@@ -1078,7 +1099,7 @@ def _pre_match_player_perspectives(usages: list[dict[str, Any]], lang: str) -> d
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior football analyst. Return only valid JSON keyed by player_id. Each value must be one concise 35-55 word ScoutWise perspective in the requested language. Explain why the player was selected; interpret the role and combined effect rather than reciting values. Featured players: use only positive evidence. Development players: use only the supplied weaker per-90 outputs, never praise or select a strength. Never cite zero-valued metrics. Never use the Turkish word 'örneklem'. Never invent facts, tactics, benchmarks, causation, or recommendations. No markdown/headings." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior football analyst. Return only valid JSON keyed by player_id. Each value must be one concise 35-55 word ScoutWise perspective in the requested language. Explain why the player was selected; interpret the role and combined effect rather than reciting values. Featured players: use only positive evidence. Development players: use only the supplied weaker per-90 outputs, never praise or select a strength. Never cite zero-valued metrics. Never use the Turkish word 'örneklem'. Do not mention league rankings. Lower values are better for discipline and error metrics. Never invent facts, tactics, benchmarks, causation, or recommendations. No markdown/headings." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nPlayers: {json.dumps(compact, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1313,6 +1334,7 @@ def _pre_match_overview_summary(
     regional: str,
     comparisons: dict[str, str],
     lang: str,
+    player_comparison: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Create the pre-match equivalent of the post-match report summary."""
     tr = lang == "tr"
@@ -1345,6 +1367,8 @@ def _pre_match_overview_summary(
         {"category": "Takım Karşılaştırması" if tr else "Team Comparison", "summary": next(iter(comparisons.values()), ""), "sub_bullets": []},
         {"category": "Takım Analizi" if tr else "Team Analysis", "summary": (f"{first_name}: {analysis_first.get('positive') or ''} {second_name}: {analysis_second.get('positive') or ''}").strip(), "sub_bullets": []},
     ]
+    from .pre_match_player_comparison import player_comparison_overview, player_comparison_overview_evidence
+    fallback.append(player_comparison_overview({'teams': usages, 'player_comparison': player_comparison or {}}, teams, lang))
     if not os.getenv("OPENAI_API_KEY"):
         return fallback
     try:
@@ -1360,13 +1384,14 @@ def _pre_match_overview_summary(
             "score_flow": score_flow,
             "regional": regional,
             "comparisons": comparisons,
+            "player_comparison": player_comparison_overview_evidence({"teams": usages, "player_comparison": player_comparison or {}}, teams, lang),
         }
         required = [str(row["category"]) for row in fallback]
         response = ChatOpenAI(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. In Player Comparison, compare the named teams through their players’ recorded role contributions; distinguish selected-match per-90 stats from competition-specific full-season rankings, respect lower-is-better errors and discipline, and never imply the recent stats use only the selected competition. Write a general comparison rather than instructions for using the selector; keep sub_bullets empty for this section. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if tr else 'English'}\nREQUIRED_CATEGORY: {json.dumps(required, ensure_ascii=False)}\nEvidence: {json.dumps(evidence, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1408,7 +1433,13 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
             )
         )
     from standings_module.comparison_ranks import enrich_comparison_ranks
-    result = enrich_comparison_ranks({"teams": usages}, fixture)
+    from .pre_match_player_comparison import comparison_player, enrich_player_comparison
+    comparison = {'stats_scope': 'selected_matches', 'teams': [{'team_id': team['team_id'], 'sample_size': team.pop('comparison_sample_size', 0),
+                            'selected_fixture_ids': team.pop('comparison_selected_fixture_ids', []), 'status': 'ready',
+                            'players': [comparison_player(player) for player in team.pop('comparison_players', [])]}
+                           for team in usages]}
+    result = enrich_comparison_ranks({"teams": usages, 'player_comparison': comparison}, fixture)
+    result = enrich_player_comparison(result, fixture)
     def publish(section):
         emit_progress({"recent_squad_usage": result}, section)
     publish("recent_statistics")
@@ -1425,9 +1456,9 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
     result["regional_perspectives"] = {scope: _pre_match_regional_perspective(usages, teams, lang, scope) for scope in ("overall", "first_half", "second_half")}
     result["regional_perspective"] = result["regional_perspectives"]["overall"]
     publish("pre_regional")
-    result["player_perspectives"] = _pre_match_player_perspectives(usages, lang)
+    result["player_perspectives"] = _pre_match_player_perspectives(result["teams"], lang)
     publish("pre_players")
-    result["overview_summary"] = _pre_match_overview_summary(usages, teams, result["team_analysis"], result["momentum_perspectives"], result["score_flow_perspectives"], result["regional_perspective"], result["team_comparison_perspectives"], lang)
+    result["overview_summary"] = _pre_match_overview_summary(usages, teams, result["team_analysis"], result["momentum_perspectives"], result["score_flow_perspectives"], result["regional_perspective"], result["team_comparison_perspectives"], lang, player_comparison=result.get("player_comparison"))
     publish("pre_overview")
     return result
 

@@ -6,6 +6,8 @@ import logging
 import os
 import threading
 import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -13,6 +15,7 @@ from sqlalchemy import text
 
 from api_module.database import SessionLocal
 from .stages import EUROPEAN_LEAGUES, SCOPES, scoped_schedule
+from .player_rankings import ensure_schema as ensure_player_schema, save_snapshot as save_player_snapshot, period_winners as player_period_winners
 from .metrics import PLAYER_AWARD_METRICS, Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, kickoff, normalize_fixture, period_for
 
 log = logging.getLogger(__name__)
@@ -21,6 +24,7 @@ _stop = threading.Event()
 _wake = threading.Event()
 _thread = None
 CLAIM_LOCK = 716394820
+# These versions describe shared Supabase rows: keep both backends aligned.
 # Award selection changes do not invalidate compact fixture contributions.
 SEASON_SUMMARY_VERSION = 6
 SCOPED_VERSION = 9
@@ -40,6 +44,50 @@ def provider(session, path, **params):
         raise RuntimeError('League statistics provider is temporarily unavailable') from None
 
 
+def requested_cached_rebuild(db, row):
+    """Upgrade a requested summary from saved matches without joining the provider queue.
+
+    A per-season lease prevents duplicate publication by simultaneous page requests.
+    Only cached computation is allowed on this path; missing data stays queued.
+    """
+    expected = SCOPED_VERSION if row['league_id'] in EUROPEAN_LEAGUES else SEASON_SUMMARY_VERSION
+    if (row['calculation_version'] >= expected or not row['computed_at']
+            or row['status'] not in {'pending', 'ready'} or not row['next_refresh_at']
+            or row['next_refresh_at'] <= datetime.now(timezone.utc)):
+        return False
+    token = str(uuid.uuid4())
+    claimed = db.execute(text("""UPDATE league_season_summaries
+        SET status='processing',lease_token=CAST(:token AS uuid),
+            lease_expires_at=NOW()+INTERVAL '10 minutes',updated_at=NOW()
+        WHERE league_id=:league AND season_id=:season
+          AND status IN ('pending','ready') AND calculation_version=:version
+          AND (lease_expires_at IS NULL OR lease_expires_at<=NOW())
+        RETURNING season_name,league_name,coverage"""),
+        {'league': row['league_id'], 'season': row['season_id'],
+         'version': row['calculation_version'], 'token': token}).mappings().first()
+    db.commit()
+    if claimed is None:
+        return False
+    job = {'league': row['league_id'], 'season': row['season_id'], 'token': token,
+           'rebuild_only': True, 'fixture_count': row['fixture_count'],
+           'next_refresh': row['next_refresh_at'], 'season_name': claimed['season_name'],
+           'league_name': claimed['league_name'],
+           'main_team_count': (claimed['coverage'] or {}).get('mainTeamCount')}
+    try:
+        if cached_summary_rebuild(job):
+            return True
+    except Exception as exc:
+        log.warning('Requested cached summary rebuild failed (%s)', type(exc).__name__)
+    # Leave incomplete caches to the background provider worker. Never fetch
+    # fixtures or leave a failed request holding the publication lease.
+    db.execute(text("""UPDATE league_season_summaries SET status='pending',
+        lease_token=NULL,lease_expires_at=NULL,updated_at=NOW()
+        WHERE league_id=:league AND season_id=:season AND lease_token=CAST(:token AS uuid)"""), job)
+    db.commit()
+    _wake.set()
+    return False
+
+
 def request_summary(db, league_id, season_id, period_start=None, scope=None):
     params = {'league': league_id, 'season': season_id}
     row = db.execute(text('''SELECT league_id, season_id, status, computed_at, next_refresh_at,
@@ -48,6 +96,8 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
         WHERE league_id=:league AND season_id=:season'''), params).mappings().first()
     if row is None:
         raise ValueError('Open the league standings before requesting its statistics')
+    if requested_cached_rebuild(db, row):
+        return request_summary(db, league_id, season_id, period_start, scope)
     periods = db.execute(text('''SELECT period_start, period_end, fixture_count, computed_at
         FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season
         ORDER BY period_start DESC'''), params).mappings().all()
@@ -69,14 +119,14 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
     coverage = dict(season_result.get('coverage') or {})
     scoped = coverage.pop('stageSummaries', {})
     season_result['coverage'] = coverage
-    if league_id not in EUROPEAN_LEAGUES and row['calculation_version'] != SEASON_SUMMARY_VERSION:
+    if league_id not in EUROPEAN_LEAGUES and row['calculation_version'] < SEASON_SUMMARY_VERSION:
         # Never show the previous unrestricted season winners during rebuilding.
         season_result.update(team_best_players={}, league_best_player=None, metric_player_awards={},
                              status='failed' if row['status'] == 'failed' else 'pending')
     scope = scope or ('league' if league_id in EUROPEAN_LEAGUES else 'overall')
     if league_id in EUROPEAN_LEAGUES:
         # Never serve the old whole-season cache while the scoped rebuild runs.
-        ready = row['calculation_version'] == SCOPED_VERSION and scope in scoped
+        ready = row['calculation_version'] >= SCOPED_VERSION and scope in scoped
         if ready:
             selected = scoped[scope]
             season_result.update(selected['season'])
@@ -105,21 +155,30 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
 
 def claim_job():
     with SessionLocal.begin() as db:
-        # Serialize claims across processes. One live job across the service,
-        # with a renewable lease so a restarted process cannot strand work.
+        # Serialize claims and cap service-wide provider work. Independent
+        # leagues may progress while another process holds a recovery lease.
         db.execute(text('SELECT pg_advisory_xact_lock(:key)'), {'key': CLAIM_LOCK})
-        if db.execute(text("SELECT 1 FROM league_season_summaries WHERE status='processing' AND lease_expires_at>NOW() LIMIT 1")).first():
+        active = db.execute(text("SELECT COUNT(*) FROM league_season_summaries WHERE status='processing' AND lease_expires_at>NOW()")).scalar()
+        if active >= 2:
             return None
-        row = db.execute(text('''SELECT league_id, season_id FROM league_season_summaries
-            WHERE status='pending'
+        row = db.execute(text('''SELECT league_id, season_id, season_name, league_name, computed_at, next_refresh_at,
+                       calculation_version, fixture_count, coverage FROM league_season_summaries
+            WHERE (status='pending'
                OR (status='processing' AND (lease_expires_at IS NULL OR lease_expires_at<=NOW()))
                OR (status IN ('ready','failed') AND next_refresh_at<=NOW())
-               OR (status='ready' AND calculation_version<>CASE WHEN league_id IN (2,5,2286) THEN :scoped_version ELSE :version END)
+               OR (status='ready' AND calculation_version<CASE WHEN league_id IN (2,5,2286) THEN :scoped_version ELSE :version END))
+              AND calculation_version<=CASE WHEN league_id IN (2,5,2286) THEN :scoped_version ELSE :version END
             ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, computed_at NULLS FIRST, next_refresh_at NULLS FIRST, created_at
             FOR UPDATE SKIP LOCKED LIMIT 1'''), {'version': SEASON_SUMMARY_VERSION, 'scoped_version': SCOPED_VERSION}).mappings().first()
         if not row:
             return None
-        job = {'league': row['league_id'], 'season': row['season_id'], 'token': str(uuid.uuid4())}
+        expected = SCOPED_VERSION if row['league_id'] in EUROPEAN_LEAGUES else SEASON_SUMMARY_VERSION
+        job = {'league': row['league_id'], 'season': row['season_id'], 'token': str(uuid.uuid4()),
+               'rebuild_only': bool(row['computed_at'] and row['calculation_version'] != expected
+                                    and row['next_refresh_at'] and row['next_refresh_at'] > datetime.now(timezone.utc)),
+               'next_refresh': row['next_refresh_at'], 'season_name': row['season_name'],
+               'league_name': row['league_name'], 'fixture_count': row['fixture_count'],
+               'main_team_count': (row['coverage'] or {}).get('mainTeamCount')}
         db.execute(text('''UPDATE league_season_summaries SET status='processing',
             lease_token=CAST(:token AS uuid), lease_expires_at=NOW()+INTERVAL '10 minutes',
             last_checked_at=NOW(), updated_at=NOW(), last_error=NULL
@@ -135,7 +194,77 @@ def renew(db, job):
         raise RuntimeError('League summary refresh lease was lost')
 
 
+def cached_summary_rebuild(job):
+    """Summary rule changes reuse complete, compatible match contributions."""
+    if not job.get('rebuild_only'):
+        return False
+    with SessionLocal() as db:
+        rows = db.execute(text("""SELECT calculation_version, coverage, included_in_aggregation
+            FROM league_match_contributions WHERE league_id=:league AND season_id=:season"""), job).mappings().all()
+    included = [r for r in rows if r['included_in_aggregation']]
+    if (not included or len(included) < job['fixture_count']
+            or any(r['calculation_version'] != VERSION for r in included)
+            or (job['league'] in EUROPEAN_LEAGUES and
+                any((r['coverage'] or {}).get('scope') not in {'qualifying', 'league', 'knockout'} for r in included))):
+        return False
+    season = {'name': job['season_name'], 'league': {'name': job['league_name']}}
+    if job.get('main_team_count'):
+        season['_main_team_count'] = job['main_team_count']
+    publish(job, season)
+    return True
+
+
+def fixture_details(fixtures, token):
+    """Fetch with bounded concurrency and one reusable HTTP session per thread.
+
+    At most one batch is in flight; database writes stay on the owning thread.
+    Set LEAGUE_INSIGHTS_FETCH_WORKERS=1 to use sequential fetching.
+    """
+    workers = min(8, max(1, int(os.getenv('LEAGUE_INSIGHTS_FETCH_WORKERS', '4'))))
+    local = threading.local()
+    sessions = []
+    lock = threading.Lock()
+    def fetch(item):
+        if _stop.is_set():
+            raise RuntimeError('League summary refresh interrupted; it will resume')
+        if not hasattr(local, 'session'):
+            local.session = requests.Session()
+            local.session.headers['Authorization'] = token
+            with lock:
+                sessions.append(local.session)
+        fid, fixture = item
+        detail = provider(local.session, f'fixtures/{fid}', include='participants;state;statistics.type;lineups.player;lineups.details.type;lineups.xGLineup.type;xGFixture.type')
+        return fid, fixture, detail
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='league-fixture') as pool:
+            items = iter(fixtures)
+            pending = deque()
+            for _ in range(workers):
+                item = next(items, None)
+                if item is not None:
+                    pending.append(pool.submit(fetch, item))
+            while pending:
+                yield pending.popleft().result()
+                item = next(items, None)
+                if item is not None:
+                    pending.append(pool.submit(fetch, item))
+    finally:
+        for session in sessions:
+            session.close()
+
+
+def reusable_contribution(old, played, now):
+    if not old or old['kickoff_at'] != played or old['calculation_version'] != VERSION:
+        return False
+    # Provider corrections to recent games are picked up by scheduled refreshes.
+    recent_due = played >= now - timedelta(days=7) and old['fetched_at'] < now - timedelta(days=1)
+    return not recent_due
+
+
 def refresh(job):
+    if cached_summary_rebuild(job):
+        return
+    job = {**job, 'rebuild_only': False}
     now = datetime.now(timezone.utc)
     with requests.Session() as session:
         token = os.getenv('SPORTMONKS_API_KEY')
@@ -151,6 +280,9 @@ def refresh(job):
             previous = {r['fixture_id']: dict(r) for r in db.execute(text('''SELECT fixture_id,
                 source_fingerprint, fetched_at, kickoff_at, calculation_version, included_in_aggregation, coverage FROM league_match_contributions
                 WHERE league_id=:league AND season_id=:season'''), job).mappings()}
+        if any(row['calculation_version'] > VERSION for row in previous.values()):
+            raise RuntimeError('A newer shared match-data format is in use; update this worker')
+        missing = []
         for fid, fixture in sorted(fixtures.items()):
             if _stop.is_set():
                 raise RuntimeError('League summary refresh interrupted; it will resume')
@@ -172,17 +304,18 @@ def refresh(job):
                         db.execute(text('UPDATE league_match_contributions SET included_in_aggregation=FALSE, updated_at=NOW() WHERE fixture_id=:id'), {'id': fid})
                 continue
             played = kickoff(fixture['starting_at'])
-            # Recent corrections: 21 days. Reconcile older stats after 28 days.
+            # Recheck recent corrections; settled contributions do not expire by age.
             # Interrupted initial backfills reuse already fetched contributions.
-            recent_due = played >= now - timedelta(days=21) and (not old or old['fetched_at'] < now - timedelta(days=1))
-            if old and old['kickoff_at'] == played and old['calculation_version'] == VERSION and not recent_due and old['fetched_at'] >= now - timedelta(days=28):
+            if reusable_contribution(old, played, now):
                 if not old['included_in_aggregation']:
                     # Restore a recently fetched qualifier excluded by the previous scope rules.
                     with SessionLocal.begin() as db:
                         renew(db, job)
                         db.execute(text('UPDATE league_match_contributions SET included_in_aggregation=TRUE,updated_at=NOW() WHERE fixture_id=:id'), {'id': fid})
                 continue
-            detail = provider(session, f'fixtures/{fid}', include='participants;state;statistics.type;lineups.player;lineups.details.type;lineups.xGLineup.type;xGFixture.type')
+            missing.append((fid, fixture))
+        for fid, fixture, detail in fixture_details(missing, token):
+            old = previous.get(fid)
             contribution = normalize_fixture(detail)
             contribution['coverage']['scope'] = fixture['_scope']
             if contribution['league_id'] != job['league'] or contribution['season_id'] != job['season']:
@@ -222,6 +355,7 @@ def refresh(job):
 
 
 def publish(job, season):
+    ensure_player_schema()
     aggregate = Aggregate()
     scoped = job['league'] in EUROPEAN_LEAGUES
     scope_totals = {key: Aggregate() for key in SCOPES} if scoped else {}
@@ -233,6 +367,7 @@ def publish(job, season):
         db.execute(text('SELECT 1 FROM league_season_summaries WHERE league_id=:league AND season_id=:season FOR UPDATE'), job)
         previous_periods = db.execute(text('SELECT period_start FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season'), job).scalars().all()
         periods_written = set()
+        player_periods = {}
         period = None
         fortnight = Aggregate(include_team_metrics=False)
         rows = db.execute(text('''SELECT kickoff_at,included_in_aggregation,team_contributions,player_contributions,coverage
@@ -252,14 +387,18 @@ def publish(job, season):
                 if row_scope == 'qualifying':
                     continue
             if period is not None and key != period:
-                save_period(db, job, period, fortnight.finish())
+                period_result = fortnight.finish()
+                player_periods[period.isoformat()] = player_period_winners(period_result)
+                save_period(db, job, period, period_result)
                 periods_written.add(period)
                 fortnight = Aggregate(include_team_metrics=False)
             period = key
             aggregate.add(row)
             fortnight.add(row)
         if period is not None:
-            save_period(db, job, period, fortnight.finish())
+            period_result = fortnight.finish()
+            player_periods[period.isoformat()] = player_period_winners(period_result)
+            save_period(db, job, period, period_result)
             periods_written.add(period)
         for empty in {*previous_periods, period_for(datetime.now(PERIOD_ZONE).date())[0]} - periods_written:
             save_period(db, job, empty, Aggregate(include_team_metrics=False).finish())
@@ -273,22 +412,28 @@ def publish(job, season):
                 total.pop('latest_included_kickoff_at', None)
                 hydrate_winner_images(db, total)
                 periods = []
+                scoped_player_periods = {}
                 scope_periods[scope_key].setdefault(current_period, Aggregate(include_team_metrics=False))
                 for start, accumulator in sorted(scope_periods[scope_key].items(), reverse=True):
                     summary = accumulator.finish()
+                    scoped_player_periods[start.isoformat()] = player_period_winners(summary)
                     hydrate_winner_images(db, summary)
                     periods.append({'period_start': start.isoformat(), 'period_end': (start + timedelta(days=14)).isoformat(),
                                     'status': 'ready', 'computed_at': datetime.now(timezone.utc).isoformat(),
                                     'fixture_count': summary['fixture_count'], 'coverage': summary['coverage'],
                                     'team_best_players': summary['team_best_players'], 'league_best_player': summary['league_best_player'],
                                     'metric_player_awards': summary['metric_player_awards']})
+                save_player_snapshot(db, job, scope_key, scope_totals[scope_key], period_awards=scoped_player_periods)
                 stage_summaries[scope_key] = {'season': total, 'periods': periods}
             result['coverage']['stageSummaries'] = stage_summaries
             if '_main_team_count' in season:
                 result['coverage']['mainTeamCount'] = season['_main_team_count']
+        if not scoped:
+            save_player_snapshot(db, job, 'overall', aggregate, period_awards=player_periods)
         hydrate_winner_images(db, result)
         params = {**job, **result, 'version': SCOPED_VERSION if scoped else SEASON_SUMMARY_VERSION, 'season_name': season.get('name'),
-                  'league_name': (season.get('league') or {}).get('name'), 'finished': bool(season.get('finished'))}
+                  'league_name': (season.get('league') or {}).get('name'), 'finished': bool(season.get('finished')), 'rebuild_only': job.get('rebuild_only', False),
+                  'next_refresh': job.get('next_refresh')}
         for field in ('team_metrics', 'metric_catalog', 'player_rating_totals', 'team_best_players', 'league_best_player', 'metric_player_awards', 'coverage'):
             params[field] = json.dumps(params[field])
         db.execute(text('''UPDATE league_season_summaries SET team_metrics=CAST(:team_metrics AS jsonb),
@@ -297,7 +442,8 @@ def publish(job, season):
             team_best_players=CAST(:team_best_players AS jsonb),league_best_player=NULLIF(CAST(:league_best_player AS jsonb),'null'::jsonb),
             coverage=CAST(:coverage AS jsonb),fixture_count=:fixture_count,latest_included_kickoff_at=:latest_included_kickoff_at,
             league_name=:league_name,season_name=:season_name,calculation_version=:version,status='ready',
-            computed_at=NOW(),updated_at=NOW(),next_refresh_at=NOW()+CASE WHEN :finished THEN INTERVAL '28 days' ELSE INTERVAL '2 days' END,
+            computed_at=NOW(),updated_at=NOW(),next_refresh_at=CASE WHEN :rebuild_only THEN CAST(:next_refresh AS timestamptz)
+                ELSE NOW()+CASE WHEN :finished THEN INTERVAL '28 days' ELSE INTERVAL '2 days' END END,
             lease_token=NULL,lease_expires_at=NULL,last_error=NULL
             WHERE league_id=:league AND season_id=:season AND lease_token=CAST(:token AS uuid)'''), params)
 
@@ -353,7 +499,14 @@ def _run():
                 try:
                     refresh(job)
                 except Exception as exc:
-                    fail_job(job, exc)
+                    if _stop.is_set():
+                        with SessionLocal.begin() as db:
+                            db.execute(text('''UPDATE league_season_summaries SET status='pending',
+                                lease_token=NULL,lease_expires_at=NULL,updated_at=NOW()
+                                WHERE league_id=:league AND season_id=:season
+                                  AND lease_token=CAST(:token AS uuid)'''), job)
+                    else:
+                        fail_job(job, exc)
                     log.warning('League summary refresh failed for league=%s season=%s (%s)', job['league'], job['season'], type(exc).__name__)
                 continue
         except Exception as exc:
@@ -384,6 +537,9 @@ def start_worker():
 def stop_worker():
     _stop.set()
     _wake.set()
+    # Let an interrupted fetch requeue its own lease before the process exits.
+    if _thread is not None and _thread is not threading.current_thread():
+        _thread.join(timeout=55)
 
 
 def player_profile(db, player_id):
@@ -410,8 +566,8 @@ def enqueue_season(db, standings):
             db.execute(text('''UPDATE league_season_summaries SET coverage=coverage || CAST(:metadata AS jsonb)
                 WHERE league_id=:league AND season_id=:season'''),
                 {'league': standings['leagueId'], 'season': standings['seasonId'], 'metadata': json.dumps({'mainTeamCount': team_count})})
-    stale = db.execute(text('''UPDATE league_season_summaries SET status='pending', next_refresh_at=NOW()
-        WHERE league_id=:league AND season_id=:season AND calculation_version<>:version
+    stale = db.execute(text('''UPDATE league_season_summaries SET status='pending'
+        WHERE league_id=:league AND season_id=:season AND calculation_version<:version
         AND status NOT IN ('pending','processing')'''),
         {'league': standings['leagueId'], 'season': standings['seasonId'], 'version': SCOPED_VERSION if standings['leagueId'] in EUROPEAN_LEAGUES else SEASON_SUMMARY_VERSION}).rowcount
     queued = db.execute(text('SELECT status FROM league_season_summaries WHERE league_id=:league AND season_id=:season'),
