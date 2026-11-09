@@ -16,7 +16,7 @@ from sqlalchemy import text
 from api_module.database import SessionLocal
 from .stages import EUROPEAN_LEAGUES, SCOPES, scoped_schedule
 from .player_rankings import ensure_schema as ensure_player_schema, save_snapshot as save_player_snapshot, period_winners as player_period_winners
-from .metrics import PLAYER_AWARD_METRICS, Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, kickoff, normalize_fixture, period_for
+from .metrics import PLAYER_AWARD_METRICS, Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, PLAYER_METRIC_VERSION, kickoff, normalize_fixture, period_for
 
 log = logging.getLogger(__name__)
 BASE = os.getenv('SPORTMONKS_BASE_URL', 'https://api.sportmonks.com/v3/football').rstrip('/')
@@ -26,8 +26,8 @@ _thread = None
 CLAIM_LOCK = 716394820
 # These versions describe shared Supabase rows: keep both backends aligned.
 # Award selection changes do not invalidate compact fixture contributions.
-SEASON_SUMMARY_VERSION = 6
-SCOPED_VERSION = 9
+SEASON_SUMMARY_VERSION = 8
+SCOPED_VERSION = 11
 
 
 def provider(session, path, **params):
@@ -119,14 +119,14 @@ def request_summary(db, league_id, season_id, period_start=None, scope=None):
     coverage = dict(season_result.get('coverage') or {})
     scoped = coverage.pop('stageSummaries', {})
     season_result['coverage'] = coverage
-    if league_id not in EUROPEAN_LEAGUES and row['calculation_version'] < SEASON_SUMMARY_VERSION:
+    if league_id not in EUROPEAN_LEAGUES and row['calculation_version'] < 6:
         # Never show the previous unrestricted season winners during rebuilding.
         season_result.update(team_best_players={}, league_best_player=None, metric_player_awards={},
                              status='failed' if row['status'] == 'failed' else 'pending')
     scope = scope or ('league' if league_id in EUROPEAN_LEAGUES else 'overall')
     if league_id in EUROPEAN_LEAGUES:
         # Never serve the old whole-season cache while the scoped rebuild runs.
-        ready = row['calculation_version'] >= SCOPED_VERSION and scope in scoped
+        ready = row['calculation_version'] >= 9 and scope in scoped
         if ready:
             selected = scoped[scope]
             season_result.update(selected['season'])
@@ -166,9 +166,11 @@ def claim_job():
             WHERE (status='pending'
                OR (status='processing' AND (lease_expires_at IS NULL OR lease_expires_at<=NOW()))
                OR (status IN ('ready','failed') AND next_refresh_at<=NOW())
-               OR (status='ready' AND calculation_version<CASE WHEN league_id IN (2,5,2286) THEN :scoped_version ELSE :version END))
+               )
               AND calculation_version<=CASE WHEN league_id IN (2,5,2286) THEN :scoped_version ELSE :version END
-            ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, computed_at NULLS FIRST, next_refresh_at NULLS FIRST, created_at
+            ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END,
+                     CASE WHEN status='pending' THEN updated_at END DESC NULLS LAST,
+                     computed_at NULLS FIRST, next_refresh_at NULLS FIRST, created_at
             FOR UPDATE SKIP LOCKED LIMIT 1'''), {'version': SEASON_SUMMARY_VERSION, 'scoped_version': SCOPED_VERSION}).mappings().first()
         if not row:
             return None
@@ -203,7 +205,8 @@ def cached_summary_rebuild(job):
             FROM league_match_contributions WHERE league_id=:league AND season_id=:season"""), job).mappings().all()
     included = [r for r in rows if r['included_in_aggregation']]
     if (not included or len(included) < job['fixture_count']
-            or any(r['calculation_version'] != VERSION for r in included)
+            or any(r['calculation_version'] != VERSION or
+                   (r['coverage'] or {}).get('playerMetricVersion', 0) < PLAYER_METRIC_VERSION for r in included)
             or (job['league'] in EUROPEAN_LEAGUES and
                 any((r['coverage'] or {}).get('scope') not in {'qualifying', 'league', 'knockout'} for r in included))):
         return False
@@ -254,7 +257,8 @@ def fixture_details(fixtures, token):
 
 
 def reusable_contribution(old, played, now):
-    if not old or old['kickoff_at'] != played or old['calculation_version'] != VERSION:
+    if (not old or old['kickoff_at'] != played or old['calculation_version'] != VERSION
+            or (old.get('coverage') or {}).get('playerMetricVersion', 0) < PLAYER_METRIC_VERSION):
         return False
     # Provider corrections to recent games are picked up by scheduled refreshes.
     recent_due = played >= now - timedelta(days=7) and old['fetched_at'] < now - timedelta(days=1)

@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, TEAM_METRIC_CATEGORY, PLAYER_METRIC_CATEGORY
 
 VERSION = 2
+# Additive player-field coverage; the shared compact-row structure stays compatible.
+PLAYER_METRIC_VERSION = 2
 PERIOD_ZONE = ZoneInfo('Europe/Istanbul')
 PERIOD_ANCHOR = date(2026, 1, 5)  # Monday; continuous 14-day blocks across years.
 COMPLETED_STATES = {5, 7, 8}  # FT, AET, FT after penalties; exclude walkovers.
@@ -21,7 +23,8 @@ AVERAGES = {'Ball Possession %', 'Shooting Performance'}
 LOWER_BETTER = {'Goals Conceded', 'Yellow Cards', 'Red Cards', 'Fouls', 'Offsides',
                 'Big Chances Missed', 'Shots Off Target', 'Penalties Committed',
                 'Penalties Missed', 'Possession Lost', 'Dispossessed',
-                'Error Lead To Goal', 'Error Lead To Shot', 'Duels Lost'}
+                'Error Lead To Goal', 'Error Lead To Shot', 'Duels Lost',
+                'Aerials Lost', 'Dribbled Past', 'Turn Over', 'Own Goals'}
 
 
 # Only semantically matching player metrics are eligible. In particular, fixture
@@ -34,9 +37,24 @@ PLAYER_COUNT_METRICS = frozenset({
     'Passes', 'Red Cards', 'Saves', 'Shooting Performance', 'Shots Off Target',
     'Shots On Target', 'Shots Total', 'Successful Dribbles', 'Tackles',
     'Tackles Won', 'Total Crosses', 'Yellow Cards',
+    'Clearances', 'Ball Recovery', 'Aerials Won', 'Total Duels', 'Possession Lost',
+    'Touches', 'Fouls Drawn', 'Chances Created', 'Penalties Won', 'Offsides Provoked',
+    'Shots Insidebox', 'Shots Outsidebox', 'Goal Attempts', 'Penalties Scored',
+    'Backward Passes', 'Passes In Final Third', 'Through Balls', 'Through Balls Won', 'Ball Safe',
+    'Aerials', 'Successful Headers', 'Last Man Tackle', 'Clearance Offline',
+    'Saves Insidebox', 'Punches', 'Good High Claim', 'Penalties Saved',
+    'Goals Conceded', 'Aerials Lost', 'Duels Lost', 'Dispossessed', 'Dribbled Past',
+    'Turn Over', 'Own Goals', 'Error Lead To Goal', 'Error Lead To Shot',
+    'Penalties Committed', 'Penalties Missed', 'Minutes Played', 'Captain',
+    # These are accepted only when recorded on an individual lineup, never copied from teams.
+    'Attacks', 'Dangerous Attacks', 'Ball Possession %', 'Corners', 'Free Kicks', 'Goal Kicks', 'Throwins',
 })
 PLAYER_RATE_METRICS = {name: pair for name, pair in DERIVED_PERCENTAGE_METRICS.items()
                        if all(component in PLAYER_COUNT_METRICS for component in pair)}
+PLAYER_CONTEXT_METRICS = {'Minutes Played'}
+_PLAYER_NAMES = {rate_key(name): name for name in PLAYER_COUNT_METRICS}
+_PLAYER_NAMES.update({'turnovers': 'Turn Over', 'turnover': 'Turn Over',
+                      'own_goal': 'Own Goals', 'goalkeeper_goals_conceded': 'Goals Conceded'})
 PLAYER_AWARD_METRICS = PLAYER_COUNT_METRICS | PLAYER_RATE_METRICS.keys()
 
 
@@ -47,7 +65,9 @@ def player_metric_result(player, team_matches, name, mode='total'):
     total = player['metricTotals'].get(name)
     if not total or not total['matchesCovered'] or total['matchesCovered'] * 5 < team_matches:
         return None
-    if name in PLAYER_RATE_METRICS:
+    if name in PLAYER_CONTEXT_METRICS:
+        value = total['sum']
+    elif name in PLAYER_RATE_METRICS:
         value = total.get('rateValue') if total['denominator'] > 0 else None
     elif mode == 'per90' and name not in AVERAGES:
         minutes = total.get('minutesCovered', 0)
@@ -64,6 +84,7 @@ def player_metric_values(row):
         if name == 'Blocked Shots':
             continue  # Defensive blocks are not fixture Shots Blocked.
         canonical = PLAYER_METRIC_CATEGORY.get(name, (None, name))[1]
+        canonical = _PLAYER_NAMES.get(rate_key(canonical), canonical)
         raw = detail.get('data') or {}
         value = numeric(raw.get('value') if isinstance(raw, dict) and 'value' in raw else detail.get('value'))
         if canonical in PLAYER_COUNT_METRICS and value is not None and (value >= 0 or canonical == 'Shooting Performance'):
@@ -130,7 +151,7 @@ def normalize_fixture(fixture):
               'home_team_id': locations['home'], 'away_team_id': locations['away'],
               'included_in_aggregation': fixture.get('state_id') in COMPLETED_STATES,
               'team_contributions': teams, 'player_contributions': players,
-              'coverage': {'teamsWithStats': sum(bool(t['metrics']) for t in teams.values()),
+              'coverage': {'playerMetricVersion': PLAYER_METRIC_VERSION, 'teamsWithStats': sum(bool(t['metrics']) for t in teams.values()),
                            'ratedPlayers': sum(p['rating'] is not None for p in players)}}
     result['source_fingerprint'] = hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()
     return result
@@ -194,7 +215,9 @@ class Aggregate:
             if p.get('rating') is not None:
                 item['ratingSum'] += p['rating']
                 item['ratedAppearances'] += 1
-            metrics = p.get('metrics') or {}
+            metrics = dict(p.get('metrics') or {})
+            if numeric(p.get('minutes')) is not None and p['minutes'] > 0:
+                metrics['Minutes Played'] = p['minutes']
             add_sample(item.setdefault('_rate_inputs', empty()), metrics)
             for name, value in metrics.items():
                 if name not in PLAYER_COUNT_METRICS or numeric(value) is None:
@@ -277,8 +300,8 @@ class Aggregate:
                     winner = {k: v for k, v in player.items() if k not in {'rating', 'ratingSum', 'metricTotals', '_rate_inputs'}}
                     winner.update(teamName=self.teams[tid]['teamName'],
                                   averageRating=round(player['ratingSum'] / player['ratedAppearances'], 2) if player['ratedAppearances'] else None,
-                                  awardMetric=name, awardValue=round(value, 4), awardMode=mode,
-                                  awardUnit='%' if name in PLAYER_RATE_METRICS else '', awardMatchesCovered=total['matchesCovered'])
+                                  awardMetric=name, awardValue=round(value, 4), awardMode='total' if name in PLAYER_CONTEXT_METRICS else mode,
+                                  awardUnit='%' if name in PLAYER_RATE_METRICS or '%' in name else '', awardMatchesCovered=total['matchesCovered'])
                     if name in PLAYER_RATE_METRICS:
                         winner.update(awardNumerator=total['numerator'], awardDenominator=total['denominator'])
                     winners[tid] = winner

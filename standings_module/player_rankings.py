@@ -8,10 +8,10 @@ from sqlalchemy import text
 
 from api_module.database import engine
 from .metrics import (Aggregate, AVERAGES, LOWER_BETTER, PLAYER_AWARD_METRICS,
-                      PLAYER_RATE_METRICS, VERSION, PERIOD_ZONE, period_for, player_metric_result)
+                      PLAYER_RATE_METRICS, PLAYER_CONTEXT_METRICS, VERSION, PERIOD_ZONE, period_for, player_metric_result)
 from .stages import EUROPEAN_LEAGUES, SCOPES
 
-CACHE_VERSION = 2
+CACHE_VERSION = 4
 _READY = False
 _LOCK = Lock()
 
@@ -65,7 +65,7 @@ def snapshot(aggregate):
     for name in sorted(supported - {'Rating'}):
         kind = 'derived_rate' if name in PLAYER_RATE_METRICS else 'average' if name in AVERAGES else 'total'
         catalog.append({'key': name, 'label': name, 'aggregation': kind,
-                        'unit': '%' if kind == 'derived_rate' else '',
+                        'unit': '%' if kind == 'derived_rate' or '%' in name else '',
                         'direction': 'asc' if name in LOWER_BETTER else 'desc', 'playerAwardSupported': True})
     return {'players': players, 'metric_catalog': catalog}
 
@@ -89,7 +89,7 @@ def save_snapshot(db, job, scope, aggregate, source_computed_at=None, period_awa
 
 
 def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0, limit=50):
-    catalog = payload['metric_catalog']
+    catalog = [item for item in payload['metric_catalog'] if item['key'] != 'Match Count']
     selected = next((m for m in catalog if m['key'] == metric), None)
     if selected is None:
         raise ValueError('Unsupported player metric for this league')
@@ -108,7 +108,7 @@ def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0
         previous = value
         if offset <= index < offset + limit:
             row = {k: v for k, v in player.items() if k != 'metrics'}
-            row.update(position=rank, awardMetric=metric, awardValue=round(value, 4), awardMode=mode,
+            row.update(position=rank, awardMetric=metric, awardValue=round(value, 4), awardMode='total' if metric in PLAYER_CONTEXT_METRICS else mode,
                        awardUnit=selected['unit'], awardMatchesCovered=evidence['matchesCovered'],
                        awardMinutesCovered=evidence.get('minutesCovered'))
             if 'denominator' in evidence:
@@ -133,11 +133,13 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
              'offset': offset, 'limit': limit, 'computed_at': None, 'scope': scope}
     if summary is None or summary['computed_at'] is None:
         return empty
-    saved = db.execute(text('''SELECT payload,source_computed_at FROM enterprise_league_player_rankings
-        WHERE league_id=:league AND season_id=:season AND scope=:scope AND calculation_version=:version'''), params).mappings().first()
-    if saved is None or saved['source_computed_at'] != summary['computed_at']:
-        if summary['status'] != 'ready':
-            return {**empty, 'status': 'failed' if summary['status'] == 'failed' else 'pending', 'refreshing': summary['status'] != 'failed'}
+    saved = db.execute(text('''SELECT payload,source_computed_at,calculation_version FROM enterprise_league_player_rankings
+        WHERE league_id=:league AND season_id=:season AND scope=:scope AND calculation_version>=2'''), params).mappings().first()
+    rebuild = saved is None or saved['source_computed_at'] != summary['computed_at'] or saved['calculation_version'] != CACHE_VERSION
+    if rebuild and summary['status'] != 'ready' and saved is None:
+        return {**empty, 'status': 'failed' if summary['status'] == 'failed' else 'pending', 'refreshing': summary['status'] != 'failed'}
+    # Keep the last complete player table visible during additive field backfills.
+    if rebuild and summary['status'] == 'ready':
         # Serialize first materialization per league/scope. Existing team summaries
         # stay intact, and this path never calls SportMonks or changes refresh dates.
         acquired = db.execute(text('SELECT pg_try_advisory_xact_lock(hashtextextended(:key,0))'),
