@@ -13,6 +13,7 @@ from api_module.database import engine
 from .metrics import Aggregate, LOWER_BETTER, COMPLETED_STATES, TEAM_METRIC_CATEGORY, kickoff, normalize_fixture, numeric
 from .stages import EUROPEAN_LEAGUES, stage_scope
 from .pre_match_player_ranks import strip_player_ranks
+from .team_derived import DEFINITIONS, build_team_derived, metric_sort_direction
 
 _ALIASES = {name.casefold(): canonical for name, (_, canonical) in TEAM_METRIC_CATEGORY.items()}
 _ALIASES.update({
@@ -51,9 +52,11 @@ def rank_metrics(teams, mode="perMatch"):
     result = {}
     for name, entries in values.items():
         for tid, (value, metric) in entries.items():
-            better = sum(other < value if name in LOWER_BETTER else other > value for other, _ in entries.values())
+            lower = metric_sort_direction(name) == 'asc' if name in DEFINITIONS else name in LOWER_BETTER
+            better = sum(other < value if lower else other > value for other, _ in entries.values())
             result.setdefault(tid, {})[name] = {
                 'position': better + 1, 'total_teams': len(entries),
+                'direction': 'asc' if lower else 'desc',
                 'season_value': value, 'matches_played': teams[tid]['matches'],
                 'matches_covered': metric['matchesCovered'],
             }
@@ -124,6 +127,7 @@ def _calculate_competition_ranks(league, season, cutoff, scope):
     # kickoff prevents later season matches leaking into an earlier report.
     aggregate = Aggregate()
     found = False
+    paired_rows = []
     with engine.connect() as db:
         rows = db.execute(text('''SELECT team_contributions, kickoff_at, included_in_aggregation
             FROM league_match_contributions WHERE league_id=:league AND season_id=:season
@@ -137,11 +141,17 @@ def _calculate_competition_ranks(league, season, cutoff, scope):
             }).mappings()
         for row in rows:
             found = True
+            paired_rows.append(dict(row))
             aggregate.add({**row, 'player_contributions': []})
     if not found:
         for row in _provider_rows(league, season, cutoff, scope):
+            paired_rows.append(row)
             aggregate.add({**row, 'player_contributions': []})
-    return rank_metrics(aggregate.finish()['team_metrics'])
+    teams = aggregate.finish()['team_metrics']
+    for tid, metrics in build_team_derived(paired_rows)['teams'].items():
+        if tid in teams:
+            teams[tid]['metrics'].update(metrics)
+    return rank_metrics(teams)
 
 
 def enrich_comparison_ranks(usage, fixture, now=None):
@@ -165,7 +175,9 @@ def enrich_comparison_ranks(usage, fixture, now=None):
             for category, metrics in (team.get('team_comparison') or {}).items():
                 categories[category] = []
                 for metric in metrics:
-                    value = (metric.get('competition_rank') if start <= current else None) or by_metric.get(canonical_metric_name(metric['name']))
+                    name = canonical_metric_name(metric['name'])
+                    neutral = name in DEFINITIONS and DEFINITIONS[name][2] == 'neutral'
+                    value = (metric.get('competition_rank') if start <= current and not neutral else None) or by_metric.get(name)
                     clean = {k: v for k, v in metric.items() if k != 'competition_rank'}
                     if value and numeric(metric.get('value')) is not None:
                         clean['competition_rank'] = value
@@ -190,7 +202,14 @@ def enrich_report_comparison_ranks(content, fixture):
     if content.get('report_type') != 'pre_match' or not content.get('recent_squad_usage'):
         return content
     from match_analysis_module.pre_match_player_comparison import enrich_player_comparison, ensure_player_comparison_overview
-    usage = enrich_comparison_ranks(content['recent_squad_usage'], fixture)
+    from match_analysis_module.pre_match_team_metrics import enrich_selected_team_metrics, ensure_team_comparison_perspectives
+    usage = content['recent_squad_usage']
+    try:
+        usage = enrich_selected_team_metrics(usage, fixture)
+    except (SQLAlchemyError, ValueError, TypeError, KeyError) as exc:
+        _LOG.warning('Selected team comparison additions unavailable (%s)', type(exc).__name__)
+    usage = enrich_comparison_ranks(usage, fixture)
+    usage = ensure_team_comparison_perspectives(usage, content.get('teams') or [], content.get('language') or 'en')
     usage = enrich_player_comparison(usage, fixture)
     usage = ensure_player_comparison_overview(usage, content.get('teams') or [], content.get('language') or 'en')
     return {**content, 'recent_squad_usage': usage}

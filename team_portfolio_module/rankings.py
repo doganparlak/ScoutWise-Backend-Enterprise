@@ -1,5 +1,6 @@
 """Competition-season ranks for team report data views; no match or AI fetching."""
 from datetime import datetime, timezone
+from copy import deepcopy
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,20 +41,29 @@ class TeamReportRankingsIn(BaseModel):
 def team_report_rankings(payload: TeamReportRankingsIn, user_id: str = Depends(require_auth), db=Depends(get_db)):
     del user_id  # Sports rankings are shared; this endpoint returns no saved/private reports.
     params = {'league': payload.leagueId, 'season': payload.seasonId}
-    row = db.execute(text('''SELECT status,computed_at,calculation_version,team_metrics,coverage
+    row = db.execute(text('''SELECT status,computed_at,calculation_version,team_metrics,coverage,fixture_count
         FROM league_season_summaries WHERE league_id=:league AND season_id=:season'''), params).mappings().first()
     expected = SCOPED_VERSION if payload.leagueId in EUROPEAN_LEAGUES else SEASON_SUMMARY_VERSION
     ready = row is not None and row['computed_at'] is not None and row['calculation_version'] >= expected
     snapshot = dict(row['team_metrics'] or {}) if ready else {}
+    fixture_count = row['fixture_count'] if ready else 0
     if ready and payload.leagueId in EUROPEAN_LEAGUES:
         scoped = ((row['coverage'] or {}).get('stageSummaries') or {}).get(payload.scope)
         ready = bool(scoped)
         snapshot = ((scoped or {}).get('season') or {}).get('team_metrics') or {}
+        fixture_count = ((scoped or {}).get('season') or {}).get('fixture_count', 0)
     if not ready:
         enqueue_season(db, {'leagueId': payload.leagueId, 'seasonId': payload.seasonId, 'seasonName': payload.seasonName})
         return {'status': 'unavailable' if row and row['status'] == 'failed' else 'pending', 'metrics': {}, 'mode': payload.mode}
     if payload.entity == 'team':
-        ranks = rank_metrics(snapshot, payload.mode).get(str(payload.teamId), {})
+        from standings_module.team_derived import DEFINITIONS, enrich_team_derived
+        from standings_module.metrics import LOWER_BETTER
+        summary = {'team_metrics': deepcopy(snapshot), 'metric_catalog': [], 'fixture_count': fixture_count}
+        enrich_team_derived(db, payload.leagueId, payload.seasonId, payload.scope,
+                            summary, row['computed_at'], row['status'])
+        ranks = rank_metrics(summary['team_metrics'], payload.mode).get(str(payload.teamId), {})
+        for name, rank in ranks.items():
+            rank['lowerIsBetter'] = DEFINITIONS[name][2] == 'lower' if name in DEFINITIONS else name in LOWER_BETTER
     else:
         ranks = cached_player_ranks(payload.leagueId, payload.seasonId, payload.scope,
                                     int(datetime.now(timezone.utc).timestamp()) // 60, payload.mode)

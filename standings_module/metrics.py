@@ -13,6 +13,15 @@ from match_report_module.report import DERIVED_PERCENTAGE_METRICS, TEAM_METRIC_C
 VERSION = 2
 # Additive player-field coverage; the shared compact-row structure stays compatible.
 PLAYER_METRIC_VERSION = 2
+TEAM_ADVANCED_VERSION = 3
+# Keep provider identifiers: xGD is supplied, never reconstructed as xG - xGA.
+TEAM_ADVANCED_METRICS = frozenset({
+    'Expected Goals Against (xGA)', 'Expected Goals Corners (xGC)',
+    'Expected Goals Difference (xGD)', 'Expected Goals Free Kicks (xGFK)',
+    'Expected Goals Non Penalty Goals (npxG)', 'Expected Goals Open Play (xGOP)',
+    'Expected Goals Penalties (pxG)', 'Expected Goals Prevented (xGP)',
+    'Expected Goals Set Play (xGSP)', 'Expected Points (xPTS)',
+})
 PERIOD_ZONE = ZoneInfo('Europe/Istanbul')
 PERIOD_ANCHOR = date(2026, 1, 5)  # Monday; continuous 14-day blocks across years.
 COMPLETED_STATES = {5, 7, 8}  # FT, AET, FT after penalties; exclude walkovers.
@@ -24,7 +33,8 @@ LOWER_BETTER = {'Goals Conceded', 'Yellow Cards', 'Red Cards', 'Fouls', 'Offside
                 'Big Chances Missed', 'Shots Off Target', 'Penalties Committed',
                 'Penalties Missed', 'Possession Lost', 'Dispossessed',
                 'Error Lead To Goal', 'Error Lead To Shot', 'Duels Lost',
-                'Aerials Lost', 'Dribbled Past', 'Turn Over', 'Own Goals'}
+                'Aerials Lost', 'Dribbled Past', 'Turn Over', 'Own Goals',
+                'Expected Goals Against (xGA)'}
 
 
 # Only semantically matching player metrics are eligible. In particular, fixture
@@ -110,6 +120,34 @@ def kickoff(value):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def advanced_team_metrics(fixture):
+    """Read additive team fields directly; absent fields stay absent."""
+    teams = {}
+    for row in [*(fixture.get('xgfixture') or fixture.get('xGFixture') or []), *(fixture.get('statistics') or [])]:
+        name = (row.get('type') or {}).get('name') or ''
+        value = numeric((row.get('data') or {}).get('value'))
+        if name not in TEAM_ADVANCED_METRICS | {'Penalties'} or value is None:
+            continue
+        if value < 0 and name not in {'Expected Goals Difference (xGD)', 'Expected Goals Prevented (xGP)'}:
+            continue
+        participant = row.get('participant_id')
+        if participant:
+            teams.setdefault(str(participant), {})[name] = value
+    return teams
+
+
+def team_opponent_inputs(fixture):
+    """Internal source for opponent-only metrics; never expose own counterattacks."""
+    teams = {}
+    for row in fixture.get('statistics') or []:
+        if (row.get('type') or {}).get('name') != 'Counter Attacks':
+            continue
+        value = numeric((row.get('data') or {}).get('value'))
+        if value is not None and value >= 0 and row.get('participant_id'):
+            teams.setdefault(str(row['participant_id']), {})['Counter Attacks'] = value
+    return teams
+
+
 def normalize_fixture(fixture):
     teams = {}
     participants = fixture.get('participants') or []
@@ -126,6 +164,14 @@ def normalize_fixture(fixture):
         if team is not None and value is not None and (name in TEAM_METRIC_CATEGORY or name in EXTRA_COUNTS):
             # Prefer the team-statistics source when xG appears in both includes.
             team['metrics'].setdefault(canonical, value)
+    for team_id, metrics in advanced_team_metrics(fixture).items():
+        if team_id in teams:
+            for name in TEAM_ADVANCED_METRICS:
+                teams[team_id]['metrics'].pop(name, None)
+            teams[team_id]['metrics'].update(metrics)
+    for team_id, inputs in team_opponent_inputs(fixture).items():
+        if team_id in teams:
+            teams[team_id]['opponent_inputs'] = inputs
     players = []
     seen = set()
     for row in fixture.get('lineups') or []:
@@ -151,7 +197,7 @@ def normalize_fixture(fixture):
               'home_team_id': locations['home'], 'away_team_id': locations['away'],
               'included_in_aggregation': fixture.get('state_id') in COMPLETED_STATES,
               'team_contributions': teams, 'player_contributions': players,
-              'coverage': {'playerMetricVersion': PLAYER_METRIC_VERSION, 'teamsWithStats': sum(bool(t['metrics']) for t in teams.values()),
+              'coverage': {'teamAdvancedVersion': TEAM_ADVANCED_VERSION, 'playerMetricVersion': PLAYER_METRIC_VERSION, 'teamsWithStats': sum(bool(t['metrics']) for t in teams.values()),
                            'ratedPlayers': sum(p['rating'] is not None for p in players)}}
     result['source_fingerprint'] = hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()
     return result

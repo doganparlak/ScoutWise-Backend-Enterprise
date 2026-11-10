@@ -474,7 +474,9 @@ def _aggregate_team_comparison(
             })
         if rows:
             aggregate[group] = sorted(rows, key=lambda row: row["name"])
-    return aggregate
+    from standings_module.metrics import normalize_fixture
+    from .pre_match_team_metrics import extend_comparison
+    return extend_comparison(aggregate, [normalize_fixture({**fixture, "lineups": []}) for fixture in fixtures], team_id)
 
 
 def _aggregate_score_flow(fixtures: list[dict[str, Any]], team_id: int) -> dict[str, Any]:
@@ -1114,6 +1116,24 @@ def _pre_match_player_perspectives(usages: list[dict[str, Any]], lang: str) -> d
 
 
 def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str, Any]], lang: str) -> dict[str, dict[str, str]]:
+    metric_guidance = (
+        " Use all supplied metric categories as evidence, including opponent_threat, opponent_profile, "
+        "balance differences, shot share and recorded advanced metrics. Every Opponent metric describes "
+        "what THAT team's previous opponents produced, not that team's own attacking output. "
+        "Lower opponent_threat and errors_discipline values are preferable; respect each metric's "
+        "preference metadata. Opponent_profile is neutral context: neither high nor low values alone "
+        "establish a strength or weakness. Positive: identify evidence-supported advantages and assess "
+        "how the team's own production matches the upcoming opponent's recorded concessions. "
+        "Weakness: identify vulnerabilities by relating what the team allows to the upcoming opponent's "
+        "recorded attacking strengths. Strategy: derive opponent-specific recommendations from those "
+        "matchups and the observed opponent profiles, expressing them without metric names or numbers. "
+        "Consider the complete evidence and select meaningful conclusions; do not mechanically list "
+        "every metric or force a conclusion from a missing indicator. Small differences are not decisive "
+        "advantages. Signed differences and xGD may be negative; xGD is provider-supplied. "
+        "All metric values describe selected matches across competitions; never present them as "
+        "competition-only stats or season ranks. Do not infer an established tactic from an opponent "
+        "profile alone, and do not treat recommendations as observed facts."
+    )
     compact = []
     fallback: dict[str, dict[str, str]] = {}
     for usage, team in zip(usages, teams):
@@ -1134,7 +1154,7 @@ def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str,
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON keyed by team_id. Every team value MUST contain exactly positive, strategy, weakness. Each team's fixture_location specifies whether this upcoming match is home or away. Treat it as mandatory context: do not mention, rely on, or infer from that team's opposite-venue form. For example, an away team must never be described through home strength. positive and weakness must each be a 50-60 word, insight-led analysis; strategy must be a 50-60 word opponent-specific match plan. In positive and weakness, use at most two carefully chosen numbers only when they materially support the conclusion; prioritise tactical meaning, recurring behaviour, matchup implications and risk over metric recitation. strategy is STRICTLY plan and recommendations: do not mention any number, percentage, metric name, stat, or data value. For each team_id, strategy is advice for THAT team and must explicitly refer to the other supplied team by its name as the opponent. In Turkish, never use direct commands or second-person imperatives such as 'kurun', 'sıkıştırın', 'bırakın'; use formal analytical recommendations such as 'daraltılmalı', 'yönlendirilmelidir', 'korunmalıdır', 'uygulanmalı'. State how to defend, progress, press, create advantages and manage likely game states against this specific opponent. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, facts, benchmarks or certainty. No markdown, headings, bullets, or leading dashes." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON keyed by team_id. Every team value MUST contain exactly positive, strategy, weakness. Each team's fixture_location specifies whether this upcoming match is home or away. Treat it as mandatory context: do not mention, rely on, or infer from that team's opposite-venue form. For example, an away team must never be described through home strength. positive and weakness must each be a 50-60 word, insight-led analysis; strategy must be a 50-60 word opponent-specific match plan. In positive and weakness, use at most two carefully chosen numbers only when they materially support the conclusion; prioritise tactical meaning, recurring behaviour, matchup implications and risk over metric recitation. strategy is STRICTLY plan and recommendations: do not mention any number, percentage, metric name, stat, or data value. For each team_id, strategy is advice for THAT team and must explicitly refer to the other supplied team by its name as the opponent. In Turkish, never use direct commands or second-person imperatives such as 'kurun', 'sıkıştırın', 'bırakın'; use formal analytical recommendations such as 'daraltılmalı', 'yönlendirilmelidir', 'korunmalıdır', 'uygulanmalı'. State how to defend, progress, press, create advantages and manage likely game states against this specific opponent. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, facts, benchmarks or certainty. No markdown, headings, bullets, or leading dashes." + metric_guidance + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam evidence: {json.dumps(compact, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1153,7 +1173,7 @@ def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str,
                     model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
                     api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
                 ).invoke([
-                    ("system", "Rewrite the supplied pre-match analysis as valid JSON only. Preserve the exact team_id / positive / strategy / weakness schema. Respect each team's fixture_location strictly: do not mention or derive conclusions from the opposite venue; an away team must not be described through home form. positive and weakness must each contain 60-75 words; focus on interpretation and use at most two numbers only if essential. strategy must contain 60-75 words and be a pure opponent-specific action plan: it must contain no numbers, percentages, metric names, statistics or data values. Every strategy must advise the team identified by its own team_id and explicitly name the other team as opponent. In Turkish use only formal analytical recommendation language such as 'yapılmalı', 'edilmeli', 'korunmalıdır'—never direct commands or second-person imperatives. Explain pressing, progression, defending, chance creation and game-state management in tactical terms. Do not pad by restating data. Do not use markdown, headings, bullets, leading dashes, invented facts, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+                    ("system", "Rewrite the supplied pre-match analysis as valid JSON only. Preserve the exact team_id / positive / strategy / weakness schema. Respect each team's fixture_location strictly: do not mention or derive conclusions from the opposite venue; an away team must not be described through home form. positive and weakness must each contain 60-75 words; focus on interpretation and use at most two numbers only if essential. strategy must contain 60-75 words and be a pure opponent-specific action plan: it must contain no numbers, percentages, metric names, statistics or data values. Every strategy must advise the team identified by its own team_id and explicitly name the other team as opponent. In Turkish use only formal analytical recommendation language such as 'yapılmalı', 'edilmeli', 'korunmalıdır'—never direct commands or second-person imperatives. Explain pressing, progression, defending, chance creation and game-state management in tactical terms. Do not pad by restating data. Do not use markdown, headings, bullets, leading dashes, invented facts, or the Turkish word 'örneklem'." + metric_guidance + FOOTBALL_TERMINOLOGY_GUIDANCE),
                     ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam evidence: {json.dumps(compact, ensure_ascii=False, default=str)}\nDraft to expand: {json.dumps(parsed, ensure_ascii=False, default=str)}"),
                 ])
                 revised = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(revision.content or "").strip(), flags=re.I))
@@ -1179,6 +1199,11 @@ def _pre_match_team_comparison_perspectives(
 ) -> dict[str, str]:
     """Create one evidence-led comparison interpretation for every category."""
     comparisons = [nonzero_metric_rows(usage.get("team_comparison") or {}) for usage in usages]
+    if len(comparisons) == 2:
+        for group in {key for comparison in comparisons for key in comparison}:
+            common = {m['name'] for m in comparisons[0].get(group, [])} & {m['name'] for m in comparisons[1].get(group, [])}
+            for comparison in comparisons:
+                comparison[group] = [metric for metric in comparison.get(group, []) if metric['name'] in common]
     categories = sorted({
         category
         for comparison in comparisons
@@ -1200,6 +1225,9 @@ def _pre_match_team_comparison_perspectives(
         )
         for category in categories
     }
+    from .pre_match_team_metrics import ensure_team_comparison_perspectives
+    fallback.update(ensure_team_comparison_perspectives({'teams': usages}, teams, lang)
+                    .get('team_comparison_perspectives', {}))
     if not categories or len(usages) != 2 or not os.getenv("OPENAI_API_KEY"):
         return fallback
     try:
@@ -1210,7 +1238,7 @@ def _pre_match_team_comparison_perspectives(
         ).invoke([
             (
                 "system",
-                "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON whose keys exactly match the supplied category keys. Each value must be one 45-65 word ScoutWise perspective in the requested language. Compare the two teams only within that category, identify the most meaningful contrast or shared tendency, then state the likely football implication for the upcoming match. Interpret rather than list values; use at most two short numerical facts. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, external benchmarks, certainty, or causation. No markdown, headings, bullets, or leading dashes." + FOOTBALL_TERMINOLOGY_GUIDANCE,
+                "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON whose keys exactly match the supplied category keys. Each value must be one 45-65 word ScoutWise perspective in the requested language. Compare the two teams only within that category, identify the most meaningful contrast or shared tendency, then state the likely football implication for the upcoming match. Interpret rather than list values; use at most two short numerical facts. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, external benchmarks, certainty, or causation. For opponent_threat and errors_discipline, lower values are preferable. For opponent_profile, infer how the observed opponent styles could shape the upcoming match (passing spells, transitions, second balls), without treating higher or lower values as superiority. Make the main point a matchup-specific inference supported by the available figures. If values are close, acknowledge the similar exposure and explain what might shift the balance; do not exaggerate small differences. Do not define metrics, explain the section, repeat generic data disclaimers, or prescribe unsupported formations or tactics. No markdown, headings, bullets, or leading dashes." + FOOTBALL_TERMINOLOGY_GUIDANCE,
             ),
             (
                 "human",
@@ -1367,7 +1395,8 @@ def _pre_match_overview_summary(
         {"category": "Takım Karşılaştırması" if tr else "Team Comparison", "summary": next(iter(comparisons.values()), ""), "sub_bullets": []},
         {"category": "Takım Analizi" if tr else "Team Analysis", "summary": (f"{first_name}: {analysis_first.get('positive') or ''} {second_name}: {analysis_second.get('positive') or ''}").strip(), "sub_bullets": []},
     ]
-    from .pre_match_player_comparison import player_comparison_overview, player_comparison_overview_evidence
+    from .pre_match_player_comparison import (PLAYER_OVERVIEW_VERSION, localize_overview_text,
+        player_comparison_overview, player_comparison_overview_evidence, player_overview_mentions_player)
     fallback.append(player_comparison_overview({'teams': usages, 'player_comparison': player_comparison or {}}, teams, lang))
     if not os.getenv("OPENAI_API_KEY"):
         return fallback
@@ -1391,7 +1420,7 @@ def _pre_match_overview_summary(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. In Player Comparison, compare the named teams through their players’ recorded role contributions; distinguish selected-match per-90 stats from competition-specific full-season rankings, respect lower-is-better errors and discipline, and never imply the recent stats use only the selected competition. Write a general comparison rather than instructions for using the selector; keep sub_bullets empty for this section. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. In Player Comparison, compare the complete player pools of the named teams using the supplied anonymous role-level distributions. Never name, select or compare individual players, including the default selections. Use only player_comparison evidence for this section, not individual names or statistics from standout-player or lineup evidence. Role-level medians describe player groups, not team totals or season ranks. Respect lower-is-better errors and discipline. Explain the likely matchup implication of the shared role contributions without reciting values, and never imply selected matches include only the selected competition. Write a general comparison rather than instructions for using the selector; keep sub_bullets empty for this section. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'. In Turkish, always write '90 dakika başına' instead of 'per-90', 'per90' or 'per 90'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if tr else 'English'}\nREQUIRED_CATEGORY: {json.dumps(required, ensure_ascii=False)}\nEvidence: {json.dumps(evidence, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
@@ -1403,7 +1432,16 @@ def _pre_match_overview_summary(
             row = by_category.get(str(fallback_row["category"])) or {}
             summary = re.sub(r"^\s*(?:[-•–—]\s*)+", "", str(row.get("summary") or "").strip())
             bullets = [{"label": str(item.get("label") or "").strip(), "text": re.sub(r"^\s*(?:[-•–—]\s*)+", "", str(item.get("text") or "").strip())} for item in (row.get("sub_bullets") or [])[:2] if isinstance(item, dict) and str(item.get("text") or "").strip()]
-            rows.append({"category": fallback_row["category"], "summary": summary or fallback_row["summary"], "sub_bullets": bullets})
+            summary = localize_overview_text(summary or fallback_row["summary"], lang)
+            bullets = [{**bullet, 'label': localize_overview_text(bullet['label'], lang),
+                       'text': localize_overview_text(bullet['text'], lang)} for bullet in bullets]
+            row = {"category": fallback_row["category"], "summary": summary, "sub_bullets": bullets}
+            if fallback_row["category"] in {"Oyuncu Karşılaştırması", "Player Comparison"}:
+                if player_overview_mentions_player(summary, {'teams': usages, 'player_comparison': player_comparison or {}}):
+                    row = dict(fallback_row)
+                row['sub_bullets'] = []
+                row['player_overview_version'] = PLAYER_OVERVIEW_VERSION
+            rows.append(row)
         return rows
     except Exception as exc:
         print(f"[pre_match_report] event=overview_summary_fallback error={exc}")

@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import json
 from threading import Lock
-from datetime import datetime
 from sqlalchemy import text
 
 from api_module.database import engine
 from .metrics import (Aggregate, AVERAGES, LOWER_BETTER, PLAYER_AWARD_METRICS,
                       PLAYER_RATE_METRICS, PLAYER_CONTEXT_METRICS, VERSION, PERIOD_ZONE, period_for, player_metric_result)
+from .periods import select_completed_periods
 from .stages import EUROPEAN_LEAGUES, SCOPES
 
 CACHE_VERSION = 4
@@ -123,11 +123,8 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
     scope = scope or ('league' if league_id in EUROPEAN_LEAGUES else 'overall')
     if scope not in SCOPES or (league_id not in EUROPEAN_LEAGUES and scope != 'overall'):
         raise ValueError('Invalid competition scope')
-    chosen = period_start or period_for(datetime.now(PERIOD_ZONE).date())[0]
-    if period_for(chosen)[0] != chosen:
-        raise ValueError('Invalid two-week period')
     params = {'league': league_id, 'season': season_id, 'scope': scope, 'version': CACHE_VERSION}
-    summary = db.execute(text('''SELECT computed_at,status FROM league_season_summaries
+    summary = db.execute(text('''SELECT computed_at,status,coverage FROM league_season_summaries
         WHERE league_id=:league AND season_id=:season'''), params).mappings().first()
     empty = {'status': 'pending', 'refreshing': True, 'metric_catalog': [], 'rows': [], 'total': 0,
              'offset': offset, 'limit': limit, 'computed_at': None, 'scope': scope}
@@ -146,7 +143,7 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
                               {'key': f'enterprise-player-rankings:{league_id}:{season_id}:{scope}'}).scalar()
         if not acquired:
             return empty
-        summary = db.execute(text('''SELECT computed_at,status FROM league_season_summaries
+        summary = db.execute(text('''SELECT computed_at,status,coverage FROM league_season_summaries
             WHERE league_id=:league AND season_id=:season FOR SHARE'''), params).mappings().one()
         if summary['status'] != 'ready':
             return empty
@@ -180,10 +177,17 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
         db.commit()
         saved = db.execute(text('''SELECT payload,source_computed_at FROM enterprise_league_player_rankings
             WHERE league_id=:league AND season_id=:season AND scope=:scope'''), params).mappings().one()
+    if league_id in EUROPEAN_LEAGUES:
+        coverage = summary['coverage'] or {}
+        periods = ((coverage.get('stageSummaries') or {}).get(scope) or {}).get('periods') or []
+    else:
+        periods = db.execute(text("""SELECT period_start,period_end,fixture_count,status,computed_at
+            FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season"""), params).mappings().all()
+    _, chosen = select_completed_periods(periods, period_start)
     page = ranked_page(saved['payload'], metric, mode, direction, offset, limit)
     best = ranked_page(saved['payload'], metric, mode, limit=1)['rows']
     season_winner = best[0] if best else None
-    biweekly_winner = saved['payload'].get('period_awards', {}).get(chosen.isoformat(), {}).get(metric, {}).get(mode)
+    biweekly_winner = saved['payload'].get('period_awards', {}).get(chosen.isoformat(), {}).get(metric, {}).get(mode) if chosen else None
     players = [*page['rows'], *([season_winner] if season_winner else []), *([biweekly_winner] if biweekly_winner else [])]
     ids = list({p['playerId'] for p in players})
     if ids:

@@ -3,6 +3,7 @@ from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from datetime import datetime, timezone
+import re
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from api_module.database import engine
@@ -247,68 +248,112 @@ def prepare_saved_comparison(key, usage, fixture):
             _PENDING.pop(key,None)
 
 
-def _overview_players(usage, teams, lang):
-    """Use the same highest-minute midfielder defaults as the comparison tab."""
-    tr = lang == 'tr'
-    ordered = sorted(teams, key=lambda team: 0 if team.get('location') == 'home' else 1)
-    names = [str(team.get('name') or ('Ev sahibi' if tr else 'Home')) for team in ordered[:2]]
-    if len(names) < 2:
-        names = ['Ev sahibi', 'Deplasman'] if tr else ['Home', 'Away']
-    selected = []
-    for team in ordered[:2]:
-        group = next((item for item in (usage.get('player_comparison') or {}).get('teams') or []
-                      if int(item['team_id']) == int(team['id'])), {})
-        players = group.get('players') or []
-        if not players:
-            old = next((item for item in usage.get('teams') or [] if int(item['team_id']) == int(team['id'])), {})
-            players = [comparison_player(player) for player in (old.get('performance_summary') or {}).get('featured_players') or []]
-        def midfielder(player):
-            return player.get('position_id') == 26 or any(word in str(player.get('position_name') or '').lower() for word in ('midfielder', 'orta saha'))
-        outfield = [player for player in players if player.get('position_id') != 24 and not any(word in str(player.get('position_name') or '').lower() for word in ('goalkeeper', 'kaleci'))]
-        candidates = [player for player in players if midfielder(player)] or outfield or players
-        selected.append(max(candidates, key=lambda player: player.get('minutes') or 0, default={}))
-    return ordered, names, selected
+PLAYER_OVERVIEW_VERSION = 2
 
 
 def player_comparison_overview_evidence(usage, teams, lang):
-    ordered, names, selected = _overview_players(usage, teams, lang)
+    """Anonymous role distributions across the roster, independent of selectors."""
+    from statistics import median
+    from report_module.metric_validation import valid_metric
+
     data = usage.get('player_comparison') or {}
-    supported = {'Key Passes', 'Shots On Target', 'Successful Dribbles', 'Assists', 'Goals', 'Tackles', 'Yellow Cards', 'Possession Lost'}
-    return {'competition_name': data.get('competition_name'), 'season_name': data.get('season_name'),
-            'stats_basis': 'selected_matches_per90', 'ranking_basis': 'competition_season_per90',
-            'players': [{**{key: player.get(key) for key in ('player_id', 'player_name', 'position_name', 'minutes')},
-                         'team_name': names[index],
-                         'metrics': [metric for metric in player.get('metrics') or [] if metric['name'] in supported and (numeric(metric.get('value')) or 0) > 0]}
-                        for index, player in enumerate(selected)]}
+    result = []
+    for team in sorted(teams, key=lambda item: 0 if item.get('location') == 'home' else 1)[:2]:
+        group = next((item for item in data.get('teams') or [] if int(item['team_id']) == int(team['id'])), {})
+        players = group.get('players') or []
+        if not players:
+            old = next((item for item in usage.get('teams') or [] if int(item['team_id']) == int(team['id'])), {})
+            players = [comparison_player(player) for player in old.get('comparison_players') or []]
+        roles = {}
+        seen = set()
+        for player in players:
+            pid = player.get('player_id')
+            if pid in seen or (numeric(player.get('minutes')) or 0) < 90:
+                continue
+            seen.add(pid)
+            position = player.get('position_id')
+            role = {24: 'goalkeeper', 25: 'defender', 26: 'midfielder', 27: 'attacker'}.get(position, 'other')
+            state = roles.setdefault(role, {'role': role, 'player_count': 0, 'metrics': {}})
+            state['player_count'] += 1
+            for metric in {m['name']: m for m in player.get('metrics') or []}.values():
+                name = metric['name']
+                if not valid_metric(name, metric.get('value'), nonzero=True):
+                    continue
+                entry = state['metrics'].setdefault(name, {'values': [], 'category': metric.get('category') or metric_category(name),
+                    'lower_is_better': metric.get('lower_is_better', name in LOWER_BETTER or metric_category(name) == 'errors_discipline'),
+                    'is_percentage': bool(metric.get('is_percentage') or '%' in name)})
+                entry['values'].append(numeric(metric['value']))
+        role_groups = []
+        for state in roles.values():
+            metrics = [{'name': name, 'category': metric['category'], 'lower_is_better': metric['lower_is_better'],
+                        'basis': 'percentage' if metric['is_percentage'] else 'per90',
+                        'players_covered': len(metric['values']), 'median_value': round(median(metric['values']), 4)}
+                       for name, metric in sorted(state['metrics'].items())]
+            role_groups.append({**state, 'metrics': metrics})
+        result.append({'team_name': team.get('name'), 'player_count': len(seen), 'roles': role_groups})
+    return {'scope': 'whole_player_pool_by_role', 'stats_basis': 'selected_matches_per90',
+            'aggregation': 'median of recorded nonzero player values within each role; not team totals',
+            'teams': result}
 
 
 def player_comparison_overview(usage, teams, lang):
-    """A compact evidence-led fallback, also usable by older saved reports."""
+    """General role-level fallback; never a comparison of two default players."""
     tr = lang == 'tr'
-    _, names, selected = _overview_players(usage, teams, lang)
-    summary = (f"{names[0]} ile {names[1]} oyuncularının seçili maçlardaki katkıları ortak süre temelinde karşılaştırılıyor. Bu yaklaşım, farklı dakika toplamlarını dengeleyerek bireysel üretimi daha anlaşılır kılıyor; takım düzeyindeki görünümün yanında oyuncuların rol katkılarını ve karşılaşmadaki bireysel eşleşmeleri birlikte değerlendirmeyi sağlıyor."
-               if tr else f"Comparing players from {names[0]} and {names[1]} on a common playing-time basis clarifies individual output across the selected matches. This complements team-level analysis by distinguishing role contributions and providing context for individual matchups.")
-    labels = [('Key Passes', 'kilit pas'), ('Shots On Target', 'isabetli şut'), ('Successful Dribbles', 'başarılı dripling'), ('Assists', 'asist'), ('Goals', 'gol'), ('Tackles', 'top kapma')]
-    if len(selected) == 2:
-        metrics = [{metric['name']: metric for metric in player.get('metrics') or []} for player in selected]
-        for metric, label in labels:
-            a, b = (numeric(values.get(metric, {}).get('value')) for values in metrics)
-            if a is None or b is None or a <= 0 or b <= 0 or a == b:
-                continue
-            winner = names[0 if a > b else 1]
-            summary = (f"{names[0]} ile {names[1]} oyuncuları seçili maçlar üzerinden karşılaştırıldığında, {label} üretiminde {winner} tarafı öne çıkıyor. Ortak süre temeli, oyuncuların farklı dakika toplamlarını dengeleyerek iki takımın bireysel katkı düzeyleri arasındaki farkı daha görünür kılıyor."
-                       if tr else f"Comparing players from {names[0]} and {names[1]} across the selected matches highlights stronger {metric.lower()} output on the {winner} side. A common playing-time basis clarifies individual contribution differences despite unequal minutes played.")
-            break
-    return {'category': 'Oyuncu Karşılaştırması' if tr else 'Player Comparison', 'summary': summary, 'sub_bullets': []}
+    evidence = player_comparison_overview_evidence(usage, teams, lang)
+    pools = evidence['teams']
+    names = [str(pool.get('team_name') or ('Ev sahibi' if index == 0 else 'Deplasman')) for index, pool in enumerate(pools)]
+    names = (names + (['Ev sahibi', 'Deplasman'] if tr else ['Home', 'Away']))[:2]
+    summary = (f"{names[0]} ile {names[1]} oyuncu gruplarının seçili maçlardaki yaratıcılık, bitiricilik ve savunma katkıları birlikte değerlendiriliyor. Mevki bazındaki ortak göstergeler, bireysel üretimin takım geneline nasıl yayıldığını ve yaklaşan maçın farklı alanlarında oluşabilecek katkı dengesini anlamaya yardımcı oluyor."
+               if tr else f"The player groups of {names[0]} and {names[1]} are assessed through creativity, finishing and defensive contributions across the selected matches. Shared role-level indicators provide context for how individual output may shape the upcoming matchup.")
+    labels = {'Key Passes': ('yaratıcılık', 'creativity'), 'Shots On Target': ('isabetli şut üretimi', 'shots on target'),
+              'Successful Dribbles': ('bire bir hücum katkısı', 'one-on-one attacking output'),
+              'Tackles': ('top kapma katkısı', 'tackling output'), 'Possession Lost': ('top kaybını sınırlama', 'limiting possession losses')}
+    candidates = []
+    if len(pools) == 2:
+        by_role = [{role['role']: role for role in pool['roles']} for pool in pools]
+        for role in sorted(by_role[0].keys() & by_role[1].keys()):
+            metrics = [{m['name']: m for m in roles[role]['metrics']} for roles in by_role]
+            for name in labels.keys() & metrics[0].keys() & metrics[1].keys():
+                a, b = (values[name]['median_value'] for values in metrics)
+                if min(values[name]['players_covered'] for values in metrics) < 2:
+                    continue
+                gap = abs(a - b) / max(abs(a), abs(b))
+                if gap > 0.10:
+                    winner = 0 if (a < b if metrics[0][name]['lower_is_better'] else a > b) else 1
+                    candidates.append((gap, name, role, winner))
+    if candidates:
+        _, name, role, winner = max(candidates)
+        role_tr = {'defender': 'savunma', 'midfielder': 'orta saha', 'attacker': 'hücum', 'goalkeeper': 'kaleci', 'other': 'diğer'}[role]
+        summary = (f"{names[winner]} {role_tr} oyuncularının {labels[name][0]} göstergesinde öne çıkması, yaklaşan maçın bu alanında katkı dengesini etkileyebilir. {names[1-winner]} karşısında bu katkının sürekliliği, hücumların gelişimi ile savunma sonrası toparlanma arasındaki denge açısından takip edilecek noktalardan biri olabilir."
+                   if tr else f"The {role} group of {names[winner]} shows stronger {labels[name][1]} across the selected matches, potentially influencing this area against {names[1-winner]}. This reflects recorded output across comparable roles on a common playing-time basis.")
+    return {'category': 'Oyuncu Karşılaştırması' if tr else 'Player Comparison', 'summary': summary,
+            'sub_bullets': [], 'player_overview_version': PLAYER_OVERVIEW_VERSION}
+
+
+def localize_overview_text(text, lang):
+    if lang != 'tr':
+        return str(text or '')
+    return re.sub(r'\bper[\s‐‑–—-]*90(?:\s+(?:minutes?|mins?))?\b', '90 dakika başına', str(text or ''), flags=re.I)
+
+
+def player_overview_mentions_player(summary, usage):
+    pools = [group.get('players') or [] for group in (usage.get('player_comparison') or {}).get('teams') or []]
+    pools.extend(team.get('comparison_players') or [] for team in usage.get('teams') or [])
+    names = {str(player.get('player_name') or '').strip() for pool in pools for player in pool}
+    return any(len(name) >= 4 and re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', summary, re.I) for name in names)
 
 
 def ensure_player_comparison_overview(usage, teams, lang):
     if 'overview_summary' not in usage:
         return usage
-    rows = list(usage.get('overview_summary') or [])
+    rows = [{**row, 'summary': localize_overview_text(row.get('summary'), lang),
+             'sub_bullets': [{**bullet, 'label': localize_overview_text(bullet.get('label'), lang),
+                             'text': localize_overview_text(bullet.get('text'), lang)}
+                            for bullet in row.get('sub_bullets') or []]}
+            for row in usage.get('overview_summary') or []]
     labels = {'Oyuncu Karşılaştırması', 'Player Comparison'}
     existing = next((row for row in rows if row.get('category') in labels), None)
-    row = existing or player_comparison_overview(usage, teams, lang)
+    row = existing if existing and existing.get('player_overview_version') == PLAYER_OVERVIEW_VERSION else player_comparison_overview(usage, teams, lang)
     rows = [item for item in rows if item.get('category') not in labels]
     index = next((i + 1 for i, item in enumerate(rows) if item.get('category') in {'Takım Analizi', 'Team Analysis'}), len(rows))
     rows.insert(index, row)
