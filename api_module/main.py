@@ -762,6 +762,20 @@ def pro_strategies_delete(
     return Response(status_code=204)
 
 
+@app.get("/scouting-reports/players/{player_id}/percentiles")
+def enterprise_report_player_percentiles(player_id: int, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    """Refresh modal benchmarks by provider identity without regenerating AI text."""
+    if player_id <= 0:
+        raise HTTPException(status_code=422, detail="Invalid player ID")
+    from report_module.percentiles import build_domestic_percentiles
+    metadata = db.execute(text("""SELECT metadata FROM player_data
+        WHERE (CASE WHEN (metadata->>'player_id') ~ '^[0-9]+([.]0+)?$'
+                    THEN trunc((metadata->>'player_id')::numeric)::text
+                    ELSE NULL END) = CAST(:player_id AS text) LIMIT 1"""),
+        {'player_id': player_id}).scalar()
+    return build_domestic_percentiles(db, metadata or {'player_id': player_id})
+
+
 @app.get("/pro/players/{player_id}/percentiles")
 def pro_player_percentiles(player_id: int, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     from scoutwise_pro_module.pro import get_player_percentiles

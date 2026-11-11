@@ -16,7 +16,7 @@ from scoutwise_pro_module.team_fit import eligible_roles
 
 MIN_MINUTES = 300
 MIN_PEERS = 5
-BENCHMARK_VERSION = 5
+BENCHMARK_VERSION = 8
 POSITION_GROUPS = {
     'central_midfield': ('CDM', 'CM', 'CAM'),
     'full_back': ('LB', 'RB'),
@@ -85,16 +85,20 @@ COVERED_AVERAGES = {'expected_goals', 'expected_goals_on_target', 'shooting_perf
 # Numerator, denominator(s), minimum reconstructed attempts. Aerial attempts
 # use won + lost, matching the existing report validation rule.
 RATIOS = {
-    'Accurate Passes (%)': ('accurate_passes', ('passes',), 100),
-    'Long Balls Won (%)': ('long_balls_won', ('long_balls',), 20),
-    'Successful Crosses (%)': ('accurate_crosses', ('total_crosses',), 20),
-    'Dribble Accuracy (%)': ('successful_dribbles', ('dribble_attempts',), 20),
-    'Tackles Won (%)': ('tackles_won', ('tackles',), 20),
-    'Duels Won (%)': ('duels_won', ('total_duels',), 20),
-    'Aerials Won (%)': ('aerials_won', ('aerials_won', 'aerials_lost'), 20),
-    'Shots On Target (%)': ('shots_on_target', ('shots_total',), 20),
-    'Goal Conversion (%)': ('goals', ('shots_total',), 20),
-    'On-Target to Goal Conversion (%)': ('goals', ('shots_on_target',), 20),
+    'Accurate Passes (%)': ('accurate_passes', ('passes',), 20),
+    'Long Balls Won (%)': ('long_balls_won', ('long_balls',), 10),
+    'Successful Crosses (%)': ('accurate_crosses', ('total_crosses',), 10),
+    'Dribble Accuracy (%)': ('successful_dribbles', ('dribble_attempts',), 10),
+    'Tackles Won (%)': ('tackles_won', ('tackles',), 10),
+    'Duels Won (%)': ('duels_won', ('total_duels',), 10),
+    'Aerials Won (%)': ('aerials_won', ('aerials_won', 'aerials_lost'), 10),
+    'Shots On Target (%)': ('shots_on_target', ('shots_total',), 5),
+    'Goal Conversion (%)': ('goals', ('shots_total',), 5),
+    'On-Target to Goal Conversion (%)': ('goals', ('shots_on_target',), 5),
+    # Shot quality uses matched xG/shot observations from _rate_inputs.
+    # Never reconstruct it from per-stat averages with different coverage.
+    'Shot Quality (%)': ('expected_goals', ('shots_total',), 5),
+    'On-Target Shot Quality (%)': ('expected_goals_on_target', ('shots_on_target',), 5),
     'Assist Efficiency (%)': ('assists', ('key_passes',), 20),
 }
 
@@ -247,6 +251,28 @@ def build_domestic_percentiles(db, metadata):
             'currentTeam': any(str(r['team_id']) == str(metadata.get('team_id')) for r in own_rows),
             'minutes': source['minutes'], 'matches': source['matches'], 'roles': source['roles'],
             'benchmarks': role_metrics})
+    # The modal additionally exposes each league/team stint. Keep the league
+    # cohort deduplicated, replacing this player's pooled profile with the
+    # selected stint exactly once. Peers remain league-wide, not club-only.
+    team_competitions = []
+    for competition in competitions:
+        stints = defaultdict(list)
+        for row in rows:
+            if row['league_id'] == competition['leagueId']:
+                stints[row['team_id']].append(row)
+        for team_id, team_rows in stints.items():
+            source = aggregate(team_rows)
+            if not source or not source['roles']:
+                continue
+            league_peers = [p for (lid, pid, g), p in profiles.items()
+                            if p and lid == competition['leagueId'] and g == source['gender']
+                            and bool(g) and pid != int(player_id)] + [source]
+            team_competitions.append({**competition, 'teamId': team_id,
+                'teams': list(dict.fromkeys(r['team_name'] for r in team_rows)),
+                'currentTeam': str(team_id) == str(metadata.get('team_id')),
+                'minutes': source['minutes'], 'matches': source['matches'], 'roles': source['roles'],
+                'benchmarks': profile_benchmarks(source, league_peers)})
+    team_competitions.sort(key=lambda c: (not c['currentTeam'], -c['minutes'], c['leagueId'], c['teamId']))
     # PDF uses only the latest club's domestic stint and its most-played role.
     # League peers remain deduplicated annual league profiles. Replace our own
     # pooled profile with the selected stint so the target is counted once.
@@ -279,4 +305,4 @@ def build_domestic_percentiles(db, metadata):
     competitions.sort(key=lambda c: (not c['currentTeam'], -c['minutes'], c['leagueId']))
     return {'version': BENCHMARK_VERSION, 'minimumMinutes': MIN_MINUTES, 'minimumPeers': MIN_PEERS,
             'period': 'annual', 'generatedAt': datetime.now(timezone.utc).isoformat(),
-            'competitions': competitions, 'pdfCompetition': pdf_competition, 'computationMs': round((perf_counter()-start)*1000, 2)}
+            'competitions': competitions, 'teamCompetitions': team_competitions, 'pdfCompetition': pdf_competition, 'computationMs': round((perf_counter()-start)*1000, 2)}
