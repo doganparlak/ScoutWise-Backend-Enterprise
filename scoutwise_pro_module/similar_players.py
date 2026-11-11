@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from matchup_module.comparison import _fetch_player_metadata
 from player_pool_module.player_pool import search_players, fetch_player_rows_by_ids
-from scoutwise_pro_module.discovery import ALIASES, BUNDLES, CONTEXT_METRICS, CATEGORY_DEFINITIONS, CONTEXT_BUNDLES, DiscoveryFilters, player_metrics, discovery_roles
+from scoutwise_pro_module.discovery import ALIASES, BUNDLES, CONTEXT_METRICS, CATEGORY_DEFINITIONS, CONTEXT_BUNDLES, DiscoveryFilters, player_metrics, discovery_roles, discovery_search_roles
 
 from scoutwise_pro_module.similarity_weights import feature_weights
 
@@ -55,7 +55,9 @@ def identity(row):
 def rank_similar(source_row, rows):
     source = player_metrics(source_row['content'], include_context=True)
     role_shares = discovery_roles(source_row['content'])
-    roles = set(role_shares)
+    # Expand only roles that passed the existing primary/secondary-role rule.
+    # Keep the source shares unchanged for similarity feature weighting.
+    roles = discovery_search_roles(role_shares)
     if not roles or not sufficient_metrics(feature_weights(source, source, role_shares), 'GK' in roles):
         raise HTTPException(status_code=422, detail='similarity_source_insufficient')
     eligible = {}
@@ -138,7 +140,7 @@ def similar_players(db, payload):
     # Full database coverage; no discovery shortlist limit and no AI selection.
     filters = payload.filters.model_dump(mode='json', exclude_none=True)
     choices = {key: filters.pop(key, []) for key in ('nationality', 'team', 'league')}
-    rows = search_players(db, filters, all_matches=True, candidate_roles=list(discovery_roles(source['content'])), candidate_choices=choices, metadata_fields=SIMILARITY_METADATA_FIELDS)
+    rows = search_players(db, filters, all_matches=True, candidate_roles=sorted(discovery_search_roles(discovery_roles(source['content']))), candidate_choices=choices, metadata_fields=SIMILARITY_METADATA_FIELDS)
     ranked = rank_similar(source, rows)
     del rows  # Non-winning candidate metadata is no longer needed.
     profiles = {str(row['id']): row for row in fetch_player_rows_by_ids(db, [int(match['player']['id']) for match in ranked])}

@@ -256,6 +256,7 @@ def get_team_played_matches(team_id: int, domestic_league_id: int) -> list[dict[
         fixture_season = fixture.get("season") or {}
         results.append({
             "fixtureId": int(fixture["id"]),
+            "leagueId": int(fixture["league_id"]) if fixture.get("league_id") is not None else league.get("id"),
             "name": fixture.get("name") or f'{home.get("name", "")} vs {away.get("name", "")}',
             "startingAt": fixture.get("starting_at") or "",
             "country": (league.get("country") or {}).get("name") or "",

@@ -218,15 +218,25 @@ def candidate_fingerprint(metadata):
     return hashlib.blake2b(json.dumps(metadata, sort_keys=True, separators=(',', ':')).encode(), digest_size=16).digest()
 
 
+DISCOVERY_PAIRED_ROLES = {'LM': 'LW', 'LW': 'LM', 'RM': 'RW', 'RW': 'RM'}
+
+
+def discovery_search_roles(selected_roles):
+    """Expand same-flank midfield/wing roles before both retrieval and ranking."""
+    roles = set(selected_roles)
+    return roles | {DISCOVERY_PAIRED_ROLES[role] for role in roles if role in DISCOVERY_PAIRED_ROLES}
+
+
 def shortlist_players(rows, payload):
     # Distinct real players, deterministic choice of the most complete eligible record.
     players={}
     excluded=set(payload.excludedPlayerKeys)
+    search_roles = discovery_search_roles(payload.roles) or ROLE_CODES
     for row in rows:
         meta=row['content']
         identity=f"player:{meta['player_id']}" if meta.get('player_id') else f"row:{row['id']}"
         if identity in excluded: continue
-        meta=row['content']; roles=set(discovery_roles(meta)) & set(payload.roles or ROLE_CODES)
+        meta=row['content']; roles=set(discovery_roles(meta)) & search_roles
         if not roles or not any(str(meta.get(key) or '').strip() for key in ('player_name', 'name')) or not all(str(meta.get(key) or '').strip() for key in ('team_name', 'league_name', 'nationality_name')) or not (number(meta.get('age')) or 0) > 0:
             continue
         metrics=player_metrics(meta)
@@ -311,7 +321,7 @@ def discover_players(db,user_id,payload,language):
         if not strategy:raise HTTPException(status_code=422,detail='Set a team strategy first')
     filters=payload.filters.model_dump(mode='json',exclude_none=True)
     choices={key:filters.pop(key,[]) for key in ('nationality','team','league')}
-    rows=search_players(db,filters,all_matches=True,candidate_roles=payload.roles or None,candidate_choices=choices,metadata_fields=DISCOVERY_METADATA_FIELDS,batch_size=5000,discovery_metric_names=DISCOVERY_METRIC_NAMES)
+    rows=search_players(db,filters,all_matches=True,candidate_roles=sorted(discovery_search_roles(payload.roles)) or None,candidate_choices=choices,metadata_fields=DISCOVERY_METADATA_FIELDS,batch_size=5000,discovery_metric_names=DISCOVERY_METRIC_NAMES)
     shortlist,count=shortlist_players(rows,payload)
     del rows
     if not shortlist:return {'players':[],'shortlistCount':0,'eligibleCount':count,'hasMore':False}
