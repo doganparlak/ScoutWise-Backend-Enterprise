@@ -152,7 +152,8 @@ def enrich_player_comparison(usage, fixture):
         if cutoff:
             scope = 'qualifying' if int(fixture['league']['id']) in EUROPEAN_LEAGUES and stage_scope(fixture.get('stage') or {}) == 'qualifying' else 'overall'
             try:
-                ranks = cached_player_ranks(int(fixture['league']['id']),int(fixture['season']['id']),scope,int(cutoff.timestamp())//60)
+                ranks = cached_player_ranks(int(fixture['league']['id']),int(fixture['season']['id']),scope,int(cutoff.timestamp())//60,
+                    players=[(team['team_id'], player['player_id']) for team in data['teams'] for player in team.get('players') or []])
             except SQLAlchemyError:
                 pass  # Selected-match comparisons remain usable without league ranks.
         for team in data['teams']:

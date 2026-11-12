@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 from threading import Lock
+from datetime import datetime
 from sqlalchemy import text
 
-from api_module.database import engine
+from api_module.database import engine, benchmark_engine
 from .metrics import (Aggregate, AVERAGES, LOWER_BETTER, PLAYER_AWARD_METRICS,
                       PLAYER_RATE_METRICS, PLAYER_CONTEXT_METRICS, VERSION, PERIOD_ZONE, period_for, player_metric_result)
 from .periods import select_completed_periods
@@ -119,18 +120,22 @@ def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0
 
 
 def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode='total', direction=None, offset=0, limit=50, period_start=None):
-    ensure_schema()
+    # Schema is initialized at startup/migration time, never during a read request.
     scope = scope or ('league' if league_id in EUROPEAN_LEAGUES else 'overall')
     if scope not in SCOPES or (league_id not in EUROPEAN_LEAGUES and scope != 'overall'):
         raise ValueError('Invalid competition scope')
     params = {'league': league_id, 'season': season_id, 'scope': scope, 'version': CACHE_VERSION}
-    summary = db.execute(text('''SELECT computed_at,status,coverage FROM league_season_summaries
+    summary = db.execute(text('''SELECT computed_at,status,(SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                'period_start',p->'period_start','period_end',p->'period_end',
+                'fixture_count',p->'fixture_count','status',COALESCE(p->'status','"ready"'::jsonb),
+                'computed_at',p->'computed_at')),'[]'::jsonb)
+                FROM jsonb_array_elements(COALESCE(coverage->'stageSummaries'->:scope->'periods','[]'::jsonb)) p) AS scoped_periods FROM league_season_summaries
         WHERE league_id=:league AND season_id=:season'''), params).mappings().first()
     empty = {'status': 'pending', 'refreshing': True, 'metric_catalog': [], 'rows': [], 'total': 0,
              'offset': offset, 'limit': limit, 'computed_at': None, 'scope': scope}
     if summary is None or summary['computed_at'] is None:
         return empty
-    saved = db.execute(text('''SELECT payload,source_computed_at,calculation_version FROM enterprise_league_player_rankings
+    saved = db.execute(text('''SELECT source_computed_at,calculation_version FROM enterprise_league_player_rankings
         WHERE league_id=:league AND season_id=:season AND scope=:scope AND calculation_version>=2'''), params).mappings().first()
     rebuild = saved is None or saved['source_computed_at'] != summary['computed_at'] or saved['calculation_version'] != CACHE_VERSION
     if rebuild and summary['status'] != 'ready' and saved is None:
@@ -143,7 +148,11 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
                               {'key': f'enterprise-player-rankings:{league_id}:{season_id}:{scope}'}).scalar()
         if not acquired:
             return empty
-        summary = db.execute(text('''SELECT computed_at,status,coverage FROM league_season_summaries
+        summary = db.execute(text('''SELECT computed_at,status,(SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                'period_start',p->'period_start','period_end',p->'period_end',
+                'fixture_count',p->'fixture_count','status',COALESCE(p->'status','"ready"'::jsonb),
+                'computed_at',p->'computed_at')),'[]'::jsonb)
+                FROM jsonb_array_elements(COALESCE(coverage->'stageSummaries'->:scope->'periods','[]'::jsonb)) p) AS scoped_periods FROM league_season_summaries
             WHERE league_id=:league AND season_id=:season FOR SHARE'''), params).mappings().one()
         if summary['status'] != 'ready':
             return empty
@@ -175,19 +184,30 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
         aggregate.finish(season_awards=True)  # Finalize pooled rates and missing-attempt evidence.
         save_snapshot(db, params, scope, aggregate, summary['computed_at'], period_awards)
         db.commit()
-        saved = db.execute(text('''SELECT payload,source_computed_at FROM enterprise_league_player_rankings
+        saved = db.execute(text('''SELECT source_computed_at FROM enterprise_league_player_rankings
             WHERE league_id=:league AND season_id=:season AND scope=:scope'''), params).mappings().one()
     if league_id in EUROPEAN_LEAGUES:
-        coverage = summary['coverage'] or {}
-        periods = ((coverage.get('stageSummaries') or {}).get(scope) or {}).get('periods') or []
+        periods = summary['scoped_periods'] or []
     else:
         periods = db.execute(text("""SELECT period_start,period_end,fixture_count,status,computed_at
             FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season"""), params).mappings().all()
     _, chosen = select_completed_periods(periods, period_start)
-    page = ranked_page(saved['payload'], metric, mode, direction, offset, limit)
-    best = ranked_page(saved['payload'], metric, mode, limit=1)['rows']
-    season_winner = best[0] if best else None
-    biweekly_winner = saved['payload'].get('period_awards', {}).get(chosen.isoformat(), {}).get(metric, {}).get(mode) if chosen else None
+    # Snapshot values are normalized once in Supabase; return only this page.
+    with benchmark_engine.begin() as ranking_db:
+        ready = ranking_db.execute(text("SELECT public.scoutwise_ensure_league_rank_rows_v1(:league,:season,:scope)"), params).scalar_one()
+        if not ready:
+            return empty
+        page = ranking_db.execute(text("""SELECT public.scoutwise_league_player_page_v1(
+            :league,:season,:scope,:metric,:mode,:direction,:offset,:limit,:period)"""),
+            {**params, 'metric': metric, 'mode': mode, 'direction': direction, 'offset': offset,
+             'limit': limit, 'period': chosen.isoformat() if chosen else None}).scalar_one()
+    if page.get('error') == 'unsupported_metric':
+        raise ValueError('Unsupported player metric for this league')
+    if page.get('error'):
+        return empty
+    season_winner = page.pop('season_winner')
+    biweekly_winner = page.pop('biweekly_winner')
+    source_computed_at = datetime.fromisoformat(page.pop('source_computed_at'))
     players = [*page['rows'], *([season_winner] if season_winner else []), *([biweekly_winner] if biweekly_winner else [])]
     ids = list({p['playerId'] for p in players})
     if ids:
@@ -202,4 +222,4 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
         for player in players:
             player['teamImageUrl'] = logos.get(player['teamId'])
     return {**page, 'season_winner': season_winner, 'biweekly_winner': biweekly_winner, 'selectedPeriodStart': chosen, 'status': 'ready', 'refreshing': summary['status'] in {'pending', 'processing'},
-            'computed_at': saved['source_computed_at'], 'scope': scope}
+            'computed_at': source_computed_at, 'scope': scope}

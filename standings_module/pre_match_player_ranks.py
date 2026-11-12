@@ -1,94 +1,86 @@
 """Optional pre-match player ranks from saved contributions; never fetch provider data."""
 from copy import deepcopy
 from datetime import datetime, timezone
-from functools import lru_cache
+import json
 from sqlalchemy import text
-from api_module.database import engine
-from .metrics import Aggregate, VERSION, AVERAGES, PLAYER_RATE_METRICS, PLAYER_AWARD_METRICS, LOWER_BETTER, kickoff, numeric, player_metric_result
+from api_module.database import benchmark_engine
+from .metrics import Aggregate, VERSION
 from .stages import EUROPEAN_LEAGUES
 
-def rank_players(aggregate, mode="per90"):
-    aggregate.finish(season_awards=True)
-    values = {}
-    for player in aggregate.players.values():
-        matches = aggregate.teams[str(player['teamId'])]['matches']
-        if player['ratedAppearances'] and player['appearances'] * 2 >= matches:
-            values.setdefault('Rating', []).append((player['ratingSum'] / player['ratedAppearances'], player))
-        for metric in PLAYER_AWARD_METRICS:
-            result = player_metric_result(player, matches, metric, mode)
-            if result is not None:
-                values.setdefault(metric, []).append((result[0], player))
-    ranks = {}
-    for metric, candidates in values.items():
-        candidates.sort(key=lambda item: (item[0] if metric in LOWER_BETTER else -item[0], item[1]['playerId'], item[1]['teamId']))
-        previous = None
-        position = 0
-        for index, (value, player) in enumerate(candidates):
-            if previous is None or value != previous:
-                position = index + 1
-            previous = value
-            ranks.setdefault((player['teamId'], player['playerId']), {})[metric] = {
-                'position': position, 'total_players': len(candidates), 'season_value': round(value, 4),
-                'basis': 'average_rating' if metric == 'Rating' else 'rate' if metric in PLAYER_RATE_METRICS else 'average' if metric in AVERAGES else mode,
-                'direction': 'asc' if metric in LOWER_BETTER else 'desc',
-            }
-    return ranks
 
-
-@lru_cache(maxsize=24)
-def cached_player_ranks(league, season, scope, minute, mode="per90"):
+def cached_player_ranks(league, season, scope, minute, mode="per90", *, players):
+    """Return only requested ranks; shared SQL caches never retain league maps in RAM."""
+    from .player_rankings import CACHE_VERSION, snapshot
+    from .metrics import _hide_incomplete_attempts
+    targets = sorted({(int(team), int(player)) for team, player in players})
+    if not targets:
+        return {}
+    if mode not in {'total', 'perMatch', 'per90'}:
+        raise ValueError('Unsupported ranking mode')
     cutoff = datetime.fromtimestamp(minute * 60, timezone.utc)
-    aggregate = Aggregate(include_team_metrics=False)
-    with engine.connect() as db:
-        # Reuse the published leaderboard while a refresh is in progress. A
-        # historical report may only use a snapshot published before its cutoff.
-        from .player_rankings import CACHE_VERSION
-        saved = db.execute(text("""SELECT payload FROM enterprise_league_player_rankings
-            WHERE league_id=:league AND season_id=:season AND scope=:scope
-            AND calculation_version=:version AND source_computed_at<=:cutoff"""),
-            {'league': league, 'season': season, 'scope': scope, 'version': CACHE_VERSION, 'cutoff': cutoff}).scalar()
+    args = dict(l=league, s=season, sc=scope, cutoff=cutoff, version=CACHE_VERSION,
+                targets=json.dumps(targets), mode=mode)
+
+    def selected(db):
+        result = db.execute(text("""SELECT scoutwise_selected_player_ranks_v1(
+            :l,:s,:sc,CAST(:targets AS jsonb),:mode,:cutoff)"""), args).scalar()
+        return None if result is None else {(r['team_id'], r['player_id']): r['metrics'] for r in result}
+
+    with benchmark_engine.begin() as db:
+        saved = db.execute(text("""SELECT 1 FROM enterprise_league_player_rankings
+            WHERE league_id=:l AND season_id=:s AND scope=:sc
+            AND calculation_version=:version AND source_computed_at<=:cutoff"""), args).scalar()
         if saved:
-            values = {}
-            for player in saved.get('players', []):
-                for metric, evidence in player.get('metrics', {}).items():
-                    value = numeric(evidence.get({'total': 'value', 'perMatch': 'perMatch', 'per90': 'per90'}[mode]))
-                    if value is not None:
-                        values.setdefault(metric, []).append((value, player))
-            ranks = {}
-            for metric, players in values.items():
-                players.sort(key=lambda item: (item[0] if metric in LOWER_BETTER else -item[0], item[1]['playerId'], item[1]['teamId']))
-                previous, position = None, 0
-                for index, (value, player) in enumerate(players):
-                    if previous is None or value != previous:
-                        position = index + 1
-                    previous = value
-                    ranks.setdefault((player['teamId'], player['playerId']), {})[metric] = {
-                        'position': position, 'total_players': len(players), 'season_value': round(value, 4),
-                        'basis': 'average_rating' if metric == 'Rating' else 'rate' if metric in PLAYER_RATE_METRICS else 'average' if metric in AVERAGES else mode,
-                        'direction': 'asc' if metric in LOWER_BETTER else 'desc',
-                    }
-            return ranks
-        summary = db.execute(text('''SELECT computed_at,status FROM league_season_summaries
-            WHERE league_id=:league AND season_id=:season FOR SHARE NOWAIT'''),
-            {'league': league, 'season': season}).mappings().first()
-        if summary is None or summary['computed_at'] is None or summary['status'] != 'ready':
+            db.execute(text('SELECT scoutwise_ensure_league_rank_rows_v1(:l,:s,:sc)'), args)
+            db.execute(text('SELECT scoutwise_ensure_league_rank_distributions_v1(:l,:s,:sc)'), args)
+            result = selected(db)
+            if result is not None:
+                return result
+        summary = db.execute(text("""SELECT computed_at,status FROM league_season_summaries
+            WHERE league_id=:l AND season_id=:s FOR SHARE NOWAIT"""), args).mappings().first()
+        if not summary or summary['computed_at'] is None or summary['status'] != 'ready':
             return {}
-        rows = db.execute(text('''SELECT kickoff_at,included_in_aggregation,team_contributions,
-            player_contributions,calculation_version,coverage FROM league_match_contributions
-            WHERE league_id=:league AND season_id=:season AND included_in_aggregation=TRUE
-            AND kickoff_at<:cutoff ORDER BY kickoff_at,fixture_id''').execution_options(stream_results=True, yield_per=20),
-            {'league': league, 'season': season, 'cutoff': cutoff}).mappings()
-        for row in rows:
-            if row['calculation_version'] != VERSION:
-                return {}
-            if league in EUROPEAN_LEAGUES:
-                phase = (row['coverage'] or {}).get('scope')
-                if phase not in {'league', 'knockout', 'qualifying'}:
+        # Fingerprint the exact historical input, including corrections, without
+        # downloading player contributions on a cache hit.
+        fingerprint = db.execute(text("""SELECT md5(COALESCE(string_agg(
+            concat_ws(':',fixture_id,calculation_version,extract(epoch FROM fetched_at),
+                source_fingerprint,coverage->>'scope'),',' ORDER BY kickoff_at,fixture_id),''))
+            FROM league_match_contributions WHERE league_id=:l AND season_id=:s
+            AND included_in_aggregation=TRUE AND kickoff_at<:cutoff"""), args).scalar()
+        args['sc'] = f'pre_match:{scope}:{minute}:{fingerprint}'
+        db.execute(text("""SELECT pg_advisory_xact_lock(hashtextextended(
+            'scoutwise-pre-match-history:'||CAST(:l AS text)||':'||CAST(:s AS text)||':'||:sc,0))"""), args)
+        exists = db.execute(text("""SELECT 1 FROM scoutwise_league_rank_meta_v1
+            WHERE league_id=:l AND season_id=:s AND scope=:sc AND calculation_version=:version"""), args).scalar()
+        if not exists:
+            aggregate = Aggregate(include_team_metrics=False)
+            rows = db.execute(text("""SELECT kickoff_at,included_in_aggregation,team_contributions,
+                player_contributions,calculation_version,coverage FROM league_match_contributions
+                WHERE league_id=:l AND season_id=:s AND included_in_aggregation=TRUE
+                AND kickoff_at<:cutoff ORDER BY kickoff_at,fixture_id""").execution_options(stream_results=True, yield_per=20), args).mappings()
+            for row in rows:
+                if row['calculation_version'] != VERSION:
                     return {}
-                if phase not in ({'qualifying'} if scope == 'qualifying' else {'league', 'knockout'}):
-                    continue
-            aggregate.add(row)
-    return rank_players(aggregate, mode)
+                if league in EUROPEAN_LEAGUES:
+                    phase = (row['coverage'] or {}).get('scope')
+                    if phase not in {'league', 'knockout', 'qualifying'}:
+                        return {}
+                    if phase not in ({'qualifying'} if scope == 'qualifying' else {'league', 'knockout'}):
+                        continue
+                aggregate.add(row)
+            for player in aggregate.players.values():
+                _hide_incomplete_attempts(player['metricTotals'], player.get('_rate_inputs') or {})
+            args['payload'] = json.dumps(snapshot(aggregate))
+            del aggregate
+            db.execute(text("""SELECT scoutwise_store_league_rank_rows_v1(
+                :l,:s,:sc,:cutoff,:version,CAST(:payload AS jsonb))"""), args)
+            del args['payload']
+        db.execute(text("""UPDATE scoutwise_league_rank_meta_v1 SET last_used_at=NOW()
+            WHERE league_id=:l AND season_id=:s AND scope=:sc
+            AND last_used_at<NOW()-INTERVAL '5 minutes'"""), args)
+        result = selected(db)
+        db.execute(text('SELECT scoutwise_trim_pre_match_histories_v1(24)'))
+        return result or {}
 
 
 def strip_player_ranks(usage):

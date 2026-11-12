@@ -6,14 +6,14 @@ Position distributions use the same stored competition usage as scouting.
 """
 from collections import defaultdict
 from datetime import datetime, timezone
-from functools import lru_cache
+import json
 from typing import Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import text
 
-from api_module.database import engine, get_db
+from api_module.database import benchmark_engine, get_db
 from api_module.utilities import require_auth
 from report_module.percentiles import MIN_PEERS, RATIOS, NEGATIVE, comparison_groups, rank
 from report_module.rate_evidence import empty, add_sample, key as rate_key, rate_value
@@ -50,7 +50,7 @@ class CacheNotReady(RuntimeError):
     pass
 
 
-def build_profiles(rows, positions):
+def build_profiles(rows, positions, emit=None):
     """One player per competition, combining club stints before calculating rates."""
     profiles = {}
     for row in rows:
@@ -87,7 +87,8 @@ def build_profiles(rows, positions):
             if count is not None and count > 0:
                 role_counts[pid][role] += count
     result = {}
-    for pid, profile in profiles.items():
+    for pid in list(profiles):
+        profile = profiles.pop(pid)
         if len(genders[pid]) != 1:
             continue
         roles = eligible_roles({'position_counts': dict(role_counts[pid])})
@@ -106,33 +107,86 @@ def build_profiles(rows, positions):
                                 'attempts': state['denominator'], 'minimumAttempts': minimum}
         if profile['ratings']:
             values['Rating'] = {'value': sum(profile['ratings']) / len(profile['ratings']), 'basis': 'rating', 'lowerIsBetter': False}
-        result[pid] = {'playerId': pid, 'teams': profile['teams'], 'minutes': profile['minutes'],
+        item = {'playerId': pid, 'teams': profile['teams'], 'minutes': profile['minutes'],
                        'gender': next(iter(genders[pid])), 'roles': roles,
                        'comparisonGroups': comparison_groups(roles), 'metrics': values}
+        if emit is None:
+            result[pid] = item
+        else:
+            emit(item)
     return result
 
 
-@lru_cache(maxsize=4)
-def competition_profiles(league, season, scope, published, five_minute_bucket):
-    del five_minute_bucket  # Limits reuse of the scouting position metadata to five minutes.
-    with engine.connect() as db:
-        positions = db.execute(text('''SELECT player_id,gender,position_counts
-            FROM player_comp_data WHERE league_id=:league'''), {'league': league}).mappings().all()
-        rows = db.execute(text('''SELECT player_contributions,calculation_version,fetched_at
-            FROM league_match_contributions WHERE league_id=:league AND season_id=:season
-            AND included_in_aggregation=TRUE AND kickoff_at<:cutoff AND (:european=FALSE OR
-                (:scope='qualifying' AND coverage->>'scope'='qualifying') OR
-                (:scope='overall' AND coverage->>'scope' IN ('league','knockout')))
-            ORDER BY kickoff_at,fixture_id''').execution_options(stream_results=True, yield_per=20),
-            {'league': league, 'season': season, 'scope': scope, 'european': league in EUROPEAN_LEAGUES,
-             'cutoff': datetime.now(timezone.utc)}).mappings()
-        def compatible_rows():
-            for row in rows:
-                if row['calculation_version'] != VERSION or row['fetched_at'] > published:
-                    raise CacheNotReady('Fixture refresh has not been published yet')
-                yield row
-        # Stream compact season contributions without retaining fixture JSON.
-        return build_profiles(compatible_rows(), positions)
+SEASON_BENCHMARK_CACHE_VERSION = 1
+
+
+def database_player_benchmarks(league, season, scope, published, team_id, player_id):
+    params = {'league': league, 'season': season, 'scope': scope, 'published': published,
+              'european': league in EUROPEAN_LEAGUES, 'version': VERSION,
+              'profile_version': SEASON_BENCHMARK_CACHE_VERSION,
+              'cutoff': datetime.now(timezone.utc)}
+    selection = """league_id=:league AND season_id=:season AND included_in_aggregation=TRUE
+        AND kickoff_at<:cutoff AND (:european=FALSE OR
+        (:scope='qualifying' AND coverage->>'scope'='qualifying') OR
+        (:scope='overall' AND coverage->>'scope' IN ('league','knockout')))"""
+    with benchmark_engine.begin() as cache_db:
+        def inputs():
+            revision = cache_db.execute(text('SELECT revision FROM public.scoutwise_report_source_revision_v1 WHERE singleton')).scalar_one()
+            state = cache_db.execute(text("""SELECT COALESCE(bool_and(calculation_version=:version
+                AND fetched_at IS NOT NULL AND fetched_at<=:published),true) AS compatible,
+                md5(COALESCE(string_agg(fixture_id::text||':'||calculation_version::text||':'||
+                    extract(epoch FROM fetched_at)::text||':'||COALESCE(source_fingerprint,''),',' ORDER BY fixture_id),'')) AS fingerprint
+                FROM league_match_contributions WHERE """ + selection), params).mappings().one()
+            if not state['compatible']:
+                raise CacheNotReady('Fixture refresh has not been published yet')
+            return {**params, 'position_revision': revision, 'fingerprint': state['fingerprint']}
+
+        key = inputs()
+        def ready():
+            return cache_db.execute(text("""SELECT 1 FROM public.scoutwise_team_player_meta_v1
+                WHERE league_id=:league AND season_id=:season AND scope=:scope
+                AND published_at=:published AND position_revision=:position_revision
+                AND contribution_fingerprint=:fingerprint AND profile_version=:profile_version"""), key).scalar() is not None
+        if not ready():
+            cache_db.execute(text('SELECT pg_advisory_xact_lock(hashtextextended(:lock,0))'),
+                             {'lock': f'scoutwise-team-player-profiles:{league}:{season}:{scope}'})
+            key = inputs()
+            if not ready():
+                positions = cache_db.execute(text('SELECT player_id,gender,position_counts FROM player_comp_data WHERE league_id=:league'), params).mappings().all()
+                rows = cache_db.execute(text("""SELECT player_contributions,calculation_version,fetched_at
+                    FROM league_match_contributions WHERE """ + selection + ' ORDER BY kickoff_at,fixture_id')
+                    .execution_options(stream_results=True, yield_per=20), params).mappings()
+                def compatible_rows():
+                    for row in rows:
+                        if row['calculation_version'] != VERSION or row['fetched_at'] > published:
+                            raise CacheNotReady('Fixture refresh has not been published yet')
+                        yield row
+                cache_db.execute(text('DELETE FROM public.scoutwise_team_player_meta_v1 WHERE league_id=:league AND season_id=:season AND scope=:scope'), params)
+                cache_db.execute(text("""INSERT INTO public.scoutwise_team_player_meta_v1
+                    VALUES(:league,:season,:scope,:published,:position_revision,:fingerprint,:profile_version)"""), key)
+                batch = []
+                def flush():
+                    if not batch:
+                        return
+                    cache_db.execute(text("""INSERT INTO public.scoutwise_team_player_profiles_v1
+                        SELECT :league,:season,:scope,(p->>'playerId')::bigint,p-'_group_order',
+                         ARRAY(SELECT jsonb_array_elements_text(p->'_group_order'))
+                        FROM jsonb_array_elements(CAST(:profiles AS jsonb)) p"""),
+                        {**params, 'profiles': json.dumps(batch, allow_nan=False)})
+                    batch.clear()
+                def emit(profile):
+                    batch.append({**profile, 'teams': sorted(profile['teams']),
+                                  '_group_order': list(profile['comparisonGroups'])})
+                    if len(batch) >= 64:
+                        flush()
+                try:
+                    build_profiles(compatible_rows(), positions, emit=emit)
+                    flush()
+                finally:
+                    rows.close()
+                cache_db.execute(text('SELECT public.scoutwise_build_team_player_distributions_v1(:league,:season,:scope)'), params)
+        return cache_db.execute(text('SELECT public.scoutwise_team_player_percentiles_v1(:league,:season,:scope,:team,:player)'),
+                                {**params, 'team': team_id, 'player': player_id}).scalar_one()
 
 
 def player_benchmarks(profiles, team_id, player_id):
@@ -180,9 +234,9 @@ def team_report_player_percentiles(payload: PlayerReportPercentilesIn, user_id: 
     published = row['computed_at']
     db.rollback()  # Release the request connection before reading the shared benchmark cache.
     try:
-        profiles = competition_profiles(payload.leagueId, payload.seasonId, payload.scope, published,
-                                         int(datetime.now(timezone.utc).timestamp()) // 300)
+        benchmarks = database_player_benchmarks(payload.leagueId, payload.seasonId, payload.scope,
+                                                 published, payload.teamId, payload.playerId)
     except CacheNotReady:
         return {**base, 'status': 'pending'}
-    return {**base, **player_benchmarks(profiles, payload.teamId, payload.playerId),
+    return {**base, **benchmarks,
             'status': 'ready', 'computed_at': published}

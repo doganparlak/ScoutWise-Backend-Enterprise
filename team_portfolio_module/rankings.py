@@ -66,7 +66,8 @@ def team_report_rankings(payload: TeamReportRankingsIn, user_id: str = Depends(r
             rank['lowerIsBetter'] = DEFINITIONS[name][2] == 'lower' if name in DEFINITIONS else name in LOWER_BETTER
     else:
         ranks = cached_player_ranks(payload.leagueId, payload.seasonId, payload.scope,
-                                    int(datetime.now(timezone.utc).timestamp()) // 60, payload.mode)
+                                    int(datetime.now(timezone.utc).timestamp()) // 60, payload.mode,
+                                    players=[(payload.teamId, payload.playerId)])
         ranks = ranks.get((payload.teamId, payload.playerId), {})
     return {'status': 'ready', 'metrics': ranks, 'mode': payload.mode,
             'computed_at': row['computed_at'], 'league_id': payload.leagueId, 'season_id': payload.seasonId}

@@ -22,6 +22,13 @@ DATABASE_URL = (
 )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# Keep benchmark cache transactions independent of the main request pool.
+# Four connections maximum: callers cannot exhaust their own pool while waiting
+# for a second connection to finish a cache refresh/ranking transaction.
+benchmark_engine = create_engine(
+    DATABASE_URL, pool_pre_ping=True, pool_size=2, max_overflow=2, pool_timeout=20,
+)
+
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
