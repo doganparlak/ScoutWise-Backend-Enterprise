@@ -152,3 +152,24 @@ def delete_tactic_board(db: Session, user_id: str, board_id: str) -> Response:
     )
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def search_tactic_teams(db: Session, query: str, limit: int = 12) -> list[dict[str, Any]]:
+    """Identity-only picker: compact stored names and badges, no provider requests."""
+    from match_analysis_module.current_leagues import fold
+    from player_pool_module.entity_images import ImageLookup, resolve_images
+
+    needle = fold(query)
+    if len(needle) < 2:
+        return []
+    rows = db.execute(text('''SELECT DISTINCT team_id, team_name FROM player_comp_data
+        WHERE team_id IS NOT NULL AND COALESCE(team_name, '') <> '' ''')).mappings()
+    names = {}
+    for row in rows:
+        tid = int(row['team_id'])
+        names[tid] = max(names.get(tid, ''), row['team_name'])
+    matches = sorted(((tid, name) for tid, name in names.items() if needle in fold(name)),
+                     key=lambda item: (item[1], item[0]))[:min(max(1, limit), 50)]
+    badges = resolve_images(db, [ImageLookup(kind='team', entityId=tid, name=name) for tid, name in matches])
+    return [{'id': str(tid), 'name': name, 'logoUrl': badge.get('imageUrl')}
+            for (tid, name), badge in zip(matches, badges)]

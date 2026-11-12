@@ -126,7 +126,7 @@ from player_comp_season_module import (
     get_season_player_nationalities,
     search_season_players,
 )
-from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board
+from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board, search_tactic_teams
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
 from report_module.report import generate_report_content
@@ -2995,6 +2995,16 @@ def create_enterprise_match_report(
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(status_code=502, detail="Match report generation failed") from exc
+
+
+@app.get("/tactic-boards/team-search")
+def search_enterprise_tactic_teams(
+    query: str = FastAPIQuery(min_length=2, max_length=200),
+    limit: int = FastAPIQuery(default=12, ge=1, le=50),
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    return search_tactic_teams(db, query, limit)
 
 
 @app.get("/tactic-boards", response_model=list[EnterpriseTacticBoardOut])
