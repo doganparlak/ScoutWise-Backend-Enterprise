@@ -12,6 +12,7 @@ from report_module.progress import emit_progress
 from report_module.terminology import FOOTBALL_TERMINOLOGY_GUIDANCE
 
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
@@ -394,10 +395,10 @@ def _current_score(fixture: dict[str, Any], location: str) -> int | None:
 
 
 def _aggregate_team_comparison(
-    fixtures: list[dict[str, Any]],
+    fixtures: Iterable[dict[str, Any]],
     team_id: int,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Aggregate only metrics available in a team's selected fixtures.
+    """Consume selected fixtures once, retaining totals instead of payloads.
 
     Standard counts include omitted zero events across all selected fixtures.
     Advanced values retain their recorded-match denominator. Known rate
@@ -405,46 +406,57 @@ def _aggregate_team_comparison(
     other provider rates are averaged. Keeping matches_covered per metric makes
     the comparison robust when the provider omits a metric in part of a sample.
     """
-    samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    match_values = []
+    from report_module.rate_evidence import empty, add_sample, rate_value
+    from standings_module.metrics import normalize_fixture
+    from .pre_match_team_metrics import extend_comparison
+
+    samples = defaultdict(dict)
+    rates = empty()
+    protected = set()
     penalty_samples = []
-    for fixture in fixtures:
-        statistic_rows = [
-            row for row in fixture.get("statistics") or []
-            if _as_int(row.get("participant_id")) == team_id
-        ]
-        categories, _ = _categorize(statistic_rows, TEAM_METRIC_CATEGORY)
-        _derive_team_percentages(categories)
-        expected = [
-            _metric(
-                str((row.get("type") or {}).get("name") or row.get("type_id") or ""),
-                _value(row),
-                row.get("type_id"),
-            )
-            for row in fixture.get("xgfixture") or []
-            if _as_int(row.get("participant_id")) == team_id
-            and str((row.get("type") or {}).get("name") or "") != "Expected Goals Against (xGA)"
-        ]
-        fixture_values = {}
-        for group, metrics in {**categories, "expected": expected}.items():
-            for metric in metrics:
-                try:
-                    value = float(metric.get("value"))
-                except (TypeError, ValueError):
-                    continue
-                name = str(metric.get("name") or "").strip()
-                if name and valid_metric(name, value):
-                    samples[group][name].append(value)
-                    fixture_values.setdefault(group, {})[name] = value
-        penalty_sample = penalty_xg_sample(fixture_values.get("expected", {}).get(PENALTY_XG), fixture.get("events") or [], team_id)
-        if penalty_sample is not None:
-            penalty_samples.append(penalty_sample)
-        match_values.append(fixture_values)
-    protected = set().union(*(missing_attempt_names({name: value for items in values.values() for name, value in items.items()}) for values in match_values))
+    def normalized_rows():
+        for fixture in fixtures:
+            statistic_rows = [
+                row for row in fixture.get("statistics") or []
+                if _as_int(row.get("participant_id")) == team_id
+            ]
+            categories, _ = _categorize(statistic_rows, TEAM_METRIC_CATEGORY)
+            _derive_team_percentages(categories)
+            expected = [
+                _metric(
+                    str((row.get("type") or {}).get("name") or row.get("type_id") or ""),
+                    _value(row),
+                    row.get("type_id"),
+                )
+                for row in fixture.get("xgfixture") or []
+                if _as_int(row.get("participant_id")) == team_id
+                and str((row.get("type") or {}).get("name") or "") != "Expected Goals Against (xGA)"
+            ]
+            fixture_values = {}
+            for group, metrics in {**categories, "expected": expected}.items():
+                for metric in metrics:
+                    try:
+                        value = float(metric.get("value"))
+                    except (TypeError, ValueError):
+                        continue
+                    name = str(metric.get("name") or "").strip()
+                    if name and valid_metric(name, value):
+                        state = samples[group].setdefault(name, [0., 0])
+                        state[0] += value
+                        state[1] += 1
+                        fixture_values.setdefault(group, {})[name] = value
+            penalty_sample = penalty_xg_sample(fixture_values.get("expected", {}).get(PENALTY_XG), fixture.get("events") or [], team_id)
+            if penalty_sample is not None:
+                penalty_samples.append(penalty_sample)
+            flat = {name: value for items in fixture_values.values() for name, value in items.items()}
+            protected.update(missing_attempt_names(flat))
+            add_sample(rates, flat)
+            yield normalize_fixture({**fixture, "lineups": []})
+    additions = extend_comparison({}, normalized_rows(), team_id)
     aggregate: dict[str, list[dict[str, Any]]] = {}
     for group, metrics in samples.items():
         rows = []
-        for name, values in metrics.items():
+        for name, (total, covered) in metrics.items():
             if rate_key(name) in protected:
                 continue
             if group == "expected" and name == PENALTY_XG:
@@ -454,14 +466,12 @@ def _aggregate_team_comparison(
                                  "aggregation": "average", "matches_covered": len(penalty_samples),
                                  "attempts": sum(count for _, count in penalty_samples)})
                 continue
-            total = sum(values)
-            average = total / len(values)
+            average = total / covered
             # Averaging an index does not make its unit a percentage.
             is_average = "%" in name or "percentage" in name.casefold() or "performance" in name.casefold()
             numerator_denominator = DERIVED_PERCENTAGE_METRICS.get(name)
-            pooled = pooled_rate_counts(name, [({name: value for items in values.values() for name, value in items.items()}, 1) for values in match_values],
-                                        *numerator_denominator) if numerator_denominator else None
-            derived_rate = percentage(pooled[0], pooled[1]) if pooled else None
+            state = rates['rates'].get(rate_key(name)) if numerator_denominator else None
+            derived_rate = rate_value(name, state) if numerator_denominator else None
             if numerator_denominator and derived_rate is None:
                 continue
             rows.append({
@@ -470,13 +480,14 @@ def _aggregate_team_comparison(
                 "value": round(derived_rate, 2) if derived_rate is not None else round(average, 2),
                 "total": round(derived_rate if derived_rate is not None else average if is_average else total, 2),
                 "aggregation": "derived_rate" if derived_rate is not None else "average" if is_average else "per_match",
-                "matches_covered": int(pooled[2]) if pooled else len(values),
+                "matches_covered": int(state["coverage"]) if derived_rate is not None else covered,
             })
         if rows:
             aggregate[group] = sorted(rows, key=lambda row: row["name"])
-    from standings_module.metrics import normalize_fixture
-    from .pre_match_team_metrics import extend_comparison
-    return extend_comparison(aggregate, [normalize_fixture({**fixture, "lineups": []}) for fixture in fixtures], team_id)
+    replaced = {row['name'] for rows in additions.values() for row in rows}
+    for group, rows in aggregate.items():
+        additions.setdefault(group, []).extend(row for row in rows if row['name'] not in replaced)
+    return {group: sorted(rows, key=lambda row: row['name']) for group, rows in additions.items() if rows}
 
 
 def _aggregate_score_flow(fixtures: list[dict[str, Any]], team_id: int) -> dict[str, Any]:
@@ -553,6 +564,7 @@ def _aggregate_score_flow(fixtures: list[dict[str, Any]], team_id: int) -> dict[
                 "minutes": round(totals[key]["minutes"], 1),
                 "share": round(totals[key]["minutes"] / total_minutes * 100, 1),
                 "average_spell": round(totals[key]["minutes"] / totals[key]["segments"], 1) if totals[key]["segments"] else 0,
+                "segments": int(totals[key]["segments"]),
                 **{field: int(value) for field, value in totals[key].items() if field not in {"minutes", "segments"}},
             }
             for key in state_order

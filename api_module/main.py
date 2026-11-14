@@ -18,6 +18,15 @@ from sqlalchemy.orm import Session
 
 load_dotenv()
 
+from coach_pool_module.coach_pool import CoachPoolSearchIn, CoachPoolRow, search_coaches
+from coach_pool_module.portfolio import router as coach_portfolio_router
+from coach_pool_module.analysis import router as coach_analysis_router
+import coach_pool_module.comparison  # Registers the comparison endpoint on the coach router.
+import coach_pool_module.tactics  # Registers the selected-period tactical identity endpoint.
+import coach_pool_module.profiles  # Evidence-first attack and defence themes.
+import coach_pool_module.momentum  # Selected-scope pressure and minute/event patterns.
+import coach_pool_module.regional  # Coach-oriented regional ball-location distributions.
+import coach_pool_module.score_flow  # Validated coach-oriented game-state timelines.
 from scoutwise_pro_module.comparison_insights import ProComparisonInsightsIn, get_comparison_insights
 from scoutwise_pro_module.team_fit import TeamFitIn, get_team_fit
 from scoutwise_pro_module.similar_players import SimilarPlayersIn, similar_players, similarity_eligibility
@@ -224,6 +233,8 @@ def require_enterprise_admin(db: Session, user_id: str, accept_language: str | N
 app = FastAPI(title="ScoutWise Enterprise Backend")
 app.include_router(nec_router)
 app.include_router(team_portfolio_router)
+app.include_router(coach_portfolio_router)
+app.include_router(coach_analysis_router)
 app.include_router(team_report_rankings_router)
 app.include_router(team_report_percentiles_router)
 
@@ -2265,6 +2276,20 @@ def team_pool_search(
         return search_team_pool(db, payload.team, payload.country, payload.league, payload.limit, team_id=payload.teamId)
     except SportMonksError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/coach-pool/search", response_model=list[CoachPoolRow])
+def coach_pool_search(
+    payload: CoachPoolSearchIn,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    try:
+        return search_coaches(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except SportMonksError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None
 
 
 @app.get("/team-pool/{team_id}/matches", response_model=list[TeamPlayedMatchRow])

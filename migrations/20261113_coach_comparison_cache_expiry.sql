@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS enterprise_coach_comparison_cache_expiry_idx ON public.enterprise_coach_comparison_cache (expires_at);

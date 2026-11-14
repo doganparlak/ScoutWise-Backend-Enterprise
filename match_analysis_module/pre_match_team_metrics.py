@@ -10,7 +10,20 @@ from standings_module.team_derived import DEFINITIONS, build_team_derived
 
 def extend_comparison(categories, rows, team_id):
     """Share league definitions, retaining the report's penalty-xG semantics."""
-    derived = build_team_derived(rows)
+    # Consume one-shot fixture streams once; retain only advanced totals.
+    names = (TEAM_ADVANCED_METRICS | {'Penalties'}) - set(DEFINITIONS) - {'Expected Goals Penalties (pxG)'}
+    advanced = {}
+    def observed_rows():
+        for row in rows:
+            metrics = row.get('team_contributions', {}).get(str(team_id), {}).get('metrics') or {}
+            for name in names:
+                value = numeric(metrics.get(name))
+                if value is not None:
+                    total = advanced.setdefault(name, [0., 0])
+                    total[0] += value
+                    total[1] += 1
+            yield row
+    derived = build_team_derived(observed_rows())
     additions = {}
     for name, metric in derived['teams'].get(str(team_id), {}).items():
         _, category, preference = DEFINITIONS[name]
@@ -19,15 +32,12 @@ def extend_comparison(categories, rows, team_id):
             'aggregation': 'derived_rate' if metric['aggregation'] == 'derived_rate' else 'per_match',
             'matches_covered': metric['matchesCovered'], 'preference': preference,
         })
-    for name in (TEAM_ADVANCED_METRICS | {'Penalties'}) - set(DEFINITIONS) - {'Expected Goals Penalties (pxG)'}:
-        values = [numeric((row.get('team_contributions', {}).get(str(team_id), {}).get('metrics') or {}).get(name)) for row in rows]
-        values = [value for value in values if value is not None]
-        if values:
-            additions[name] = ('set_pieces' if name == 'Penalties' else 'expected', {
-                'name': name, 'value': round(sum(values) / len(values), 4),
-                'total': round(sum(values), 4), 'aggregation': 'per_match',
-                'matches_covered': len(values), 'preference': 'higher',
-            })
+    for name, (total, covered) in advanced.items():
+        additions[name] = ('set_pieces' if name == 'Penalties' else 'expected', {
+            'name': name, 'value': round(total / covered, 4),
+            'total': round(total, 4), 'aggregation': 'per_match',
+            'matches_covered': covered, 'preference': 'higher',
+        })
     # Reopening an old snapshot must not retain stale ranks for replaced values.
     result = {group: [dict(metric) for metric in metrics if metric['name'] not in additions]
               for group, metrics in categories.items()}
