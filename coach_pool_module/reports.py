@@ -64,7 +64,11 @@ def list_reports(coach_id: int = Query(gt=0), language: str | None = None,
 
 @router.get('/coach-reports/{report_id}')
 def get_report(report_id: UUID, user_id: str = Depends(require_auth), db=Depends(get_db)):
-    return report_out(load_report(db, user_id, report_id))
+    row=load_report(db,user_id,report_id)
+    if row['report_status']=='ready':
+        from api_module.dashboard_workspace import record_ready_report_open
+        record_ready_report_open(db,user_id,'coach',report_id)
+    return report_out(row)
 
 
 @router.post('/coach-reports')

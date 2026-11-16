@@ -232,6 +232,10 @@ def require_enterprise_admin(db: Session, user_id: str, accept_language: str | N
         raise HTTPException(status_code=403, detail=msg("admin_only", accept_language))
 
 app = FastAPI(title="ScoutWise Enterprise Backend")
+from api_module.report_center import router as report_center_router
+app.include_router(report_center_router)
+from api_module.dashboard_workspace import router as dashboard_workspace_router, ensure_dashboard_workspace, record_ready_report_open
+app.include_router(dashboard_workspace_router)
 app.include_router(nec_router)
 app.include_router(team_portfolio_router)
 app.include_router(coach_portfolio_router)
@@ -371,6 +375,7 @@ def ensure_enterprise_sessions_table() -> None:
                 """
             )
         )
+        ensure_dashboard_workspace(db)
         ensure_player_position_label_cache(db)
         db.commit()
     finally:
@@ -683,6 +688,8 @@ def get_enterprise_dashboard_report(
         player_card["image_url"] = image_url
         player_card["imageUrl"] = image_url
         content_json["player_card"] = player_card
+    if row["status"] == "ready":
+        record_ready_report_open(db,user_id,"player",report_id)
     return {
         "favorite_player_id": str(row.get("cache_key") or row["id"]),
         "status": row["status"],
@@ -2885,6 +2892,7 @@ def open_enterprise_match_report(
     content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
     from standings_module.comparison_ranks import enrich_report_comparison_ranks
     content = enrich_report_comparison_ranks(content, dict(row['fixture_payload'] or {}))
+    record_ready_report_open(db,user_id,row["report_type"] or "post_match",row["id"])
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
         requires_regeneration=(row['report_type'] == 'pre_match'

@@ -157,6 +157,8 @@ def get_report(report_id: UUID, user_id: str = Depends(require_auth), db=Depends
     if row is None:
         raise HTTPException(404, 'Team report not found')
     upgraded = upgrade_report_content(db, str(row['id']), user_id, row['report_content'], row['team_id'], row['language'])
+    from api_module.dashboard_workspace import record_ready_report_open
+    record_ready_report_open(db,user_id,'team',report_id)
     return report_out({**row, 'report_content': upgraded}, True)
 
 
