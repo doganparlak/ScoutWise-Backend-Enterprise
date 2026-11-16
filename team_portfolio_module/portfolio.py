@@ -3,6 +3,7 @@ import hashlib
 import json
 import uuid
 from uuid import UUID
+from threading import Lock
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -14,6 +15,7 @@ from api_module.models import TeamPoolSearchRow
 from api_module.utilities import require_auth
 
 router = APIRouter()
+_report_upgrade_locks = [Lock() for _ in range(32)]
 
 
 class FavoriteTeamIn(BaseModel):
@@ -97,6 +99,35 @@ def delete_team(favorite_id: UUID, user_id: str = Depends(require_auth), db=Depe
     db.commit()
 
 
+def upgrade_report_content(db, report_id, user_id, content, team_id, lang):
+    from match_analysis_module.saved_score_flow import upgrade_team
+    from report_module.attacking_styles import upgrade_attack_profile, upgrade_defense_profile
+    from report_module.team_findings import upgrade_findings
+    from report_module.profile_overview import upgrade_profile_overview
+    # Repeated modal requests must not generate the same prose simultaneously.
+    # Release the read connection before waiting or making provider requests.
+    db.rollback()
+    lock = _report_upgrade_locks[int(hashlib.sha256(str(report_id).encode()).hexdigest()[:8],16)%len(_report_upgrade_locks)]
+    with lock:
+        latest = execute(db, """SELECT report_content FROM enterprise_team_reports
+            WHERE id=:id AND user_id=:uid AND report_status='ready'""",
+            {'id':report_id,'uid':user_id}).mappings().first()
+        if latest is None:
+            raise HTTPException(404, 'Team report not found')
+        content = latest['report_content']
+        db.rollback()
+        upgraded = upgrade_defense_profile(upgrade_attack_profile(upgrade_team(content, team_id, lang), team_id, lang), team_id, lang)
+        upgraded = upgrade_findings(upgraded, team_id, lang)
+        upgraded = upgrade_profile_overview(upgraded, lang)
+        if upgraded is not content:
+            execute(db, """UPDATE enterprise_team_reports SET
+                report_content=report_content || CAST(:sections AS jsonb)
+                WHERE id=:id AND user_id=:uid""",
+                {'sections': json.dumps({key: upgraded[key] for key in ('scoreFlowProfile','attackProfile','defenseProfile','strengths','weaknesses','overview') if key in upgraded and upgraded[key] is not content.get(key)}), 'id': report_id, 'uid': user_id})
+            db.commit()
+        return upgraded
+
+
 def report_out(row, include_content=False):
     result = {'id': str(row['id']), 'teamId': row['team_id'], 'team': row['team_payload'],
               'fixtureIds': row['fixture_ids'], 'matches': row['matches_payload'],
@@ -125,7 +156,8 @@ def get_report(report_id: UUID, user_id: str = Depends(require_auth), db=Depends
         {'id': str(report_id), 'user_id': user_id}).mappings().first()
     if row is None:
         raise HTTPException(404, 'Team report not found')
-    return report_out(row, True)
+    upgraded = upgrade_report_content(db, str(row['id']), user_id, row['report_content'], row['team_id'], row['language'])
+    return report_out({**row, 'report_content': upgraded}, True)
 
 
 @router.get('/dashboard/team-reports')
@@ -177,7 +209,7 @@ def begin_report(db, user_id, payload, lang, version):
         WHERE user_id=:user_id AND team_id=:team_id AND selection_key=:key AND language=:lang AND version=:version''', params).mappings().one()
     db.commit()
     if existing['report_status'] == 'ready':
-        return {'id': str(existing['id']), 'content': existing['report_content']}
+        return {'id': str(existing['id']), 'content': upgrade_report_content(db, str(existing['id']), user_id, existing['report_content'], payload.teamId, lang)}
     raise HTTPException(409, 'Seçtiğiniz maçlar zaten analiz ediliyor. Lütfen kısa bir süre sonra tekrar deneyin.'
                         if lang == 'tr' else 'This match selection is already being analyzed. Please try again shortly.')
 

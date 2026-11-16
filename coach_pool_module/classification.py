@@ -18,6 +18,8 @@ SIGNALS = {
     'through': ('Through Balls', 0, 5, False, False),
     'inside': ('Inside-box Shot Share (%)', 35, 80, False, False),
     'creation': ('Key Passes', 3, 15, False, False),
+    'creation_rate': ('Key Passes Per 100 Passes', .5, 3.5, False, False),
+    'through_rate': ('Through Balls Per 100 Passes', 0, 1.5, False, False),
     'carrying': ('Successful Dribbles', 2, 15, False, False),
     'dribble_success': ('Dribble Accuracy (%)', 35, 75, False, False),
     'crossing': ('Cross Share (%)', 1, 7, False, False),
@@ -64,13 +66,13 @@ SIGNALS = {
 # A ! prefix means the lower end of that measured signal supports the style.
 WEIGHTS = {
     'attack': {
-        'positional': {'accuracy': .25, 'control': .20, 'mid_pass': .20, 'back_pass': .15, '!long': .10, 'final_third': .10},
+        'positional': {'final_third': .35, 'mid_pass': .20, 'back_pass': .10, 'accuracy': .15, 'control': .10, '!long': .10},
         'possession': {'control': .40, 'circulation': .30, 'accuracy': .15, '!long': .15},
         'direct': {'long': .40, 'shot_pace': .25, '!circulation': .20, 'forward_carry': .15},
         'transition': {'counter': .35, '!control': .20, 'shot_pace': .20, 'forward_carry': .15, 'recovery_activity': .10},
-        'combination': {'accuracy': .25, '!long': .25, 'mid_creation': .25, 'creation': .15, 'mid_pass': .10},
+        'combination': {'creation_rate': .30, 'mid_creation': .25, 'accuracy': .15, 'through_rate': .10, 'mid_pass': .10, '!long': .10},
         'wide': {'crossing': .40, 'cross_volume': .25, 'carrying': .20, 'forward_carry': .15},
-        'vertical': {'through': .30, 'final_third': .30, 'inside': .20, 'shot_pace': .20},
+        'vertical': {'through_rate': .30, 'final_third': .30, 'inside': .20, 'shot_pace': .20},
         'pragmatic': {'long_variation': .35, 'width_variation': .35, 'control_variation': .30},
         'free': {'creator_focus': .35, 'carrying': .25, 'dribble_success': .20, 'forward_carry': .20},
     },
@@ -86,6 +88,54 @@ WEIGHTS = {
         'pragmatic': {'threat_variation': .35, 'recovery_variation': .35, 'intercept_variation': .30},
     },
 }
+
+
+# Defining observations are required, rather than letting familiar passing
+# context stand in for every attacking identity. Thresholds use the midpoint
+# of the existing scoring scales; they are not league percentiles.
+ATTACK_CORE = {
+    'positional': (('final_third',), ('mid_pass', 'back_pass')),
+    'possession': (('control',), ('circulation',)),
+    'combination': (('creation_rate',), ('mid_creation',)),
+    'direct': (('long',), ('shot_pace', '!circulation')),
+    'transition': (('counter',), ('shot_pace', 'forward_carry', '!control')),
+    'wide': (('crossing',), ('cross_volume', 'carrying')),
+    'vertical': (('through_rate',), ('final_third', 'inside')),
+    'free': (('carrying',), ('dribble_success',), ('creator_focus', 'forward_carry')),
+    'pragmatic': (('long_variation', 'width_variation', 'control_variation'),),
+}
+
+
+def distinctive_attack_signals(identity, evidence):
+    supported = {s['signal']:s for s in evidence if s['support'] >= .5 and s['coverage'] >= .6 and s.get('consistency', 1) >= .5}
+    groups = ATTACK_CORE[identity]
+    if not all(any(name in supported for name in group) for group in groups):
+        return []
+    names = {name for group in groups for name in group}
+    core = [s for name,s in supported.items() if name in names]
+    # One fluctuating input does not establish an adaptive attacking identity.
+    if identity == 'pragmatic' and len(core) < 2:
+        return []
+    return core
+
+
+def distinct_attack_candidate(candidate, selected):
+    """Require a second style to add substantial defining evidence.
+
+    Compare the actual source metrics, so alternate team/outfield names or
+    repeated passing context cannot masquerade as a new attacking dimension.
+    This does not ban any label pair when both have independent support.
+    """
+    core = candidate.get('distinctiveSignals') or []
+    if not core:
+        return False
+    for previous in selected:
+        used = {s['metric'] for s in previous.get('distinctiveSignals') or []}
+        total = sum(s['weight'] * s['support'] for s in core)
+        novel = sum(s['weight'] * s['support'] for s in core if s['metric'] not in used)
+        if not total or novel / total < .35:
+            return False
+    return True
 
 
 def signal_values(catalog):
@@ -108,6 +158,10 @@ def signal_values(catalog):
         normalized = max(0., min(1., (raw - low) / (high - low)))
         coverage = mean(min(1., r.get('covered', 1) / max(1, r.get('matches', 1))) for r in rows)
         result[name] = {'metric': key, 'value': raw, 'score': 1 - normalized if inverse else normalized, 'coverage': coverage}
+        if not variation:
+            observations = [v for row in rows for v in row.get('matchValues',[]) if isinstance(v,(int,float)) and math.isfinite(v)]
+            if observations:
+                result[name]['matchScores'] = [max(0.,min(1.,(v-low)/(high-low))) for v in observations]
     return result
 
 
@@ -124,8 +178,14 @@ def rank_styles(catalog, side):
             effective = weight * signal['coverage']
             weighted += fit * effective
             observed += effective
-            evidence.append({**signal, 'signal': name, 'weight': weight, 'support': round(fit, 3)})
+            evidence.append({**{key:value for key,value in signal.items() if key != 'matchScores'}, 'signal': name, 'weight': weight, 'support': round(fit, 3),
+                             **({'consistency':mean((1-v if name.startswith('!') else v)>=.5 for v in signal['matchScores'])} if signal.get('matchScores') else {})})
         # Missing evidence reduces a fit instead of silently rewarding a low/zero value.
         score = weighted / observed * math.sqrt(observed / sum(weights.values())) if observed else 0.
-        ranked.append({'id': identity, 'statisticalFit': round(score, 4), 'coverage': round(observed / sum(weights.values()), 3), 'signals': evidence})
+        coverage = observed / sum(weights.values())
+        core = distinctive_attack_signals(identity, evidence) if side == 'attack' else []
+        if side == 'attack' and (coverage < .65 or score < .5 or not core):
+            continue
+        ranked.append({'id': identity, 'statisticalFit': round(score, 4), 'coverage': round(coverage, 3),
+                       'signals': evidence, 'distinctiveSignals': core})
     return sorted(ranked, key=lambda row: (-row['statisticalFit'], -row['coverage'], row['id']))

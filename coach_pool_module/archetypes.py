@@ -3,29 +3,29 @@ import json
 import os
 from copy import deepcopy
 from itertools import combinations
-from .classification import rank_styles
+from .classification import rank_styles, distinct_attack_candidate
 
 ATTACK={
- 'positional':('Pozisyonel Hücumcu','Positional Attacker','Possession, pass accuracy, formation continuity and role participation are proxies; never assert spacing or off-ball positioning.'),
- 'possession':('Dominant Topa Sahip Olan','Dominant Possession','Use sustained possession, passing volume and accuracy with the outfield groups carrying circulation.'),
- 'direct':('Direkt Hücumcu','Direct Attacker','Use recorded long-ball share and carrying/shooting contributions; do not invent attack speed or passing-sequence length.'),
- 'transition':('Geçiş Hücumcusu','Transition Attacker','Use recorded counterattacks when present, shots relative to passes, carrying, recovery workload and possession as a transition-style fit; do not invent timed sequences.'),
- 'combination':('Kombinasyon Hücumcusu','Combination Attacker','Passing accuracy, low long-ball share and creativity shares are proxies; no claim of observed overloads or intricate sequences.'),
- 'wide':('Kanat Odaklı Hücumcu','Wing-oriented Attacker','Use crossing and dribbling output plus contributing role groups; do not infer individual winger/fullback positions.'),
- 'vertical':('Dikey Hücumcu','Vertical Attacker','Use final-third passing, through balls, inside-box shot share and shots per pass as progression proxies; do not invent tracked central paths.'),
- 'pragmatic':('Pragmatik Hücumcu','Pragmatic Attacker','Describe measured changes in approach between periods or matches, not inferred coaching intent or opponent-specific instructions.'),
- 'free':('Serbest Hücumcu','Free Attacker','Use dribbling success, creator concentration and attacker carrying contributions as an individual-initiative fit; do not invent off-ball freedom.'),
+ 'positional':('Pozisyonel Hücum','Positional Attack','Possession, pass accuracy, formation continuity and role participation are proxies; never assert spacing or off-ball positioning.'),
+ 'possession':('Topa Sahip Olma Odaklı Hücum','Possession-oriented Attack','Use sustained possession, passing volume and accuracy with the outfield groups carrying circulation.'),
+ 'direct':('Direkt Hücum','Direct Attack','Use recorded long-ball share and carrying/shooting contributions; do not invent attack speed or passing-sequence length.'),
+ 'transition':('Geçiş Hücumu','Transition Attack','Use recorded counterattacks when present, shots relative to passes, carrying, recovery workload and possession as a transition-style fit; do not invent timed sequences.'),
+ 'combination':('Kombinasyon Hücumu','Combination Attack','Passing accuracy, low long-ball share and creativity shares are proxies; no claim of observed overloads or intricate sequences.'),
+ 'wide':('Kanat Odaklı Hücum','Wing-oriented Attack','Use crossing and dribbling output plus contributing role groups; do not infer individual winger/fullback positions.'),
+ 'vertical':('Dikey Hücum','Vertical Attack','Use final-third passing, through balls, inside-box shot share and shots per pass as progression proxies; do not invent tracked central paths.'),
+ 'pragmatic':('Pragmatik Hücum','Pragmatic Attack','Describe measured changes in approach between periods or matches, not inferred coaching intent or opponent-specific instructions.'),
+ 'free':('Serbest Hücum','Free Attack','Use dribbling success, creator concentration and attacker carrying contributions as an individual-initiative fit; do not invent off-ball freedom.'),
 }
 DEFENCE={
- 'aggressive':('Agresif Presçi','Aggressive Presser','Use opponent-pass-adjusted tackles and duels, forward tackling and fouls as an active-pressure fit, not measured pressing events.'),
- 'high':('Önde Baskıcı','High-line Presser','Use opponent offsides, opponent progression and long-ball share, possession and forward recovery shares as a high-defending fit; do not assert an observed line height.'),
- 'midblock':('Orta Blok Savunmacısı','Mid-block Defender','Use midfield interception/recovery shares, adjusted interceptions and opponent creation as a midfield-defending fit; do not invent compactness measurements.'),
- 'deep':('Derin Blok Savunmacısı','Deep-block Defender','Use clearances, defensive blocks, defender clearance shares, possession and opponent box-shot share as a goal-protection fit; do not assert a tracked block depth.'),
- 'man':('Adam Odaklı Savunmacı','Man-oriented Defender','Use duel workload and success, defender duel contribution, tackles and fouls as a confrontation-oriented fit; do not invent marking assignments.'),
- 'zone':('Alan Odaklı Savunmacı','Zonal Defender','Use interception activity, the distribution of recovery work, foul restraint and opponent creation/box-shot share as a space-protection fit; do not invent positional coverage.'),
- 'counterpress':('Geçiş Presçisi','Counterpresser','Use recoveries relative to opponent passes, forward/midfield recovery shares, recorded losses and opponent counterattacks as a recovery-pressure fit; do not invent post-loss timing.'),
- 'reactive':('Reaktif Savunmacı','Reactive Defender','Statistical fit only: opponent output, possession and role recovery distribution; do not invent block depth or a deliberate reactive instruction.'),
- 'pragmatic':('Pragmatik Savunmacı','Pragmatic Defender','Statistical fit only: measured variations in workload and recovery roles, not inferred opponent-specific plans.'),
+ 'aggressive':('Agresif Pres','Aggressive Press','Use opponent-pass-adjusted tackles and duels, forward tackling and fouls as an active-pressure fit, not measured pressing events.'),
+ 'high':('Önde Baskı','High Press','Use opponent offsides, opponent progression and long-ball share, possession and forward recovery shares as a high-defending fit; do not assert an observed line height.'),
+ 'midblock':('Orta Blok Savunma','Mid-block Defence','Use midfield interception/recovery shares, adjusted interceptions and opponent creation as a midfield-defending fit; do not invent compactness measurements.'),
+ 'deep':('Derin Blok Savunma','Deep-block Defence','Use clearances, defensive blocks, defender clearance shares, possession and opponent box-shot share as a goal-protection fit; do not assert a tracked block depth.'),
+ 'man':('Adam Odaklı Savunma','Man-oriented Defence','Use duel workload and success, defender duel contribution, tackles and fouls as a confrontation-oriented fit; do not invent marking assignments.'),
+ 'zone':('Alan Odaklı Savunma','Zonal Defence','Use interception activity, the distribution of recovery work, foul restraint and opponent creation/box-shot share as a space-protection fit; do not invent positional coverage.'),
+ 'counterpress':('Geçiş Presi','Counterpress','Use recoveries relative to opponent passes, forward/midfield recovery shares, recorded losses and opponent counterattacks as a recovery-pressure fit; do not invent post-loss timing.'),
+ 'reactive':('Reaktif Savunma','Reactive Defence','Statistical fit only: opponent output, possession and role recovery distribution; do not invent block depth or a deliberate reactive instruction.'),
+ 'pragmatic':('Pragmatik Savunma','Pragmatic Defence','Statistical fit only: measured variations in workload and recovery roles, not inferred opponent-specific plans.'),
 }
 
 
@@ -104,6 +104,8 @@ def materialize_supported(plan, seasons, meta, side):
     # A missing fourth metric must not discard a coherent three-metric explanation.
     for size in (4, 3):
         for subset in combinations(keys, size):
+            if not set(plan.get('requiredMetrics',[])).issubset(subset):
+                continue
             candidate = {**plan, 'metrics':list(subset), 'primaryMetric':subset[0]}
             topic = engine.materialize(candidate, seasons, meta, side)
             if topic is not None:
@@ -137,9 +139,15 @@ def generate(seasons, meta, catalog, perspective, allow_ai=True, fixed_topics=No
     output = deepcopy(fixed_topics) if fixed_topics is not None else {}
     if fixed_topics is None:
         for side in ('attack','defence'):
-            topics = []
+            topics, selected_fits = [], []
             for option in options[side]:
+                if side == 'attack' and not distinct_attack_candidate(option, selected_fits):
+                    continue
                 plan = default_plan(option['id'], catalog, side)
+                if side == 'attack':
+                    core = [s['metric'] for s in option['distinctiveSignals']]
+                    pool = list(dict.fromkeys(core + plan['metricPool']))
+                    plan = {**plan, 'metrics':pool[:4], 'metricPool':pool, 'requiredMetrics':core}
                 topic = materialize_supported(plan, seasons, meta, side)
                 if topic is None:
                     continue
@@ -148,6 +156,7 @@ def generate(seasons, meta, catalog, perspective, allow_ai=True, fixed_topics=No
                     'description':{'tr':DESCRIPTIONS[side][option['id']][0], 'en':DESCRIPTIONS[side][option['id']][1]}})
                 topic['summary'] = {lang:engine.fallback_explanation(topic, meta, lang) for lang in ('tr','en')}
                 topics.append(topic)
+                selected_fits.append(option)
                 if len(topics) == 2:
                     break
             output[side] = topics

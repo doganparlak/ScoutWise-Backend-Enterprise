@@ -132,7 +132,7 @@ def _recent_team_fixtures(
     return sorted(source, key=lambda item: item.get("starting_at") or "", reverse=True)[:10]
 
 
-def _fixture_lineup_usage(fixture_id: int, team_id: int) -> dict[str, Any]:
+def _fixture_lineup_usage(fixture_id: int, team_id: int, include: str | None = None) -> dict[str, Any]:
     token = os.getenv("SPORTMONKS_API_KEY")
     if not token:
         raise SportMonksError("ScoutWise data service is not configured")
@@ -140,9 +140,9 @@ def _fixture_lineup_usage(fixture_id: int, team_id: int) -> dict[str, Any]:
         f"{SPORTMONKS_BASE_URL}/fixtures/{fixture_id}",
         params={
             "api_token": token,
-            "include": "participants;formations;lineups.player;lineups.position;lineups.details.type;lineups.xGLineup.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type",
+            "include": include or "participants;formations;lineups.player;lineups.position;lineups.details.type;lineups.xGLineup.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type",
         },
-        timeout=35,
+        timeout=15 if include else 35,
     )
     if response.status_code != 200:
         raise SportMonksError(f"ScoutWise historical lineup request failed (HTTP {response.status_code})")
@@ -317,6 +317,22 @@ def _highlight_metric_eligible(metric: dict[str, Any], sample_size: int) -> bool
     return int(metric.get("matches_covered") or 0) * 5 >= max(1, sample_size)
 
 
+def _interpretation_metrics(player, selection, sample_size):
+    field = 'development_metrics' if selection == 'development' else 'standout_metrics'
+    return [metric for metric in player.get(field) or []
+            if metric.get('name') not in _PLAYER_HIGHLIGHT_EXCLUDED_METRICS
+            and str(metric.get('name') or '').casefold() not in _PLAYER_INSIGHT_EXCLUDED_METRICS
+            and valid_metric(str(metric.get('name') or ''), metric.get('value'), nonzero=True)
+            and float(metric.get('recorded_minutes') or 0) >= _PLAYER_METRIC_MIN_RECORDED_MINUTES
+            and _highlight_metric_eligible(metric, sample_size)]
+
+
+def _can_interpret_player(player, selection, sample_size):
+    names = {str(metric['name']).casefold() for metric in _interpretation_metrics(player, selection, sample_size)}
+    # Average rating is displayed separately and never counts as evidence.
+    return len(names) >= (3 if selection == 'development' else 1)
+
+
 def _player_highlight_evidence(value: Any, sample_size: int) -> Any:
     """Keep thinly covered detailed statistics out of the overview AI evidence."""
     if isinstance(value, list):
@@ -347,7 +363,9 @@ def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size:
         scored = []
         risk_scored = []
         for metric in player.get("per90_metrics") or []:
-            if not _highlight_metric_eligible(metric, sample_size) or str(metric.get("name") or "") in _PLAYER_HIGHLIGHT_EXCLUDED_METRICS:
+            if (not _highlight_metric_eligible(metric, sample_size)
+                or str(metric.get("name") or "") in _PLAYER_HIGHLIGHT_EXCLUDED_METRICS
+                or str(metric.get("name") or "").casefold() in _PLAYER_INSIGHT_EXCLUDED_METRICS):
                 continue
             values = metric_population.get(str(metric["name"]), [])
             if not values:
@@ -378,6 +396,51 @@ def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size:
             sorted(risk_scored, key=lambda item: (-item["relative_score"], -item["value"], item["name"]))[:3]
             or sorted(scored, key=lambda item: (item["relative_score"], item["value"], item["name"]))[:3]
         )
+
+
+def _select_player_highlights(players, sample_size):
+    _attach_player_highlight_metrics(players, sample_size)
+    rating_order = sorted(
+        [player for player in players if _interpretation_metrics(player, 'featured', sample_size)],
+        key=lambda item: (-item["average_rating"], -item["minutes"], item["player_name"]),
+    )
+    goal_order = sorted(
+        [player for player in players if _interpretation_metrics(player, 'featured', sample_size)],
+        key=lambda item: (-item["goals"], -item["average_rating"], -item["minutes"], item["player_name"]),
+    )
+    top_rated = rating_order[0] if rating_order else None
+    top_goal_count = goal_order[0]["goals"] if goal_order and goal_order[0]["goals"] > 0 else 0
+    # When the goal lead is shared, keep the two strongest rated scorers from
+    # that tie rather than arbitrarily presenting a single player.
+    top_scorers = [
+        item for item in goal_order if item["goals"] == top_goal_count
+    ][:2] if top_goal_count else []
+    top_scorer = top_scorers[0] if top_scorers else None
+    # Prefer two distinct standout players when sufficient evidence exists. Prefer the
+    # top-rated player plus the leading scorer; where that yields one person
+    # (or no scorer), complete the pair with the next highest-rated player.
+    featured_players: list[dict[str, Any]] = []
+    for candidate in [top_rated, *top_scorers, *rating_order]:
+        if candidate and all(candidate["player_id"] != item["player_id"] for item in featured_players):
+            featured_players.append(candidate)
+        if len(featured_players) == 2:
+            break
+    # Goalkeepers are evaluated through a distinct role profile and should not
+    # be surfaced as a development-risk player beside outfield contributors.
+    outfield_performers = [
+        player for player in players
+        if _can_interpret_player(player, 'development', sample_size)
+        and str(player.get("position_name") or "").strip().casefold()
+        not in {"goalkeeper", "kaleci"}
+    ]
+    development = sorted(
+        outfield_performers,
+        key=lambda item: (item["average_rating"], -item["minutes"], item["player_name"]),
+    )[0] if outfield_performers else None
+    return {
+        "top_rated": top_rated, "top_scorer": top_scorer, "top_scorers": top_scorers,
+        "featured_players": featured_players, "development": development,
+    }
 
 
 def _current_score(fixture: dict[str, Any], location: str) -> int | None:
@@ -494,14 +557,20 @@ def _aggregate_score_flow(fixtures: list[dict[str, Any]], team_id: int) -> dict[
     """Build the same ahead/level/behind state model used in team analysis."""
     state_order = ("ahead", "level", "behind")
     totals = {
-        key: {"minutes": 0.0, "segments": 0, "matches_entered": 0, "goals_for": 0, "goals_against": 0, "to_ahead": 0, "to_level": 0, "to_behind": 0, "final_wins": 0, "final_draws": 0, "final_losses": 0}
+        key: {"minutes": 0.0, "segments": 0, "matches_entered": 0, "goals_for": 0, "goals_against": 0, "to_ahead": 0, "to_level": 0, "to_behind": 0, "matches_to_ahead": 0, "matches_to_level": 0, "matches_to_behind": 0, "final_wins": 0, "final_draws": 0, "final_losses": 0}
         for key in state_order
     }
 
     def game_state(team_score: int, opponent_score: int) -> str:
         return "ahead" if team_score > opponent_score else "behind" if team_score < opponent_score else "level"
 
+    seen_fixtures = set()
     for fixture in fixtures:
+        fid = fixture.get("id")
+        if fid is not None and fid in seen_fixtures:
+            continue
+        if fid is not None:
+            seen_fixtures.add(fid)
         location = _team_location(fixture, team_id)
         home = location == "home"
         try:
@@ -528,6 +597,7 @@ def _aggregate_score_flow(fixtures: list[dict[str, Any]], team_id: int) -> dict[
         cursor = 0.0
         current = "level"
         entered = {current}
+        transitions = set()
         totals[current]["segments"] += 1
         for goal in goals:
             minute = min(duration, max(cursor, goal["minute"]))
@@ -546,11 +616,14 @@ def _aggregate_score_flow(fixtures: list[dict[str, Any]], team_id: int) -> dict[
             next_state = game_state(team_score, opponent_score)
             if next_state != current:
                 totals[current][f"to_{next_state}"] += 1
+                transitions.add((current, next_state))
                 totals[next_state]["segments"] += 1
                 entered.add(next_state)
                 current = next_state
             cursor = minute
         totals[current]["minutes"] += max(0.0, duration - cursor)
+        for origin, target in transitions:
+            totals[origin][f"matches_to_{target}"] += 1
         outcome = "final_wins" if team_score > opponent_score else "final_losses" if team_score < opponent_score else "final_draws"
         for key in entered:
             totals[key]["matches_entered"] += 1
@@ -851,43 +924,7 @@ def _team_recent_squad_usage(
     if _comparison_fixtures is not None:
         return {"comparison_players": comparison_performers, "selected_fixture_ids": fixture_ids, "sample_size": len(fixtures)}
     comparison_ids = fixture_ids
-    _attach_player_highlight_metrics(eligible_performers, len(fixtures))
-    rating_order = sorted(
-        eligible_performers,
-        key=lambda item: (-item["average_rating"], -item["minutes"], item["player_name"]),
-    )
-    goal_order = sorted(
-        eligible_performers,
-        key=lambda item: (-item["goals"], -item["average_rating"], -item["minutes"], item["player_name"]),
-    )
-    top_rated = rating_order[0] if rating_order else None
-    top_goal_count = goal_order[0]["goals"] if goal_order and goal_order[0]["goals"] > 0 else 0
-    # When the goal lead is shared, keep the two strongest rated scorers from
-    # that tie rather than arbitrarily presenting a single player.
-    top_scorers = [
-        item for item in goal_order if item["goals"] == top_goal_count
-    ][:2] if top_goal_count else []
-    top_scorer = top_scorers[0] if top_scorers else None
-    # The report always presents two distinct standout players. Prefer the
-    # top-rated player plus the leading scorer; where that yields one person
-    # (or no scorer), complete the pair with the next highest-rated player.
-    featured_players: list[dict[str, Any]] = []
-    for candidate in [top_rated, *top_scorers, *rating_order]:
-        if candidate and all(candidate["player_id"] != item["player_id"] for item in featured_players):
-            featured_players.append(candidate)
-        if len(featured_players) == 2:
-            break
-    # Goalkeepers are evaluated through a distinct role profile and should not
-    # be surfaced as a development-risk player beside outfield contributors.
-    outfield_performers = [
-        player for player in eligible_performers
-        if str(player.get("position_name") or "").strip().casefold()
-        not in {"goalkeeper", "kaleci"}
-    ]
-    development = sorted(
-        outfield_performers,
-        key=lambda item: (item["average_rating"], -item["minutes"], item["player_name"]),
-    )[0] if outfield_performers else None
+    performance_summary = _select_player_highlights(eligible_performers, len(fixtures))
     windows = ((0, 10), (11, 20), (21, 30), (31, 40), (41, 50), (51, 60), (61, 70), (71, 80), (81, 90), (91, None))
     momentum_rows = []
     for start, end in windows:
@@ -974,13 +1011,7 @@ def _team_recent_squad_usage(
             for name, count in formation_counts.most_common()
         ],
         "results": results,
-        "performance_summary": {
-            "top_rated": top_rated,
-            "top_scorer": top_scorer,
-            "top_scorers": top_scorers,
-            "featured_players": featured_players,
-            "development": development,
-        },
+        "performance_summary": performance_summary,
         "momentum": momentum_rows,
         **aggregate_regional_play(full_fixtures, team_id, str(team.get("location") or "home")),
         "team_comparison": _aggregate_team_comparison(full_fixtures, team_id),
@@ -1066,7 +1097,7 @@ def _head_to_head_results(
 
 
 def _pre_match_player_perspectives(usages: list[dict[str, Any]], lang: str) -> dict[str, dict[str, str]]:
-    selected: list[tuple[dict[str, Any], str]] = []
+    selected: list[tuple[dict[str, Any], str, int]] = []
     for usage in usages:
         summary = usage.get("performance_summary") or {}
         featured = summary.get("featured_players") or [
@@ -1077,16 +1108,17 @@ def _pre_match_player_perspectives(usages: list[dict[str, Any]], lang: str) -> d
         for player in featured:
             if isinstance(player, dict) and _as_int(player.get("player_id")) not in seen:
                 seen.add(_as_int(player.get("player_id")))
-                selected.append((player, "featured"))
+                selected.append((player, "featured", int(usage.get("sample_size") or 0)))
         if isinstance(summary.get("development"), dict):
-            selected.append((summary["development"], "development"))
+            selected.append((summary["development"], "development", int(usage.get("sample_size") or 0)))
 
     fallback: dict[str, dict[str, str]] = {}
     compact = []
-    for player, selection in selected:
+    for player, selection, sample_size in selected:
         key = str(player.get("player_id") or player.get("player_name"))
-        metrics = [metric for metric in player.get("development_metrics" if selection == "development" else "standout_metrics") or []
-                   if valid_metric(str(metric.get("name") or ""), metric.get("value"), nonzero=True)]
+        metrics = _interpretation_metrics(player, selection, sample_size)
+        if not _can_interpret_player(player, selection, sample_size):
+            continue  # Development cards require three metrics beyond average rating.
         name = str(player.get("player_name") or "Oyuncu")
         fallback[key] = {
             "text": (
@@ -1325,20 +1357,17 @@ def _pre_match_score_flow_perspectives(
 ) -> dict[str, dict[str, str]]:
     """Return one focused interpretation per side for each score state."""
     states = ("ahead", "level", "behind")
-    fallback = {
-        state: {
-            str(_as_int(team.get("id")) or index): (
-                "Bu skor durumundaki süre, geçişler ve sonuçlar takımın maç yönetimi eğilimini gösteriyor."
-                if lang == "tr" else "The time, transitions and outcomes in this game state show the team's match-management tendency."
-            )
-            for index, team in enumerate(teams)
-        }
-        for state in states
-    }
+    from .score_flow_rates import rate_evidence, rate_perspectives
+    fallback = {state: {} for state in states}
+    for index, (usage, team) in enumerate(zip(usages, teams)):
+        team_id = str(_as_int(team.get("id")) or index)
+        interpretations = rate_perspectives((usage.get("score_flow") or {}).get("states") or [], lang, snake=True)
+        for state in states:
+            fallback[state][team_id] = interpretations.get(state, "—")
     if len(usages) != 2 or not os.getenv("OPENAI_API_KEY"):
         return fallback
     evidence = [
-        {"team_id": _as_int(team.get("id")), "team_name": team.get("name"), "score_flow": usage.get("score_flow") or {}}
+        {"team_id": _as_int(team.get("id")), "team_name": team.get("name"), "score_flow": rate_evidence((usage.get("score_flow") or {}).get("states") or [], snake=True)}
         for usage, team in zip(usages, teams)
     ]
     try:
@@ -1347,7 +1376,7 @@ def _pre_match_score_flow_perspectives(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON with exactly the keys ahead, level, behind. Each key maps team_id strings to one concise 20-32 word interpretation. For each state, infer the team's game-management tendency and the likely consequence in the upcoming match from duration, transitions, goal balance and final results. Prioritize the insight; do not restate the statistics or list values. Use the requested language. No markdown, headings, bullets, leading dashes, invented facts, certainty, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON with exactly the keys ahead, level, behind. Each key maps team_id strings to one concise 20-32 word interpretation. For each state, infer the team's game-management tendency and the likely consequence in the upcoming match from time shares, distinct-match transition/outcome percentages and goals per 90 minutes spent in each state. Compare rates rather than raw counts. Each transition counts once per match and uses matches entering that state as its denominator; transitions can overlap and need not sum to 100%. A win after leading does not mean the lead was never lost. Account for the number of matches entering each state; avoid strong conclusions from few matches. Null means unavailable. Prioritize the insight; do not restate the statistics or list values. Use the requested language. No markdown, headings, bullets, leading dashes, invented facts, certainty, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nScore-flow evidence: {json.dumps(evidence, ensure_ascii=False)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))

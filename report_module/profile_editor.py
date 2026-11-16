@@ -5,7 +5,7 @@ import re
 from copy import deepcopy
 
 from report_module.profile_evidence import bind_row_evidence
-from report_module.profile_review import prose_issues
+from report_module.profile_review import prose_issues, finding_narrative_issues
 from report_module.terminology import FOOTBALL_TERMINOLOGY_GUIDANCE
 
 
@@ -26,6 +26,10 @@ def review_team_profiles(profiles: dict, lang: str, *, editable_sections=None, t
     model. Neither this review nor its single repair can guarantee factual truth.
     """
     result = deepcopy(profiles)
+    if any((profiles.get(section) or {}).get('narrativeVersion',0)>=2 for section in ('strengths','weaknesses')):
+        from report_module.team_findings import NARRATIVE_CONTRACT
+        if NARRATIVE_CONTRACT not in task_contract:
+            task_contract = task_contract + '\n' + NARRATIVE_CONTRACT
     targets, flagged = {}, {}
     for section, profile in result.items():
         if editable_sections is not None and section not in editable_sections:
@@ -34,7 +38,7 @@ def review_team_profiles(profiles: dict, lang: str, *, editable_sections=None, t
             for index, row in enumerate(profile.get(kind) or []):
                 if not isinstance(row, dict):
                     continue
-                entries = [("title", None, row.get("title"))]
+                entries = [] if row.get("styleId") or row.get("findingId") else [("title", None, row.get("title"))]
                 entries += [("analysis", i, text) for i, text in enumerate(row.get("analysis") or [])]
                 for field, bullet, text in entries:
                     if not isinstance(text, str) or not text.strip():
@@ -44,6 +48,8 @@ def review_team_profiles(profiles: dict, lang: str, *, editable_sections=None, t
                     issues = prose_issues(text, lang, analysis=field == "analysis")
                     if field == "analysis":
                         issues += row.get("evidence_validation") or []
+                        if section in {'strengths','weaknesses'} and profile.get('narrativeVersion',0)>=2:
+                            issues += finding_narrative_issues(text)
                     if issues:
                         flagged[key] = list(dict.fromkeys(issues))
     accepted = set()
@@ -58,7 +64,7 @@ def review_team_profiles(profiles: dict, lang: str, *, editable_sections=None, t
                 api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
             )
             review = _decode(model.invoke([
-                ("system", "You are the final football evidence editor. Review attackProfile, defenseProfile, strengths and weaknesses TOGETHER. Return JSON with exactly issues, an array of {target, reason}. Use only supplied passage IDs. Flag ONLY concrete problems: a statement not supported by its cited metrics, contradiction across sections about the SAME relationship, title/analysis/card mismatch, wrong metric meaning, unjustified benchmark or causal/location/timing/tactical claim, repeated generic prose, or wording issues. Different conclusions about distinct aspects are not automatically contradictions. Check count versus success rate versus outcome and per-match team values versus per-90 player values. _source_metrics is the authoritative metric pool for that row; evidence_metrics identifies each paragraph's claimed support. A reference existing is not enough: check whether it actually supports the claim. Missing references are an issue. Do not infer causation from aggregate association. Do not flag word count deviations. Explicit task_contract units and length targets override generic defaults. Other sections are read-only context when they have no supplied passage IDs. Do not rewrite anything yet. An empty issues array is valid." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+                ("system", "You are the final football evidence editor. Review attackProfile, defenseProfile, strengths and weaknesses TOGETHER. Return JSON with exactly issues, an array of {target, reason}. Use only supplied passage IDs. Flag ONLY concrete problems: a statement not supported by its cited metrics, contradiction across sections about the SAME relationship, title/analysis/card mismatch, wrong metric meaning, unjustified benchmark or causal/location/timing/tactical claim, repeated generic prose, or wording issues. For strengths/weaknesses with narrativeVersion >= 2, also flag shallow table-reading, a definition of the topic instead of an actual team-specific advantage or risk, repetition between the two paragraphs, or failure to explain the practical football value/cost of the cited relationship. Different conclusions about distinct aspects are not automatically contradictions. Check count versus success rate versus outcome and per-match team values versus per-90 player values. _source_metrics is the authoritative metric pool for that row; evidence_metrics identifies each paragraph's claimed support. A reference existing is not enough: check whether it actually supports the claim. Missing references are an issue. Do not infer causation from aggregate association. Do not flag word count deviations outside sections with an explicit shortening contract. Explicit task_contract units and length targets override generic defaults. Other sections are read-only context when they have no supplied passage IDs. Do not rewrite anything yet. An empty issues array is valid." + FOOTBALL_TERMINOLOGY_GUIDANCE),
                 ("human", json.dumps({"language": lang, "passage_ids": list(targets), "sections": result, "machine_issues": flagged, "task_contract": task_contract}, ensure_ascii=False, default=str)),
             ]), "issues")
             if not isinstance(review.get("issues"), list):
@@ -121,6 +127,10 @@ def review_team_profiles(profiles: dict, lang: str, *, editable_sections=None, t
                             continue
                     entry = pending.setdefault(id(row), (row, deepcopy(row), []))
                     candidate, keys = entry[1], entry[2]
+                    if row.get('findingId') and bullet is not None:
+                        # A repair must not merge paragraphs or undo the shortening.
+                        if re.search(r'\n\s*\n',text) or len(text.split())>38:
+                            continue
                     if bullet is None:
                         candidate[field] = text.strip()
                     else:
@@ -134,6 +144,9 @@ def review_team_profiles(profiles: dict, lang: str, *, editable_sections=None, t
                     bound = bind_row_evidence(candidate, row.get("_source_metrics") or {}, row.get("_metric_limit", 4))
                     if len(bound["evidence_values"]) > row.get("_metric_limit", 4):
                         continue
+                    if row.get('styleId') or row.get('findingId'):
+                        bound['metrics'] = list((row.get('_source_metrics') or {}).values())
+                        bound['evidence_values'] = dict(row.get('_source_metrics') or {})
                     row.update(bound)
                     accepted.update(keys)
             except Exception as exc:

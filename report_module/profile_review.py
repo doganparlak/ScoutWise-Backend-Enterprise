@@ -15,3 +15,13 @@ def prose_issues(text: str, lang: str, *, analysis: bool) -> list[str]:
         issues.append("Keep at most one short numerical fact; prioritize interpretation.")
     # Word counts are prompt targets, never a reason to discard usable prose.
     return issues
+
+
+def finding_narrative_issues(text: str) -> list[str]:
+    """Flag fixable length and table-reading prose without truncating a finding."""
+    issues=[]
+    if len(text.split())>38:
+        issues.append("Shorten this finding paragraph to 30-38 words while preserving the specific football insight.")
+    if re.search(r"olarak kaydediliyor|değerine göre|is recorded at|was recorded at|support(?:s|ing)? (?:the stated|this|the performance) finding|bulguyu destekliyor|yorum yalnızca",text,re.I):
+        issues.append("Replace the statistical recap or generic support statement with the team's specific advantage/risk, its evidence relationship and practical football implication.")
+    return issues

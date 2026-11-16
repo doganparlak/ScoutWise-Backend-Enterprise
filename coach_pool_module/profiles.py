@@ -15,7 +15,7 @@ from match_report_module.report import TEAM_METRIC_CATEGORY, DERIVED_PERCENTAGE_
 from . import analysis as history, comparison, tactics
 from .progressive import NARRATIVE_LOCKS, progressive_response
 
-VERSION = 17
+VERSION = 20
 PLAYER_METRICS = tactics.DETAIL_METRICS
 ATTACK_PLAYER_METRICS = {'Passes','Key Passes','Shots Total','Successful Dribbles','Total Crosses','Passes In Final Third','Through Balls','Touches'}
 DEFENCE_PLAYER_METRICS = {'Tackles','Interceptions','Ball Recovery','Clearances','Duels Won','Total Duels','Aerials Won','Fouls','Tackles Won'}
@@ -69,6 +69,8 @@ def add_context_rates(sample, meta):
             sample[name] = (a[0] * scale, b[0])
             meta[name] = {'name':name, 'percentage':percentage}
     rate('Shots Per 100 Passes', 'Shots Total', 'Passes', 100)
+    rate('Key Passes Per 100 Passes', 'Key Passes', 'Passes', 100)
+    rate('Through Balls Per 100 Passes', 'Through Balls', 'Passes', 100)
     rate('Outfield Final-third Pass Share (%)', 'Outfield Passes In Final Third', 'Outfield Passes', percentage=True)
     rate('Outfield Duels Won (%)', 'Outfield Duels Won', 'Outfield Total Duels', percentage=True)
     rate('Recovery To Loss Ratio', 'Ball Recovery', 'Possession Lost')
@@ -170,7 +172,7 @@ def build_evidence(db,periods,groups,coach_id):
             mean=sum(observations)/len(observations)
             variation=(sum((x-mean)**2 for x in observations)/len(observations))**.5/max(abs(mean),.001)
             rows.append({'periodId':season['period']['id'],'value':metric['value'],'covered':len(samples),'matches':season['period']['matchCount'],
-                'matchVariation':round(variation,3),'range':[round(min(observations),2),round(max(observations),2)]})
+                'matchVariation':round(variation,3),'matchValues':observations,'range':[round(min(observations),2),round(max(observations),2)]})
         if rows:catalog[key]={**definition,'seasons':rows}
     return meta,seasons,catalog
 
@@ -196,7 +198,7 @@ def select_leaders(players,metric_names,limit=2):
 def topic_side_valid(keys,player_keys,side):
     attack={'Passes','Accurate Passes','Accurate Passes (%)','Long Balls','Long Balls Won','Long Ball Share (%)','Long Balls Won (%)','Key Passes','Total Crosses','Accurate Crosses','Accurate Crosses (%)','Dribble Attempts','Successful Dribbles','Dribble Accuracy (%)','Shots Total','Shots On Target','Shots On Target (%)','Shots Insidebox','Shots Outsidebox','Inside-box Shot Share (%)','Goals','Goal Conversion (%)','Big Chances Created','Big Chances Missed','Dangerous Attacks','Attacks','Corners'}
     defensive={'Tackles','Tackles Won','Interceptions','Ball Recovery','Blocked Shots','Fouls','Clearances','Total Duels','Duels Won','Aerials Won','Outfield Duels Won (%)','Defensive Role Balance (%)','Recovery To Loss Ratio','Yellow Cards','Red Cards','Error Lead To Shot','Error Lead To Goal'}
-    attack |= {'Counter Attacks','Passes In Final Third','Through Balls','Touches','Final-third Pass Share (%)','Cross Share (%)','Shots Per 100 Passes','Creator Concentration (%)','Outfield Final-third Pass Share (%)'}
+    attack |= {'Counter Attacks','Passes In Final Third','Through Balls','Touches','Final-third Pass Share (%)','Cross Share (%)','Shots Per 100 Passes','Key Passes Per 100 Passes','Through Balls Per 100 Passes','Creator Concentration (%)','Outfield Final-third Pass Share (%)'}
     if side=='attack':
         if any(key not in ATTACK_PLAYER_METRICS for key in player_keys):return False
         valid=lambda key:key in attack or key.startswith('Expected Goals') or key.startswith('role:') and key.split(':',2)[-1] in attack

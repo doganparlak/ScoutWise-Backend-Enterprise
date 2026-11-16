@@ -2350,9 +2350,9 @@ def team_analysis_report_data(
         emit_progress({"defenseProfile": profile_snapshot(defense_profile)}, "defenseProfile")
         score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang)
         emit_progress({"scoreFlowProfile": score_flow_profile}, "scoreFlowProfile")
-        strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang)
+        strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang, score_flow_profile)
         emit_progress({"strengths": profile_snapshot(strengths)}, "strengths")
-        weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang)
+        weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang, score_flow_profile)
         emit_progress({"weaknesses": profile_snapshot(weaknesses)}, "weaknesses")
         from report_module.profile_editor import review_team_profiles
         reviewed = review_team_profiles({
@@ -2599,6 +2599,8 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
         },
         "temporary_extra_team_metrics": [],
     }
+    from match_analysis_module.pre_match_cover import enrich_pre_match_coaches
+    content = enrich_pre_match_coaches(content)
     emit_progress(content, "fixture")
     from match_analysis_module.model_profile import enrich_model_profile
     content = enrich_model_profile(content, fixture)
@@ -2838,6 +2840,30 @@ def enterprise_pre_match_player_comparison(favorite_id: uuid.UUID, user_id: str 
     return result
 
 
+def upgrade_saved_pre_match_score_flow(db, report_id, user_id, content):
+    if not content.get('recent_squad_usage'):
+        return content
+    from match_analysis_module.saved_score_flow import upgrade_pre_match
+    from match_analysis_module.saved_player_highlights import upgrade_player_highlights
+    from match_analysis_module.pre_match_cover import enrich_pre_match_coaches
+    db.rollback()  # Release the read connection before team lookups or narrative generation.
+    upgraded = upgrade_player_highlights(enrich_pre_match_coaches(upgrade_pre_match(content)))
+    if upgraded is not content:
+        usage = upgraded['recent_squad_usage']
+        db.execute(text("""UPDATE enterprise_favorite_matches SET report_content=jsonb_set(jsonb_set(jsonb_set(
+            jsonb_set(report_content,'{recent_squad_usage,teams}',CAST(:teams AS jsonb),true),
+            '{recent_squad_usage,score_flow_perspectives}',CAST(:perspectives AS jsonb),true),
+            '{recent_squad_usage,player_perspectives}',CAST(:player_perspectives AS jsonb),true),
+            '{teams}',CAST(:report_teams AS jsonb),true)
+            WHERE id=:id AND user_id=:uid"""),
+            {'teams': json.dumps(usage['teams']), 'perspectives': json.dumps(usage.get('score_flow_perspectives') or {}),
+             'player_perspectives':json.dumps(usage.get('player_perspectives') or {}),
+             'report_teams':json.dumps(upgraded['teams']),
+             'id': str(report_id), 'uid': user_id})
+        db.commit()
+    return upgraded
+
+
 @app.get("/favorite-matches/{favorite_id}/report", response_model=EnterpriseMatchReportOut)
 def open_enterprise_match_report(
     favorite_id: uuid.UUID,
@@ -2850,6 +2876,8 @@ def open_enterprise_match_report(
     if not row:
         raise HTTPException(status_code=404, detail="Saved match report not found")
     content = dict(row['report_content'])
+    if row['report_type'] == 'pre_match':
+        content = upgrade_saved_pre_match_score_flow(db, row['id'], user_id, content)
     from match_analysis_module.model_profile import enrich_model_profile
     content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
     from standings_module.comparison_ranks import enrich_report_comparison_ranks
@@ -2915,6 +2943,8 @@ def create_enterprise_match_report(
                 or not _is_not_started_enterprise_fixture(dict(row.get("fixture_payload") or {}))
             )
         ):
+            if report_type == "pre_match":
+                cached = upgrade_saved_pre_match_score_flow(db, row["id"], user_id, cached)
             from match_analysis_module.model_profile import enrich_model_profile
             cached = enrich_model_profile(cached, dict(row.get("fixture_payload") or {}))
             from standings_module.comparison_ranks import enrich_report_comparison_ranks
