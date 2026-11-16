@@ -19,14 +19,17 @@ class FavoriteCoachIn(BaseModel):
 
 def favorite_out(row):
     return {'favoriteId': str(row['id']), 'coach': row['coach_payload'],
-            'createdAt': row['created_at'], 'updatedAt': row['updated_at']}
+            'createdAt': row['created_at'], 'updatedAt': row['updated_at'],
+            'latestReportId': str(row['latest_report_id']) if row.get('latest_report_id') else None}
 
 
 @router.get('/favorite-coaches')
 def list_coaches(user_id: str = Depends(require_auth), db=Depends(get_db)):
-    rows = db.execute(text('''SELECT id, coach_payload, created_at, updated_at
-        FROM enterprise_favorite_coaches WHERE user_id=:user_id
-        ORDER BY created_at DESC, id'''), {'user_id': user_id}).mappings().all()
+    rows = db.execute(text('''SELECT f.id, f.coach_payload, f.created_at, f.updated_at,
+        (SELECT r.id FROM enterprise_coach_reports r WHERE r.user_id=f.user_id AND r.coach_id=f.coach_id
+         ORDER BY r.created_at DESC, r.id LIMIT 1) AS latest_report_id
+        FROM enterprise_favorite_coaches f WHERE f.user_id=:user_id
+        ORDER BY f.created_at DESC, f.id'''), {'user_id': user_id}).mappings().all()
     return [favorite_out(row) for row in rows]
 
 

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 load_dotenv()
 
 from coach_pool_module.coach_pool import CoachPoolSearchIn, CoachPoolRow, search_coaches
+from coach_pool_module.reports import router as coach_reports_router
 from coach_pool_module.portfolio import router as coach_portfolio_router
 from coach_pool_module.analysis import router as coach_analysis_router
 import coach_pool_module.comparison  # Registers the comparison endpoint on the coach router.
@@ -234,6 +235,7 @@ app = FastAPI(title="ScoutWise Enterprise Backend")
 app.include_router(nec_router)
 app.include_router(team_portfolio_router)
 app.include_router(coach_portfolio_router)
+app.include_router(coach_reports_router)
 app.include_router(coach_analysis_router)
 app.include_router(team_report_rankings_router)
 app.include_router(team_report_percentiles_router)

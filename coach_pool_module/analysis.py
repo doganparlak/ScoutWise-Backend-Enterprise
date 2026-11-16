@@ -1,4 +1,5 @@
 """Full recorded career with bounded, batch-based match eligibility checks."""
+from contextvars import ContextVar
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from api_module.utilities import require_auth
 from match_analysis_module.match_analysis import SportMonksError
 
 router = APIRouter()
+report_history = ContextVar("coach_report_history", default=None)
 SCHEMA_VERSION = 5
 MINIMUM_MATCHES = 10
 CORE_STATS = {'ball-possession', 'shots-total', 'shots-on-target', 'passes', 'successful-passes'}
@@ -366,6 +368,9 @@ def remember_history(coach_id, fingerprint, today, result, persistent_expiry):
 
 
 def get_periods(db, coach_id):
+    snapshot = report_history.get()
+    if snapshot is not None and snapshot["coachId"] == coach_id:
+        return snapshot
     today = date.today()
     with _refresh_locks[coach_id % len(_refresh_locks)]:
         record = db.execute(text('SELECT profile_data, updated_at, career_data, career_fetched_at FROM enterprise_coach_images WHERE coach_id=:id'), {'id': coach_id}).mappings().one_or_none()
