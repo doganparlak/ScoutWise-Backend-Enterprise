@@ -2878,6 +2878,9 @@ def open_enterprise_match_report(
     content = dict(row['report_content'])
     if row['report_type'] == 'pre_match':
         content = upgrade_saved_pre_match_score_flow(db, row['id'], user_id, content)
+    else:
+        from match_report_module.saved_profiles import upgrade_saved_match_profiles
+        content = upgrade_saved_match_profiles(db,row['id'],user_id,content)
     from match_analysis_module.model_profile import enrich_model_profile
     content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
     from standings_module.comparison_ranks import enrich_report_comparison_ranks
@@ -2945,6 +2948,9 @@ def create_enterprise_match_report(
         ):
             if report_type == "pre_match":
                 cached = upgrade_saved_pre_match_score_flow(db, row["id"], user_id, cached)
+            else:
+                from match_report_module.saved_profiles import upgrade_saved_match_profiles
+                cached = upgrade_saved_match_profiles(db,row["id"],user_id,cached)
             from match_analysis_module.model_profile import enrich_model_profile
             cached = enrich_model_profile(cached, dict(row.get("fixture_payload") or {}))
             from standings_module.comparison_ranks import enrich_report_comparison_ranks

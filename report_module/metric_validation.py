@@ -7,7 +7,14 @@ from report_module.scouting_evidence import sanitize_scouting_documents
 
 def numeric(value: Any) -> float | None:
     try:
-        result = float(str(value).strip().rstrip('%'))
+        raw = str(value).strip()
+        # Profile cards store percentages with a leading %, while provider
+        # metrics may use a trailing sign. Both are valid display formats.
+        if raw.startswith('%'):
+            raw = raw[1:].strip()
+        if raw.endswith('%'):
+            raw = raw[:-1].strip()
+        result = float(raw.replace(',', '.'))
         return result if isfinite(result) else None
     except (TypeError, ValueError):
         return None

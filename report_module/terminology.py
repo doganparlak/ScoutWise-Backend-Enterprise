@@ -58,7 +58,13 @@ Football language and editorial review:
   A heading should make sense to a coach before reading its paragraph. Examples
   of specificity, only when supported: 'Topa Sahipken Etkisizlik',
   'Son Vuruşlarda İsabetsizlik', 'Yedeklerden Hücum Katkısı'. Do not reuse these
-  as a fixed template. This applies to generated insight titles, not schema-owned
+  as a fixed template. Prefer concise football noun phrases over headline-like
+  predicates. Avoid 'israfa döndü', 'şut hacmi', 'yaratıcı ikili besledi',
+  'az topla çok şut', 'yedek bitiriciliği geldi' and similar contrived phrasing.
+  Describe shot accuracy, chance conversion, creative passing, substitute impact
+  or defensive discipline precisely when the evidence supports that finding.
+  Do not turn inaccurate shots into a finishing-efficiency claim without the
+  relevant conversion or chance evidence. This applies to generated insight titles, not schema-owned
   section headings or metric labels.
 - Lead analytical prose with the football conclusion, then use the most
   diagnostic evidence to explain it. Reveal what relationships between metrics

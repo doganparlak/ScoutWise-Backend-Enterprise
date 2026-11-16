@@ -165,7 +165,7 @@ def signal_values(catalog):
     return result
 
 
-def rank_styles(catalog, side):
+def rank_styles(catalog, side, secondary_match=False):
     signals = signal_values(catalog)
     ranked = []
     for identity, weights in WEIGHTS[side].items():
@@ -184,8 +184,19 @@ def rank_styles(catalog, side):
         score = weighted / observed * math.sqrt(observed / sum(weights.values())) if observed else 0.
         coverage = observed / sum(weights.values())
         core = distinctive_attack_signals(identity, evidence) if side == 'attack' else []
+        secondary = False
         if side == 'attack' and (coverage < .65 or score < .5 or not core):
-            continue
+            # A single match can show a secondary route without establishing a
+            # dominant identity. Still require observed defining evidence from
+            # every core group, rather than awarding a label for generic context.
+            supported = {s['signal']:s for s in evidence if s['support'] >= .25 and s['coverage'] >= .6}
+            groups = ATTACK_CORE[identity]
+            if not secondary_match or identity == 'pragmatic' or coverage < .65 or score < .35 or not all(any(name in supported for name in group) for group in groups):
+                continue
+            core = [s for name,s in supported.items() if name in {n for group in groups for n in group}]
+            if not any(s['support'] >= .5 for s in core):
+                continue
+            secondary = True
         ranked.append({'id': identity, 'statisticalFit': round(score, 4), 'coverage': round(coverage, 3),
-                       'signals': evidence, 'distinctiveSignals': core})
-    return sorted(ranked, key=lambda row: (-row['statisticalFit'], -row['coverage'], row['id']))
+                       'signals': evidence, 'distinctiveSignals': core, 'secondaryTendency':secondary})
+    return sorted(ranked, key=lambda row: (row['secondaryTendency'], -row['statisticalFit'], -row['coverage'], row['id']))

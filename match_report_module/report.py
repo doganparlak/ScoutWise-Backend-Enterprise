@@ -1427,7 +1427,17 @@ def generate_match_report(fixture_id: int, lang: str = "en", build_narratives: b
         report["player_analysis_perspectives"] = _build_player_analysis_perspectives(teams, lineups, events, lang)
         emit_progress(report, "player_analysis_perspectives")
         report["team_deep_analyses"] = _build_team_deep_analyses(report, lang)
+        from match_report_module.dynamic_topic_language import upgrade_dynamic_topic_language
+        edited = upgrade_dynamic_topic_language(report)
+        if edited is not report:
+            report["team_deep_analyses"] = edited["team_deep_analyses"]
+            report["dynamic_topic_language_version"] = edited["dynamic_topic_language_version"]
         emit_progress(report, "team_deep_analyses")
+        from match_report_module.style_profiles import upgrade_match_profiles
+        enriched = upgrade_match_profiles(report)
+        if enriched is not report:
+            report["match_profiles"] = enriched["match_profiles"]
+            emit_progress(report, "match_profiles")
         report["overview_summary"] = _build_report_overview_summary(report, lang)
         emit_progress(report, "overview_summary")
     report["analysis_model"] = os.getenv(
