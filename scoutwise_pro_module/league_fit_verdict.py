@@ -13,7 +13,7 @@ from scoutwise_pro_module.team_fit import eligible_roles
 
 METRICS = {name.lstrip('-') for names in BUNDLES.values() for name in names}
 NEGATIVE = {name[1:] for names in BUNDLES.values() for name in names if name.startswith('-')}
-BANDS = ((80, 'very_strong'), (65, 'strong'), (45, 'conditional'), (30, 'limited'), (0, 'weak'))
+BANDS = ((60, 'strong'), (50, 'conditional'), (40, 'limited'), (0, 'weak'))
 VERDICT_LABELS = {
     'very_strong': {'tr': 'Üstün uyum', 'en': 'Superior fit'},
     'strong': {'tr': 'Yüksek uyum', 'en': 'High fit'},
@@ -21,6 +21,14 @@ VERDICT_LABELS = {
     'limited': {'tr': 'Sınırlı uyum', 'en': 'Limited fit'},
     'weak': {'tr': 'Zayıf uyum', 'en': 'Weak fit'},
 }
+
+
+def verdict_for_score(score):
+    # Round away floating-point noise at the band boundaries.
+    score = round(score, 9)
+    if score > 70:
+        return 'very_strong'
+    return next(key for floor, key in BANDS if score >= floor)
 
 
 def metric_key(value):
@@ -69,7 +77,7 @@ def weighted_percentile_verdict(values, peers, roles):
         percentile = (left + right) / (2 * len(population)) * 100
         percentiles[metric] = 100 - percentile if metric in NEGATIVE else percentile
     score = sum(weights[metric] * percentiles[metric] for metric in weights)
-    verdict = next(key for floor, key in BANDS if score + 1e-9 >= floor)
+    verdict = verdict_for_score(score)
     return {'key': verdict, 'score': score, 'coverage': coverage,
             'roleShares': roles, 'metricWeights': weights, 'percentiles': percentiles,
             'metricEvidence': [{'metric': metric, 'values': [values[metric], sum(distributions[metric]) / len(distributions[metric])],
