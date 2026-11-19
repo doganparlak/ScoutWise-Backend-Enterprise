@@ -6,6 +6,7 @@ from report_module.metric_validation import pooled_rate_counts
 
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
+import logging
 import math
 import re
 from collections import defaultdict
@@ -22,6 +23,9 @@ from scoutwise_pro_module.competition_profile import competition_profile, load_c
 from match_analysis_module import get_team_played_matches
 from standings_module.team_derived import build_team_derived, DEFINITIONS as TEAM_DERIVED_DEFINITIONS
 from match_report_module.report import generate_match_report, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, DERIVED_PERCENTAGE_METRICS
+
+
+logger = logging.getLogger(__name__)
 
 
 class TeamFitIn(BaseModel):
@@ -272,10 +276,10 @@ def comparable_peer_metrics(candidate_stats, peer_stats):
 
 
 def evidence_rows(names, available, subject, player):
-    if len(names) != len(set(names)) or any(name not in available for name in names):
+    if any(name not in available for name in names):
         raise ValueError('Invalid evidence reference')
     return [{'metric': name, 'value': available[name], 'subject': subject,
-             'unit': 'percent' if '%' in name or 'percentage' in name.lower() else 'value' if rate(name) else 'per90' if player else 'perMatch'} for name in names]
+             'unit': 'percent' if '%' in name or 'percentage' in name.lower() else 'value' if rate(name) else 'per90' if player else 'perMatch'} for name in dict.fromkeys(names)]
 
 
 def paired_section_evidence(section, candidate_stats, team_stats, player_name, team_name, positional_stats, positional_name):
@@ -587,11 +591,19 @@ CLASSIFICATION FOR THIS ASSESSMENT: fixed_verdict is null. Choose exactly one ve
         output = team_fit_insight_model(candidate_stats, team_stats, peers, fallback_verdict=verdict is None)
         result = generate_grounded(CHAT_LLM, output, [('system', PROMPT + classification_prompt + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))], evidence)
         result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
-        result = verbalize_team_profile(CHAT_LLM, result, 'Turkish' if lang == 'tr' else 'English')
-        result = verbalize_fit_sections(CHAT_LLM, result, 'Turkish' if lang == 'tr' else 'English')
+        language = 'Turkish' if lang == 'tr' else 'English'
+        for rewrite in (verbalize_team_profile, verbalize_fit_sections):
+            try:
+                result = rewrite(CHAT_LLM, result, language)
+            except Exception as exc:
+                # These wording passes run after the evidence review.
+                logger.warning('Team fit retained reviewed text after %s failed (%s)',
+                               rewrite.__name__, type(exc).__name__)
         response = build_result(result, candidate_stats, team_stats, peers, evidence['player']['name'], evidence['team']['name'], positional_stats,
                                 f"{evidence['team']['name']} · {'Rol ortalaması' if lang == 'tr' else 'Role average'}")
     except Exception as exc:
+        logger.error('Team fit generation failed for player=%s team=%s league=%s (%s)',
+                     payload.playerId, payload.teamId, payload.leagueId, type(exc).__name__)
         raise HTTPException(status_code=502, detail='Team fit insights could not be generated') from exc
     if verdict is None:
         verdict = {'key': result.verdict.key, 'label': VERDICT_LABELS[result.verdict.key]['tr' if lang == 'tr' else 'en']}
