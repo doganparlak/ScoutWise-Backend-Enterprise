@@ -23,7 +23,7 @@ from typing import Any
 import requests
 
 from report_module.rate_evidence import missing_attempt_names, key as rate_key
-from report_module.metric_validation import is_standard_count, nonzero_evidence, nonzero_metric_rows, nonzero_report_metric_evidence, percentage, pooled_rate_counts, valid_metric
+from report_module.metric_validation import is_standard_count, nonzero_report_metric_evidence, percentage, pooled_rate_counts, valid_metric
 
 from .match_analysis import SPORTMONKS_BASE_URL, SportMonksError
 from .regional_play import aggregate_regional_play, regional_perspective
@@ -330,20 +330,24 @@ def _interpretation_metrics(player, selection, sample_size):
 def _can_interpret_player(player, selection, sample_size):
     names = {str(metric['name']).casefold() for metric in _interpretation_metrics(player, selection, sample_size)}
     # Average rating is displayed separately and never counts as evidence.
-    return len(names) >= (3 if selection == 'development' else 1)
+    return len(names) >= (2 if selection == 'development' else 1)
 
 
-def _player_highlight_evidence(value: Any, sample_size: int) -> Any:
-    """Keep thinly covered detailed statistics out of the overview AI evidence."""
-    if isinstance(value, list):
-        return [_player_highlight_evidence(item, sample_size) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: ([item for item in items if _highlight_metric_eligible(item, sample_size)]
-                  if key == "per90_metrics" else _player_highlight_evidence(items, sample_size))
-            for key, items in value.items()
-        }
-    return value
+def _distinct_player_highlight_metrics(metrics):
+    """Keep one chance-creation indicator and fill with other eligible outputs."""
+    selected = []
+    used = set()
+    creation = {'chances created', 'big chances created', 'key passes'}
+    for metric in metrics:
+        name = str(metric.get('name') or '').strip().casefold()
+        family = 'chance_creation' if name in creation else name
+        if not family or family in used:
+            continue
+        used.add(family)
+        selected.append(metric)
+        if len(selected) == 3:
+            break
+    return selected
 
 
 def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size: int) -> None:
@@ -386,15 +390,15 @@ def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size:
                 risk_scored.append(entry)
             else:
                 scored.append(entry)
-        player["standout_metrics"] = sorted(
+        player["standout_metrics"] = _distinct_player_highlight_metrics(sorted(
             scored, key=lambda item: (-item["relative_score"], -item["value"], item["name"])
-        )[:3]
+        ))
         # Lead with errors/discipline where that player's selected-match
         # record provides it. When none is recorded, show the lowest
         # productive outputs rather than inventing a risk.
         player["development_metrics"] = (
-            sorted(risk_scored, key=lambda item: (-item["relative_score"], -item["value"], item["name"]))[:3]
-            or sorted(scored, key=lambda item: (item["relative_score"], item["value"], item["name"]))[:3]
+            _distinct_player_highlight_metrics(sorted(risk_scored, key=lambda item: (-item["relative_score"], -item["value"], item["name"])))
+            or _distinct_player_highlight_metrics(sorted(scored, key=lambda item: (item["relative_score"], item["value"], item["name"])))
         )
 
 
@@ -695,6 +699,7 @@ def _team_recent_squad_usage(
     player_count_samples: dict[int, list[tuple[dict[str, float], float]]] = defaultdict(list)
     player_derived_rates: dict[int, dict[str, tuple[float, float, float]]] = defaultdict(dict)
     pressure_samples: dict[int, list[float]] = {}
+    pressure_by_match: list[dict[int, float]] = []
     momentum_events: list[dict[str, Any]] = []
     for fixture_index, fixture in enumerate(full_fixtures):
         # Formation is recorded per participant. A fixture without formation
@@ -802,8 +807,12 @@ def _team_recent_squad_usage(
                 continue
             target = own_pressure if _as_int(point.get("participant_id")) == team_id else opponent_pressure
             target[minute] += value
-        for minute in set(own_pressure) | set(opponent_pressure):
-            pressure_samples.setdefault(minute, []).append(own_pressure[minute] - opponent_pressure[minute])
+        match_pressure = {minute: own_pressure[minute] - opponent_pressure[minute]
+                          for minute in own_pressure.keys() | opponent_pressure.keys()}
+        if match_pressure:
+            pressure_by_match.append(match_pressure)
+        for minute, value in match_pressure.items():
+            pressure_samples.setdefault(minute, []).append(value)
 
         # Goals scored by the opponent are kept separately for the same
         # 10-minute intervals. Own goals are intentionally excluded from the
@@ -938,7 +947,12 @@ def _team_recent_squad_usage(
             event for event in momentum_events
             if event["minute"] >= start and (end is None or event["minute"] <= end)
         ]
+        match_windows = [[value for minute, value in match.items() if minute >= start and (end is None or minute <= end)]
+                         for match in pressure_by_match]
+        covered = [values for values in match_windows if values]
         momentum_rows.append({
+            "pressure_matches": len(covered),
+            "positive_pressure_matches": sum(sum(values) > 0 for values in covered),
             "period": "90+" if end is None else f"{start}-{end}",
             "average_net_pressure": round(sum(pressure_values) / len(pressure_values), 2) if pressure_values else 0,
             "goals_for": sum(event["goals_for"] for event in scoped_events),
@@ -1096,316 +1110,15 @@ def _head_to_head_results(
     return {"matches": [serialize(item) for item in sorted(fixtures, key=lambda value: value.get("starting_at") or "", reverse=True)]}
 
 
-def _pre_match_player_perspectives(usages: list[dict[str, Any]], lang: str) -> dict[str, dict[str, str]]:
-    selected: list[tuple[dict[str, Any], str, int]] = []
-    for usage in usages:
-        summary = usage.get("performance_summary") or {}
-        featured = summary.get("featured_players") or [
-            summary.get("top_rated"),
-            *(summary.get("top_scorers") or []),
-        ]
-        seen: set[int] = set()
-        for player in featured:
-            if isinstance(player, dict) and _as_int(player.get("player_id")) not in seen:
-                seen.add(_as_int(player.get("player_id")))
-                selected.append((player, "featured", int(usage.get("sample_size") or 0)))
-        if isinstance(summary.get("development"), dict):
-            selected.append((summary["development"], "development", int(usage.get("sample_size") or 0)))
-
-    fallback: dict[str, dict[str, str]] = {}
-    compact = []
-    for player, selection, sample_size in selected:
-        key = str(player.get("player_id") or player.get("player_name"))
-        metrics = _interpretation_metrics(player, selection, sample_size)
-        if not _can_interpret_player(player, selection, sample_size):
-            continue  # Development cards require three metrics beyond average rating.
-        name = str(player.get("player_name") or "Oyuncu")
-        fallback[key] = {
-            "text": (
-                f"{name}, seçili maçlarda rolüne uygun tekrar eden bir katkı sundu; bu profil takımın ilgili oyun alanındaki üretimini destekliyor."
-                if selection == "featured" and lang == "tr" else
-                f"{name}'ın seçili maçlarda düşük kalan rol katkısı, daha istikrarlı üretim oluşturması gereken alanı öne çıkarıyor."
-                if lang == "tr" else
-                f"{name}'s output shows a recurring contribution within the role across the selected matches."
-                if selection == "featured" else
-                f"{name}'s lower role output identifies the area requiring more consistent contribution."
-            )
-        }
-        compact.append({
-            "player_id": player.get("player_id"), "player_name": name,
-            "selection_type": selection, "position": player.get("position_name"),
-            "average_rating": player.get("average_rating"),
-            "per90_metrics": [{k: v for k, v in metric.items() if k != "competition_rank"} for metric in metrics],
-        })
-    if not compact or not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    try:
-        from langchain_openai import ChatOpenAI
-        response = ChatOpenAI(
-            model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-            api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior football analyst. Return only valid JSON keyed by player_id. Each value must be one concise 35-55 word ScoutWise perspective in the requested language. Explain why the player was selected; interpret the role and combined effect rather than reciting values. Featured players: use only positive evidence. Development players: use only the supplied weaker per-90 outputs, never praise or select a strength. Never cite zero-valued metrics. Never use the Turkish word 'örneklem'. Do not mention league rankings. Lower values are better for discipline and error metrics. Never invent facts, tactics, benchmarks, causation, or recommendations. No markdown/headings." + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nPlayers: {json.dumps(compact, ensure_ascii=False, default=str)}"),
-        ])
-        parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
-        if isinstance(parsed, dict):
-            for key, value in parsed.items():
-                text = value.get("text") if isinstance(value, dict) else value
-                if str(text or "").strip():
-                    fallback[str(key)] = {"text": str(text).strip()}
-    except Exception as exc:
-        print(f"[pre_match_report] event=player_perspective_fallback error={exc}")
-    return fallback
-
-
-def _pre_match_team_analysis(usages: list[dict[str, Any]], teams: list[dict[str, Any]], lang: str) -> dict[str, dict[str, str]]:
-    metric_guidance = (
-        " Use all supplied metric categories as evidence, including opponent_threat, opponent_profile, "
-        "balance differences, shot share and recorded advanced metrics. Every Opponent metric describes "
-        "what THAT team's previous opponents produced, not that team's own attacking output. "
-        "Lower opponent_threat and errors_discipline values are preferable; respect each metric's "
-        "preference metadata. Opponent_profile is neutral context: neither high nor low values alone "
-        "establish a strength or weakness. Positive: identify evidence-supported advantages and assess "
-        "how the team's own production matches the upcoming opponent's recorded concessions. "
-        "Weakness: identify vulnerabilities by relating what the team allows to the upcoming opponent's "
-        "recorded attacking strengths. Strategy: derive opponent-specific recommendations from those "
-        "matchups and the observed opponent profiles, expressing them without metric names or numbers. "
-        "Consider the complete evidence and select meaningful conclusions; do not mechanically list "
-        "every metric or force a conclusion from a missing indicator. Small differences are not decisive "
-        "advantages. Signed differences and xGD may be negative; xGD is provider-supplied. "
-        "All metric values describe selected matches across competitions; never present them as "
-        "competition-only stats or season ranks. Do not infer an established tactic from an opponent "
-        "profile alone, and do not treat recommendations as observed facts."
-    )
-    compact = []
-    fallback: dict[str, dict[str, str]] = {}
-    for usage, team in zip(usages, teams):
-        team_id = _as_int(team.get("id"))
-        summary = usage.get("summary") or {}
-        categories = nonzero_metric_rows(usage.get("team_comparison") or {})
-        compact.append({"team_id": team_id, "team_name": team.get("name"), "fixture_location": team.get("location"), "form": summary, "metrics": categories})
-        fallback[str(team_id)] = {
-            "positive": "Seçili maçlardaki üretim, takımın tekrar eden güçlü oyun alanlarını gösteriyor." if lang == "tr" else "The selected-match output reveals the team's recurring strengths.",
-            "strategy": "Rakibin alan bırakabildiği anlarda bu üretimi daha sık son bölgeye taşımak belirleyici olacaktır." if lang == "tr" else "Turning this output into more final-third actions when space appears against the opponent will be decisive.",
-            "weakness": "Maçlardaki dalgalanan değerler, rakip baskısı altında korunması gereken gelişim alanını işaret ediyor." if lang == "tr" else "Variation across the selected matches identifies the area that must be protected under opponent pressure.",
-        }
-    if len(compact) != 2 or not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    try:
-        from langchain_openai import ChatOpenAI
-        response = ChatOpenAI(
-            model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-            api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON keyed by team_id. Every team value MUST contain exactly positive, strategy, weakness. Each team's fixture_location specifies whether this upcoming match is home or away. Treat it as mandatory context: do not mention, rely on, or infer from that team's opposite-venue form. For example, an away team must never be described through home strength. positive and weakness must each be a 50-60 word, insight-led analysis; strategy must be a 50-60 word opponent-specific match plan. In positive and weakness, use at most two carefully chosen numbers only when they materially support the conclusion; prioritise tactical meaning, recurring behaviour, matchup implications and risk over metric recitation. strategy is STRICTLY plan and recommendations: do not mention any number, percentage, metric name, stat, or data value. For each team_id, strategy is advice for THAT team and must explicitly refer to the other supplied team by its name as the opponent. In Turkish, never use direct commands or second-person imperatives such as 'kurun', 'sıkıştırın', 'bırakın'; use formal analytical recommendations such as 'daraltılmalı', 'yönlendirilmelidir', 'korunmalıdır', 'uygulanmalı'. State how to defend, progress, press, create advantages and manage likely game states against this specific opponent. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, facts, benchmarks or certainty. No markdown, headings, bullets, or leading dashes." + metric_guidance + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam evidence: {json.dumps(compact, ensure_ascii=False, default=str)}"),
-        ])
-        parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
-        required_fields = ("positive", "strategy", "weakness")
-        needs_expansion = isinstance(parsed, dict) and any(
-            not isinstance(value, dict)
-            or len(str(value.get("positive") or "").split()) < 60
-            or len(str(value.get("weakness") or "").split()) < 60
-            or len(str(value.get("strategy") or "").split()) < 60
-            or bool(re.search(r"\d", str(value.get("strategy") or "")))
-            for value in parsed.values()
-        )
-        if needs_expansion:
-            try:
-                revision = ChatOpenAI(
-                    model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-                    api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-                ).invoke([
-                    ("system", "Rewrite the supplied pre-match analysis as valid JSON only. Preserve the exact team_id / positive / strategy / weakness schema. Respect each team's fixture_location strictly: do not mention or derive conclusions from the opposite venue; an away team must not be described through home form. positive and weakness must each contain 60-75 words; focus on interpretation and use at most two numbers only if essential. strategy must contain 60-75 words and be a pure opponent-specific action plan: it must contain no numbers, percentages, metric names, statistics or data values. Every strategy must advise the team identified by its own team_id and explicitly name the other team as opponent. In Turkish use only formal analytical recommendation language such as 'yapılmalı', 'edilmeli', 'korunmalıdır'—never direct commands or second-person imperatives. Explain pressing, progression, defending, chance creation and game-state management in tactical terms. Do not pad by restating data. Do not use markdown, headings, bullets, leading dashes, invented facts, or the Turkish word 'örneklem'." + metric_guidance + FOOTBALL_TERMINOLOGY_GUIDANCE),
-                    ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam evidence: {json.dumps(compact, ensure_ascii=False, default=str)}\nDraft to expand: {json.dumps(parsed, ensure_ascii=False, default=str)}"),
-                ])
-                revised = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(revision.content or "").strip(), flags=re.I))
-                if isinstance(revised, dict):
-                    parsed = revised
-            except Exception as exc:
-                # A formatting failure in the optional rewrite must never discard
-                # the valid first-pass analysis and force a generic fallback.
-                print(f"[pre_match_report] event=team_analysis_revision_skipped error={exc}")
-        if isinstance(parsed, dict):
-            for key, value in parsed.items():
-                if isinstance(value, dict) and all(str(value.get(field) or "").strip() for field in required_fields):
-                    fallback[str(key)] = {field: str(value[field]).strip() for field in required_fields}
-    except Exception as exc:
-        print(f"[pre_match_report] event=team_analysis_fallback error={exc}")
-    return fallback
-
-
-def _pre_match_team_comparison_perspectives(
+def _pre_match_overview_and_plans(
     usages: list[dict[str, Any]],
     teams: list[dict[str, Any]],
-    lang: str,
-) -> dict[str, str]:
-    """Create one evidence-led comparison interpretation for every category."""
-    comparisons = [nonzero_metric_rows(usage.get("team_comparison") or {}) for usage in usages]
-    if len(comparisons) == 2:
-        for group in {key for comparison in comparisons for key in comparison}:
-            common = {m['name'] for m in comparisons[0].get(group, [])} & {m['name'] for m in comparisons[1].get(group, [])}
-            for comparison in comparisons:
-                comparison[group] = [metric for metric in comparison.get(group, []) if metric['name'] in common]
-    categories = sorted({
-        category
-        for comparison in comparisons
-        for category, metrics in comparison.items()
-        if metrics
-    })
-    evidence = {
-        category: {
-            str(team.get("name") or "Team"): comparison.get(category, [])
-            for comparison, team in zip(comparisons, teams)
-        }
-        for category in categories
-    }
-    fallback = {
-        category: (
-            "İki takımın bu kategorideki değerleri, maçın ilgili oyun alanında belirginleşebilecek farkı gösteriyor."
-            if lang == "tr" else
-            "The two teams' values in this category show the difference that may shape this area of the match."
-        )
-        for category in categories
-    }
-    from .pre_match_team_metrics import ensure_team_comparison_perspectives
-    fallback.update(ensure_team_comparison_perspectives({'teams': usages}, teams, lang)
-                    .get('team_comparison_perspectives', {}))
-    if not categories or len(usages) != 2 or not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    try:
-        from langchain_openai import ChatOpenAI
-        response = ChatOpenAI(
-            model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-            api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            (
-                "system",
-                "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON whose keys exactly match the supplied category keys. Each value must be one 45-65 word ScoutWise perspective in the requested language. Compare the two teams only within that category, identify the most meaningful contrast or shared tendency, then state the likely football implication for the upcoming match. Interpret rather than list values; use at most two short numerical facts. Never use the Turkish word 'örneklem'. Never invent unavailable tactics, players, external benchmarks, certainty, or causation. For opponent_threat and errors_discipline, lower values are preferable. For opponent_profile, infer how the observed opponent styles could shape the upcoming match (passing spells, transitions, second balls), without treating higher or lower values as superiority. Make the main point a matchup-specific inference supported by the available figures. If values are close, acknowledge the similar exposure and explain what might shift the balance; do not exaggerate small differences. Do not define metrics, explain the section, repeat generic data disclaimers, or prescribe unsupported formations or tactics. No markdown, headings, bullets, or leading dashes." + FOOTBALL_TERMINOLOGY_GUIDANCE,
-            ),
-            (
-                "human",
-                f"Language: {'Turkish' if lang == 'tr' else 'English'}\nRequired category keys: {json.dumps(categories, ensure_ascii=False)}\nCategory evidence: {json.dumps(evidence, ensure_ascii=False, default=str)}",
-            ),
-        ])
-        parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
-        if isinstance(parsed, dict):
-            for category in categories:
-                text = str(parsed.get(category) or "").strip()
-                if text:
-                    fallback[category] = text
-    except Exception as exc:
-        print(f"[pre_match_report] event=team_comparison_perspective_fallback error={exc}")
-    return fallback
-
-
-def _pre_match_momentum_perspectives(
-    usages: list[dict[str, Any]],
-    teams: list[dict[str, Any]],
-    lang: str,
-) -> dict[str, Any]:
-    """Interpret each side's pressure windows and their likely meeting points."""
-    fallback = {
-        "teams": {
-            str(_as_int(team.get("id")) or index): (
-                "Baskı akışı, takımın öne çıktığı ve oyunu daha çok rakibe bıraktığı dakikaları gösteriyor."
-                if lang == "tr" else "The pressure flow identifies the minutes when the team steps forward or cedes more of the game."
-            )
-            for index, team in enumerate(teams)
-        },
-        "match_outlook": (
-            "İki baskı eğiliminin kesiştiği dönemler, maçın kontrolünün en sık el değiştirebileceği aralıklar olacaktır."
-            if lang == "tr" else "The periods where the two pressure trends meet should be the intervals in which control changes hands most often."
-        ),
-    }
-    if len(usages) != 2 or not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    evidence = [
-        {"team_id": _as_int(team.get("id")), "team_name": team.get("name"), "momentum": usage.get("momentum") or []}
-        for usage, team in zip(usages, teams)
-    ]
-    try:
-        from langchain_openai import ChatOpenAI
-        response = ChatOpenAI(
-            model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-            api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON with exactly: {\"teams\": {\"team_id\": \"text\", ...}, \"match_outlook\": \"text\"}. Write one concise 25-40 word evidence-led interpretation per team from 10-minute net-pressure and goal patterns, plus one 25-40 word match-outlook sentence identifying likely pressure windows for the upcoming match. Use the requested language. Interpret, do not merely list data. No markdown, headings, bullets, leading dashes, invented certainty, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nPressure evidence: {json.dumps(evidence, ensure_ascii=False)}"),
-        ])
-        parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
-        if isinstance(parsed, dict):
-            returned_teams = parsed.get("teams") or {}
-            if isinstance(returned_teams, dict):
-                for team_id in fallback["teams"]:
-                    text = str(returned_teams.get(team_id) or "").strip()
-                    if text:
-                        fallback["teams"][team_id] = text
-            text = str(parsed.get("match_outlook") or "").strip()
-            if text:
-                fallback["match_outlook"] = text
-    except Exception as exc:
-        print(f"[pre_match_report] event=momentum_perspective_fallback error={exc}")
-    return fallback
-
-
-def _pre_match_score_flow_perspectives(
-    usages: list[dict[str, Any]],
-    teams: list[dict[str, Any]],
-    lang: str,
-) -> dict[str, dict[str, str]]:
-    """Return one focused interpretation per side for each score state."""
-    states = ("ahead", "level", "behind")
-    from .score_flow_rates import rate_evidence, rate_perspectives
-    fallback = {state: {} for state in states}
-    for index, (usage, team) in enumerate(zip(usages, teams)):
-        team_id = str(_as_int(team.get("id")) or index)
-        interpretations = rate_perspectives((usage.get("score_flow") or {}).get("states") or [], lang, snake=True)
-        for state in states:
-            fallback[state][team_id] = interpretations.get(state, "—")
-    if len(usages) != 2 or not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    evidence = [
-        {"team_id": _as_int(team.get("id")), "team_name": team.get("name"), "score_flow": rate_evidence((usage.get("score_flow") or {}).get("states") or [], snake=True)}
-        for usage, team in zip(usages, teams)
-    ]
-    try:
-        from langchain_openai import ChatOpenAI
-        response = ChatOpenAI(
-            model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
-            api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match football analyst. Return only valid JSON with exactly the keys ahead, level, behind. Each key maps team_id strings to one concise 20-32 word interpretation. For each state, infer the team's game-management tendency and the likely consequence in the upcoming match from time shares, distinct-match transition/outcome percentages and goals per 90 minutes spent in each state. Compare rates rather than raw counts. Each transition counts once per match and uses matches entering that state as its denominator; transitions can overlap and need not sum to 100%. A win after leading does not mean the lead was never lost. Account for the number of matches entering each state; avoid strong conclusions from few matches. Null means unavailable. Prioritize the insight; do not restate the statistics or list values. Use the requested language. No markdown, headings, bullets, leading dashes, invented facts, certainty, or the Turkish word 'örneklem'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nScore-flow evidence: {json.dumps(evidence, ensure_ascii=False)}"),
-        ])
-        parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
-        if isinstance(parsed, dict):
-            for state in states:
-                returned_state = parsed.get(state) or {}
-                if not isinstance(returned_state, dict):
-                    continue
-                for team_id in fallback[state]:
-                    text = str(returned_state.get(team_id) or "").strip()
-                    if text:
-                        fallback[state][team_id] = text
-    except Exception as exc:
-        print(f"[pre_match_report] event=score_flow_perspective_fallback error={exc}")
-    return fallback
-
-
-def _pre_match_overview_summary(
-    usages: list[dict[str, Any]],
-    teams: list[dict[str, Any]],
-    team_analysis: dict[str, dict[str, str]],
-    momentum: dict[str, Any],
-    score_flow: dict[str, dict[str, str]],
+    team_findings: dict[str, Any],
     regional: str,
-    comparisons: dict[str, str],
     lang: str,
     player_comparison: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """Create the pre-match equivalent of the post-match report summary."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Draft both the report overview and the two team plans in one call."""
     tr = lang == "tr"
     first = usages[0] if usages else {}
     second = usages[1] if len(usages) > 1 else {}
@@ -1413,9 +1126,20 @@ def _pre_match_overview_summary(
     second_name = str((teams[1] if len(teams) > 1 else {}).get("name") or ("Deplasman" if tr else "Away side"))
     first_id = str(_as_int((teams[0] if teams else {}).get("id")) or "")
     second_id = str(_as_int((teams[1] if len(teams) > 1 else {}).get("id")) or "")
-    analysis_first = team_analysis.get(first_id, {})
-    analysis_second = team_analysis.get(second_id, {})
-    momentum_teams = momentum.get("teams") or {}
+    finding_summary = []
+    for team_id, name in ((first_id, first_name), (second_id, second_name)):
+        strengths = [card["title"] for card in (team_findings.get(team_id) or {}).get("strength", [])]
+        if strengths:
+            finding_summary.append(f"{name}: {', '.join(strengths)}.")
+    momentum_bullets = []
+    for name, usage in ((first_name, first), (second_name, second)):
+        positive = [row for row in usage.get("momentum", [])
+                    if row.get("pressure_matches") != 0 and (row.get("average_net_pressure") or 0) > 0]
+        if positive:
+            peak = max(positive, key=lambda row: row["average_net_pressure"])
+            phrase = (f"Son maçlarda en yüksek ortalama baskı {peak['period']}. dakika aralığında görüldü."
+                      if tr else f"The highest average pressure in recent matches came in the {peak['period']}-minute interval.")
+            momentum_bullets.append({"label": name, "text": phrase})
     formations = [
         ", ".join(str(row.get("formation") or "") for row in (usage.get("formations") or [])[:2] if row.get("formation"))
         for usage in (first, second)
@@ -1430,30 +1154,63 @@ def _pre_match_overview_summary(
         {"category": "Kadro ve Diziliş" if tr else "Squad & Formation", "summary": (f"{first_name}, {formations[0] or 'son kullanılan düzeni'} etrafında yüzde {rotation_levels[0]:.1f} rotasyonla süreklilik ararken; {second_name}, {formations[1] or 'son kullanılan düzeni'} içinde yüzde {rotation_levels[1]:.1f} rotasyonla farklı bir kadro devamlılığı sergiliyor." if tr else f"{first_name} combines {formations[0] or 'its recent structure'} with {rotation_levels[0]:.1f}% rotation, while {second_name} uses {formations[1] or 'its recent structure'} with {rotation_levels[1]:.1f}% rotation, shaping two distinct continuity profiles."), "sub_bullets": [{"label": first_name, "text": formations[0] or ("Son kadro kullanımı değerlendirildi." if tr else "Recent squad usage assessed.")}, {"label": second_name, "text": formations[1] or ("Son kadro kullanımı değerlendirildi." if tr else "Recent squad usage assessed.")}]},
         {"category": "Form ve Sonuçlar" if tr else "Form & Results", "summary": (f"{first_name} ile {second_name} için son sonuçlar, maçın ritmine taşınabilecek form ve skor eğilimlerini ortaya koyuyor." if tr else f"Recent results for {first_name} and {second_name} reveal the form and scoring trends that may carry into the match."), "sub_bullets": []},
         {"category": "Göze Çarpan Oyuncular" if tr else "Standout Players", "summary": ("90 dakikanın üzerinde süre alan oyuncuların puan ve rol katkıları, iki takımın belirleyici bireysel kaynaklarını öne çıkarıyor." if tr else "Ratings and role output from players exceeding 90 minutes identify the key individual resources for both teams."), "sub_bullets": []},
-        {"category": "Baskı Endeksi" if tr else "Pressure Index", "summary": str(momentum.get("match_outlook") or ""), "sub_bullets": [{"label": first_name, "text": str(momentum_teams.get(first_id) or "")}, {"label": second_name, "text": str(momentum_teams.get(second_id) or "")} ]},
+        {"category": "Baskı Endeksi" if tr else "Pressure Index",
+         "summary": (f"{first_name} ve {second_name} için baskı profili, son maçlardaki on dakikalık dilimlere dayanıyor."
+                     if tr else f"The pressure profiles of {first_name} and {second_name} describe ten-minute intervals in their recent matches."),
+         "sub_bullets": momentum_bullets},
         {"category": "Skor Akış Profili" if tr else "Score Flow Profile", "summary": ("Skor durumlarındaki geçişler, iki takımın avantajı koruma ve maç içinde dengeyi değiştirme eğilimlerini karşılaştırıyor." if tr else "Score-state transitions compare how the two sides protect advantages and alter balance during matches."), "sub_bullets": []},
         {"category": "Bölgesel Oyun Dağılımı" if tr else "Regional Play Distribution", "summary": regional, "sub_bullets": []},
-        {"category": "Takım Karşılaştırması" if tr else "Team Comparison", "summary": next(iter(comparisons.values()), ""), "sub_bullets": []},
-        {"category": "Takım Analizi" if tr else "Team Analysis", "summary": (f"{first_name}: {analysis_first.get('positive') or ''} {second_name}: {analysis_second.get('positive') or ''}").strip(), "sub_bullets": []},
+        {"category": "Takım Karşılaştırması" if tr else "Team Comparison",
+         "summary": (f"{first_name} ve {second_name} karşılaştırmasında son maç değerleri ile lig sıralaması farklı dönemleri gösteriyor."
+                     if tr else f"The recent-match values and league rankings for {first_name} and {second_name} describe different samples."),
+         "sub_bullets": []},
+        {"category": "Takım Analizi" if tr else "Team Analysis", "summary": " ".join(finding_summary), "sub_bullets": []},
     ]
     from .pre_match_player_comparison import (PLAYER_OVERVIEW_VERSION, localize_overview_text,
         player_comparison_overview, player_comparison_overview_evidence, player_overview_mentions_player)
     fallback.append(player_comparison_overview({'teams': usages, 'player_comparison': player_comparison or {}}, teams, lang))
     if not os.getenv("OPENAI_API_KEY"):
-        return fallback
+        return fallback, []
     try:
         from langchain_openai import ChatOpenAI
+        from .score_flow_rates import rate_evidence
+        from .pre_match_findings import TACTICAL_PLAN_GUIDANCE
+
+        recent_usage = []
+        for usage in usages:
+            summary = usage.get("performance_summary") or {}
+            featured = summary.get("featured_players") or [
+                player for player in (summary.get("top_rated"), summary.get("top_scorer")) if player
+            ]
+            development = summary.get("development") or {}
+            recent_usage.append({
+                "team_id": usage.get("team_id"),
+                "sample_size": usage.get("sample_size"),
+                "summary": usage.get("summary"),
+                "formations": usage.get("formations"),
+                "results": usage.get("results"),
+                "standout_players": [
+                    {key: player.get(key) for key in ("player_name", "minutes", "average_rating", "goals", "standout_metrics")}
+                    for player in featured[:2]
+                ],
+                "development_player": ({key: development.get(key) for key in
+                                        ("player_name", "minutes", "average_rating", "development_metrics")}
+                                       if development else None),
+            })
         evidence = {
             "teams": nonzero_report_metric_evidence(teams),
-            "recent_usage": nonzero_report_metric_evidence([
-                _player_highlight_evidence(usage, int(usage.get("sample_size") or 0))
-                for usage in usages
-            ]),
-            "team_analysis": team_analysis,
-            "momentum": momentum,
-            "score_flow": score_flow,
+            "recent_usage": recent_usage,
+            "team_analysis": {"selected_findings": team_findings},
+            "momentum": [{"team_id": usage.get("team_id"), "windows": usage.get("momentum") or []} for usage in usages],
+            "score_flow": [{"team_id": usage.get("team_id"),
+                            "states": rate_evidence((usage.get("score_flow") or {}).get("states") or [], snake=True)}
+                           for usage in usages],
+            "comparisons": [{"team_id": usage.get("team_id"), "groups": {
+                group: [{key: row[key] for key in ("name", "value", "matches_covered", "preference") if key in row}
+                        for row in rows if valid_metric(str(row.get("name") or ""), row.get("value"))]
+                for group, rows in (usage.get("team_comparison") or {}).items()
+            }} for usage in usages],
             "regional": regional,
-            "comparisons": comparisons,
             "player_comparison": player_comparison_overview_evidence({"teams": usages, "player_comparison": player_comparison or {}}, teams, lang),
         }
         required = [str(row["category"]) for row in fallback]
@@ -1461,13 +1218,17 @@ def _pre_match_overview_summary(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
         ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return only valid JSON: an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. Write a 30-35 word insight-led summary for every section using the supplied evidence and existing ScoutWise conclusions. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. In Player Comparison, compare the complete player pools of the named teams using the supplied anonymous role-level distributions. Never name, select or compare individual players, including the default selections. Use only player_comparison evidence for this section, not individual names or statistics from standout-player or lineup evidence. Role-level medians describe player groups, not team totals or season ranks. Respect lower-is-better errors and discipline. Explain the likely matchup implication of the shared role contributions without reciting values, and never imply selected matches include only the selected competition. Write a general comparison rather than instructions for using the selector; keep sub_bullets empty for this section. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'. In Turkish, always write '90 dakika başına' instead of 'per-90', 'per90' or 'per 90'." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("system", "You are ScoutWise Enterprise's senior pre-match report editor. Return a JSON object with two keys. overview is an array in the exact REQUIRED_CATEGORY order, each object exactly {category, summary, sub_bullets}. tactical_plans is an array with one object {team_id, strategy} for each team. Use team_analysis.selected_findings for the tactical plans. Treat metrics marked context_only as context, never as evidence for a finding. Omit the tactical_plans entries if that evidence is empty. Write a 30-35 word insight-led summary for every section using the supplied evidence. For Pressure Index, base the summary on the recorded ten-minute windows and their match coverage where available. Treat historical patterns as watch windows, not forecasts. For Score Flow, compare conditional rates and sample sizes; winning after leading does not prove the lead was held continuously. For Team Comparison, use the raw paired recent-match metrics and distinguish opponent outputs from the team's own production. Do not describe the page, restate raw figures, use markdown, bullets, leading dashes, K1/K2, or mention unavailable information. Always name the teams instead of saying 'bir ekip', 'diğer ekip', 'bir taraf' or 'diğer taraf'. In Kadro ve Diziliş, explicitly compare both named teams' formation continuity, rotation_level, and the duration-weighted team average_rating; interpret how those three signals shape squad continuity. In Team Analysis, write one fluent comparison: name each team once and never repeat a team name back-to-back. In Player Comparison, compare the complete player pools of the named teams using the supplied anonymous role-level distributions. Never name, select or compare individual players, including the default selections. Use only player_comparison evidence for this section, not individual names or statistics from standout-player or lineup evidence. Role-level medians describe player groups, not team totals or season ranks. Respect lower-is-better errors and discipline. Explain the likely matchup implication of the shared role contributions without reciting values, and never imply selected matches include only the selected competition. Write a general comparison rather than instructions for using the selector; keep sub_bullets empty for this section. For Regional Play Distribution, use the supplied direction-adjusted historical evidence: the upcoming home team attacks left to right and the away team right to left. Name specific defensive, midfield or attacking channels and each named team's own left/right when supported. Compare where the distributions overlap or differ. Ball locations include both teams in each historical match; never infer possession ownership, playing style, defensive weakness, or guaranteed future tactics from location alone. Add zero to two concise supporting sub_bullets only where they provide a distinct insight. Turkish must use natural Turkish football language and never use 'örneklem'. In Turkish, always write '90 dakika başına' instead of 'per-90', 'per90' or 'per 90'." + FOOTBALL_TERMINOLOGY_GUIDANCE + " Tactical plan requirements: " + TACTICAL_PLAN_GUIDANCE),
             ("human", f"Language: {'Turkish' if tr else 'English'}\nREQUIRED_CATEGORY: {json.dumps(required, ensure_ascii=False)}\nEvidence: {json.dumps(evidence, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
-        if not isinstance(parsed, list):
-            raise ValueError("pre-match overview response was not an array")
-        by_category = {str(row.get("category") or ""): row for row in parsed if isinstance(row, dict)}
+        if not isinstance(parsed, dict):
+            raise ValueError("pre-match overview and plans response was not an object")
+        overview = parsed.get("overview")
+        plans = parsed.get("tactical_plans")
+        if not isinstance(overview, list):
+            return fallback, plans if isinstance(plans, list) else []
+        by_category = {str(row.get("category") or ""): row for row in overview if isinstance(row, dict)}
         rows = []
         for fallback_row in fallback:
             row = by_category.get(str(fallback_row["category"])) or {}
@@ -1483,10 +1244,10 @@ def _pre_match_overview_summary(
                 row['sub_bullets'] = []
                 row['player_overview_version'] = PLAYER_OVERVIEW_VERSION
             rows.append(row)
-        return rows
+        return rows, plans if isinstance(plans, list) else []
     except Exception as exc:
         print(f"[pre_match_report] event=overview_summary_fallback error={exc}")
-        return fallback
+        return fallback, []
 
 
 def _pre_match_regional_perspective(usages: list[dict[str, Any]], teams: list[dict[str, Any]], lang: str, scope: str = "overall") -> str:
@@ -1524,20 +1285,25 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
     publish("recent_statistics")
     result["head_to_head"] = _head_to_head_results(teams[0], teams[1], season_id, reference_date)
     publish("head_to_head")
-    result["team_analysis"] = _pre_match_team_analysis(usages, teams, lang)
+    from .pre_match_findings import FINDINGS_VERSION, attach_tactical_plans, build_pre_match_findings, enrich_tactical_plans
+    result["team_findings"] = build_pre_match_findings(result["teams"], lang, teams)
+    result["team_findings_version"] = FINDINGS_VERSION if result["team_findings"] else 0
     publish("pre_team_analysis")
-    result["team_comparison_perspectives"] = _pre_match_team_comparison_perspectives(usages, teams, lang)
-    publish("pre_comparisons")
-    result["momentum_perspectives"] = _pre_match_momentum_perspectives(usages, teams, lang)
-    publish("pre_momentum")
-    result["score_flow_perspectives"] = _pre_match_score_flow_perspectives(usages, teams, lang)
-    publish("pre_score_flow")
     result["regional_perspectives"] = {scope: _pre_match_regional_perspective(usages, teams, lang, scope) for scope in ("overall", "first_half", "second_half")}
     result["regional_perspective"] = result["regional_perspectives"]["overall"]
     publish("pre_regional")
-    result["player_perspectives"] = _pre_match_player_perspectives(result["teams"], lang)
-    publish("pre_players")
-    result["overview_summary"] = _pre_match_overview_summary(usages, teams, result["team_analysis"], result["momentum_perspectives"], result["score_flow_perspectives"], result["regional_perspective"], result["team_comparison_perspectives"], lang, player_comparison=result.get("player_comparison"))
+    overview, plans = _pre_match_overview_and_plans(
+        result["teams"], teams, result["team_findings"],
+        result["regional_perspective"], lang, player_comparison=result.get("player_comparison"),
+    )
+    result["overview_summary"] = overview
+    result.update(attach_tactical_plans(result, plans, teams, lang))
+    if not result.get("team_tactical_plans"):
+        result.update(enrich_tactical_plans(result, teams, lang))
+    if not result.get("team_tactical_plans"):
+        strategy = ("Rakibin alan bıraktığı anlarda top kontrollü biçimde son bölgeye taşınmalı."
+                    if lang == "tr" else "Progress the ball into the final third when the opponent leaves space.")
+        result["team_analysis"] = {str(team["id"]): {"strategy": strategy} for team in teams if team.get("id")}
     publish("pre_overview")
     return result
 

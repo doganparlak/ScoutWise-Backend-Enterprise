@@ -172,7 +172,19 @@ def enrich_comparison_ranks(usage, fixture, now=None):
         for team in usage.get('teams') or []:
             by_metric = ranks.get(str(team['team_id']), {})
             categories = {}
-            for category, metrics in (team.get('team_comparison') or {}).items():
+            comparison = team.get('team_comparison') or {}
+            rows = {row['name']: row for metrics in comparison.values() for row in metrics}
+            total, accurate = rows.get('Total Crosses', {}), rows.get('Accurate Crosses', {})
+            attempts, completed = numeric(total.get('value')), numeric(accurate.get('value'))
+            if ('Unsuccessful Crosses' not in rows and 'Unsuccessful Crosses' in by_metric
+                    and total.get('matches_covered') == accurate.get('matches_covered') == team.get('sample_size')
+                    and attempts is not None and completed is not None and 0 <= completed <= attempts):
+                comparison = {**comparison, 'crosses': [
+                    *comparison.get('crosses', []),
+                    {'name': 'Unsuccessful Crosses', 'value': round(attempts - completed, 4),
+                     'matches_covered': team['sample_size'], 'preference': 'lower', 'aggregation': 'per_match'},
+                ]}
+            for category, metrics in comparison.items():
                 categories[category] = []
                 for metric in metrics:
                     name = canonical_metric_name(metric['name'])
@@ -202,14 +214,13 @@ def enrich_report_comparison_ranks(content, fixture):
     if content.get('report_type') != 'pre_match' or not content.get('recent_squad_usage'):
         return content
     from match_analysis_module.pre_match_player_comparison import enrich_player_comparison, ensure_player_comparison_overview
-    from match_analysis_module.pre_match_team_metrics import enrich_selected_team_metrics, ensure_team_comparison_perspectives
+    from match_analysis_module.pre_match_team_metrics import enrich_selected_team_metrics
     usage = content['recent_squad_usage']
     try:
         usage = enrich_selected_team_metrics(usage, fixture)
     except (SQLAlchemyError, ValueError, TypeError, KeyError) as exc:
         _LOG.warning('Selected team comparison additions unavailable (%s)', type(exc).__name__)
     usage = enrich_comparison_ranks(usage, fixture)
-    usage = ensure_team_comparison_perspectives(usage, content.get('teams') or [], content.get('language') or 'en')
     usage = enrich_player_comparison(usage, fixture)
     usage = ensure_player_comparison_overview(usage, content.get('teams') or [], content.get('language') or 'en')
     return {**content, 'recent_squad_usage': usage}

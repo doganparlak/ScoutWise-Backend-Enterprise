@@ -55,6 +55,7 @@ BALANCES = {
     'Shots On Target Difference': ('Shots On Target', 'shooting', 'higher'),
 }
 DEFINITIONS = {**MIRRORS, **RATES, **BALANCES,
+               'Unsuccessful Crosses': ('Total Crosses', 'crosses', 'lower'),
                'Shot Share (%)': ('Shots Total', 'shooting', 'higher'),
                'Expected Goals Difference (xGD)': ('Expected Goals Difference (xGD)', 'expected', 'higher')}
 
@@ -96,6 +97,10 @@ def build_team_derived(rows):
             for name, (source, _, _) in BALANCES.items():
                 a, b = number(own.get(source)), number(opponent.get(source))
                 values[name] = a - b if a is not None and b is not None and a >= 0 and b >= 0 else None
+            crosses = number(own.get('Total Crosses'))
+            accurate = number(own.get('Accurate Crosses'))
+            if crosses is not None and accurate is not None and 0 <= accurate <= crosses:
+                values['Unsuccessful Crosses'] = crosses - accurate
             for name, value in values.items():
                 if value is None or value < 0 and name not in BALANCES and name != 'Expected Goals Difference (xGD)':
                     continue

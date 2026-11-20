@@ -2871,6 +2871,37 @@ def upgrade_saved_pre_match_score_flow(db, report_id, user_id, content):
     return upgraded
 
 
+def upgrade_saved_pre_match_findings(db, report_id, user_id, content, snapshot_teams=None):
+    from match_analysis_module.pre_match_findings import (
+        FINDINGS_VERSION, enrich_pre_match_findings, enrich_tactical_plans, findings_complete, tactical_plan_key,
+    )
+
+    usage = content.get("recent_squad_usage") or {}
+    lang = content.get("language") or "en"
+    if not usage or (usage.get("team_findings_version") == FINDINGS_VERSION
+                     and findings_complete(usage.get("team_findings") or {})
+                     and usage.get("team_tactical_plans_key") == tactical_plan_key(usage, lang)):
+        return content
+    db.rollback()
+    upgraded = enrich_pre_match_findings(content)
+    findings = enrich_tactical_plans(upgraded["recent_squad_usage"], content.get("teams") or [], lang)
+    if findings.get("team_findings_version") == FINDINGS_VERSION and findings != usage:
+        patch = {key: findings[key] for key in (
+            "team_findings", "team_findings_version", "team_tactical_plans", "team_tactical_plans_key",
+        ) if key in findings}
+        db.execute(text("""UPDATE enterprise_favorite_matches
+            SET report_content=jsonb_set(report_content, '{recent_squad_usage}',
+                (report_content->'recent_squad_usage') || CAST(:patch AS jsonb), false)
+            WHERE id=:id AND user_id=:uid AND report_status='ready' AND report_type='pre_match'
+              AND report_content->'recent_squad_usage'->'teams'=CAST(:teams AS jsonb)
+              AND (report_content#>'{recent_squad_usage,team_findings}') IS NOT DISTINCT FROM CAST(:previous AS jsonb)"""),
+            {'id': str(report_id), 'uid': user_id, 'teams': json.dumps(snapshot_teams if snapshot_teams is not None else usage['teams']),
+             'patch': json.dumps(patch),
+             'previous': json.dumps(usage['team_findings']) if 'team_findings' in usage else None})
+        db.commit()
+    return {**upgraded, "recent_squad_usage": findings}
+
+
 @app.get("/favorite-matches/{favorite_id}/report", response_model=EnterpriseMatchReportOut)
 def open_enterprise_match_report(
     favorite_id: uuid.UUID,
@@ -2891,7 +2922,10 @@ def open_enterprise_match_report(
     from match_analysis_module.model_profile import enrich_model_profile
     content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
     from standings_module.comparison_ranks import enrich_report_comparison_ranks
+    snapshot_teams = (content.get("recent_squad_usage") or {}).get("teams")
     content = enrich_report_comparison_ranks(content, dict(row['fixture_payload'] or {}))
+    if row['report_type'] == "pre_match":
+        content = upgrade_saved_pre_match_findings(db, row["id"], user_id, content, snapshot_teams)
     record_ready_report_open(db,user_id,row["report_type"] or "post_match",row["id"])
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
@@ -2962,7 +2996,10 @@ def create_enterprise_match_report(
             from match_analysis_module.model_profile import enrich_model_profile
             cached = enrich_model_profile(cached, dict(row.get("fixture_payload") or {}))
             from standings_module.comparison_ranks import enrich_report_comparison_ranks
+            snapshot_teams = (cached.get("recent_squad_usage") or {}).get("teams")
             cached = enrich_report_comparison_ranks(cached, dict(row.get("fixture_payload") or {}))
+            if report_type == "pre_match":
+                cached = upgrade_saved_pre_match_findings(db, row["id"], user_id, cached, snapshot_teams)
             return EnterpriseMatchReportOut(
                 favorite_match_id=str(row["id"]),
                 status="ready",
