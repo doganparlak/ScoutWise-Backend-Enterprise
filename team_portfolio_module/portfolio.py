@@ -101,9 +101,7 @@ def delete_team(favorite_id: UUID, user_id: str = Depends(require_auth), db=Depe
 
 def upgrade_report_content(db, report_id, user_id, content, team_id, lang):
     from match_analysis_module.saved_score_flow import upgrade_team
-    from report_module.attacking_styles import upgrade_attack_profile, upgrade_defense_profile
-    from report_module.team_findings import upgrade_findings
-    from report_module.profile_overview import upgrade_profile_overview
+    from match_report_module.team_profile_comparison import upgrade_visual_team_profiles
     # Repeated modal requests must not generate the same prose simultaneously.
     # Release the read connection before waiting or making provider requests.
     db.rollback()
@@ -116,9 +114,7 @@ def upgrade_report_content(db, report_id, user_id, content, team_id, lang):
             raise HTTPException(404, 'Team report not found')
         content = latest['report_content']
         db.rollback()
-        upgraded = upgrade_defense_profile(upgrade_attack_profile(upgrade_team(content, team_id, lang), team_id, lang), team_id, lang)
-        upgraded = upgrade_findings(upgraded, team_id, lang)
-        upgraded = upgrade_profile_overview(upgraded, lang)
+        upgraded = upgrade_visual_team_profiles(upgrade_team(content, team_id, lang), team_id, lang)
         if upgraded is not content:
             execute(db, """UPDATE enterprise_team_reports SET
                 report_content=report_content || CAST(:sections AS jsonb)

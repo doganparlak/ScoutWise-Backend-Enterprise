@@ -24,7 +24,7 @@ SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
 MATCH_REPORT_VERSION = 52
-TEAM_ANALYSIS_REPORT_VERSION = 68
+TEAM_ANALYSIS_REPORT_VERSION = 72
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -1128,7 +1128,7 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
 
 
 def build_team_report_player_perspectives(
-    reports: list[dict[str, Any]], team_id: int, lang: str = "en"
+    reports: list[dict[str, Any]], team_id: int, lang: str = "en", *, include_ai: bool = True
 ) -> dict[str, dict[str, str]]:
     reports = _team_player_metric_reports(reports)
     players: dict[str, dict[str, Any]] = {}
@@ -1208,7 +1208,7 @@ def build_team_report_player_perspectives(
         }
         for player, selection in chosen
     }
-    if not chosen or not os.getenv("OPENAI_API_KEY"):
+    if not include_ai or not chosen or not os.getenv("OPENAI_API_KEY"):
         return result
     compact = [{
         "player_id": player["player_id"], "player_name": player["player_name"],
@@ -1395,9 +1395,10 @@ def build_team_report_attack_profile(
     team_id: int,
     team_metrics: dict[str, list[dict[str, Any]]],
     lang: str = "en",
+    *, include_analysis: bool = True, minimum_style_metrics: int = 4,
 ) -> dict[str, Any]:
     from report_module.attacking_styles import STYLE_VERSION, select_team_styles, bind_selected_styles
-    selected_styles = select_team_styles(reports, team_id, lang)
+    selected_styles = select_team_styles(reports, team_id, lang, minimum_metrics=minimum_style_metrics)
     attacking_groups = ("contribution_impact", "shooting", "passing", "expected")
     team_name = next((str(team.get("name") or "") for report in reports for team in report.get("teams") or [] if int(team.get("id") or 0) == int(team_id)), "Takım" if lang == "tr" else "The team")
     team_evidence = {
@@ -1492,6 +1493,10 @@ def build_team_report_attack_profile(
             shown = str(value or "—")
         return {"label": name, "value": f"%{shown}" if basis == "rate" else shown}
 
+    if not include_analysis:
+        from .team_profile_comparison import visual_profile
+        return visual_profile(selected_styles, shortlist, metric_cell, STYLE_VERSION, 'attack')
+
     flat_team = [
         (group, str(row.get("name") or ""), row.get("valuePerMatch"), "rate" if row.get("isRate") else "perMatch")
         for group, rows in team_evidence.items() for row in rows
@@ -1530,10 +1535,11 @@ def build_team_report_defense_profile(
     team_id: int,
     team_metrics: dict[str, list[dict[str, Any]]],
     lang: str = "en",
+    *, include_analysis: bool = True, minimum_style_metrics: int = 4,
 ) -> dict[str, Any]:
     """Build a selected-match defensive identity without goalkeeper-save evidence."""
     from report_module.attacking_styles import DEFENCE_STYLE_VERSION as STYLE_VERSION, select_team_styles, bind_selected_styles
-    selected_styles = select_team_styles(reports, team_id, lang, side='defence')
+    selected_styles = select_team_styles(reports, team_id, lang, side='defence', minimum_metrics=minimum_style_metrics)
     groups = ("defending", "errors_discipline")
     excluded = (
         "save", "kurtar", "offside", "ofsayt", "shot off target",
@@ -1610,6 +1616,10 @@ def build_team_report_defense_profile(
         numeric = float(value)
         shown = str(int(numeric)) if numeric.is_integer() else f"{numeric:.2f}".rstrip("0").rstrip(".")
         return {"label": name, "value": f"%{shown}" if basis == "rate" else shown}
+
+    if not include_analysis:
+        from .team_profile_comparison import visual_profile
+        return visual_profile(selected_styles, shortlist, cell, STYLE_VERSION, 'defence')
 
     flat_team = [(str(row["name"]), row["valuePerMatch"], "rate" if row["isRate"] else "perMatch") for rows in team_evidence.values() for row in rows]
     if not team_evidence and not selected_styles:
@@ -1845,16 +1855,21 @@ def build_team_report_overview(
         return fallback
     try:
         from langchain_openai import ChatOpenAI
-        keys = list(section_titles)
+        # The modal and PDF already build these rows from structured evidence.
+        keys = [key for key in section_titles if key not in {"momentum", "attack", "defense", "strengths", "weaknesses"}]
+        visible_evidence = {key: evidence[key] for key in keys}
         response = ChatOpenAI(model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")), api_key=os.environ["OPENAI_API_KEY"], temperature=.2).invoke([
-            ("system", "You are ScoutWise Enterprise's lead team-report editor. Return only one valid JSON object whose top-level keys exactly match REQUIRED_KEYS. Each value must contain exactly summary and subBullets. summary must be a polished 20-32 word synthesis of that report page's decisive football conclusion, not a description of what the page contains. subBullets must be an array of zero to two objects with exactly label and text; label is a concise 2-4 word insight name and text is an 8-16 word supporting conclusion. Synthesize the supplied existing evidence and ScoutWise interpretations without contradicting them. In particular, Strengths and Weaknesses must remain mutually consistent: never present the same metric relationship as both an advantage and a vulnerability. Cover the team's identity across every section, prioritize inference over facts, and avoid repeating the same conclusion across pages. Team Card may be factual. Form & Results summarizes outcome pattern; Squad Profile & Tactics summarizes usage and formation evidence; Momentum summarizes first/second-half pressure; Score Flow summarizes level/ahead/behind control; Regional summarizes recurring spatial character; Attack and Defense summarize their strongest identity findings; Strengths synthesizes the three most repeatable positive qualities; Weaknesses synthesizes the three most important recurring vulnerabilities; Player Data summarizes standout/development patterns without listing players unnecessarily; Team Data summarizes the broad statistical identity. Never mention missing data, fallback, API, match count, raw internal keys, unavailable evidence, recommendations or limitations. Do not invent tactics, causation or benchmarks. When the requested language is Turkish, use only natural Turkish football terminology except proper names and established metric abbreviations; never use foreign adjectives such as 'consequential'. No markdown." + CONTRACT + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam: {team_name}\nREQUIRED_KEYS: {json.dumps(keys)}\nSection titles: {json.dumps(section_titles, ensure_ascii=False)}\nExisting report evidence: {json.dumps(evidence, ensure_ascii=False, default=str)}"),
+            ("system", "You are ScoutWise Enterprise's lead team-report editor. Return only one valid JSON object whose top-level keys exactly match REQUIRED_KEYS. Each value must contain exactly summary and subBullets. summary must be a polished 20-32 word synthesis of that report page's decisive football conclusion, not a description of what the page contains. subBullets must be an array of zero to two objects with exactly label and text; label is a concise 2-4 word insight name and text is an 8-16 word supporting conclusion. Synthesize the supplied existing evidence and ScoutWise interpretations without contradicting them. Cover the team's identity across every section, prioritize inference over facts, and avoid repeating the same conclusion across pages. Team Card may be factual. Form & Results summarizes outcome pattern; Squad Profile & Tactics summarizes usage and formation evidence; Score Flow summarizes level/ahead/behind control; Regional summarizes recurring spatial character; Player Data summarizes standout/development patterns without listing players unnecessarily; Team Data summarizes the broad statistical identity. Never mention missing data, fallback, API, match count, raw internal keys, unavailable evidence, recommendations or limitations. Do not invent tactics, causation or benchmarks. When the requested language is Turkish, use only natural Turkish football terminology except proper names and established metric abbreviations; never use foreign adjectives such as 'consequential'. No markdown." + CONTRACT + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam: {team_name}\nREQUIRED_KEYS: {json.dumps(keys)}\nSection titles: {json.dumps({key: section_titles[key] for key in keys}, ensure_ascii=False)}\nExisting report evidence: {json.dumps(visible_evidence, ensure_ascii=False, default=str)}"),
         ])
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
         if not isinstance(parsed, dict):
             raise ValueError("team overview response root was not a JSON object")
         rows = []
         for index, (key, title) in enumerate(section_titles.items()):
+            if key not in keys:
+                rows.append(fallback[index])
+                continue
             item = parsed.get(key) if isinstance(parsed.get(key), dict) else {}
             def naturalize_overview(value: Any) -> str:
                 text = str(value or "").strip()
@@ -1876,7 +1891,7 @@ def build_team_report_overview(
                 except ValueError:
                     pass  # A saved report can retry compact synthesis on reopening.
             rows.append(row)
-        missing = [row["key"] for row in rows if row["summary"] == fallback[keys.index(row["key"])]["summary"]]
+        missing = [row["key"] for row, default in zip(rows, fallback) if row["key"] in keys and row["summary"] == default["summary"]]
         if missing:
             print(f"[enterprise_team_report] event=overview_partial_fallback missing_keys={missing}")
         return rows

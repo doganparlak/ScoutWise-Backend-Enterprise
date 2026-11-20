@@ -30,8 +30,8 @@ def configure_progress(formatter=lambda value: value, persist=None):
     sink = _sink.get()
     def publish(patch, section):
         content.update(patch)
-        if section and section not in completed:
-            completed.append(section)
+        sections = section if isinstance(section, tuple) else (section,)
+        completed.extend(name for name in sections if name and name not in completed)
         snapshot = jsonable_encoder({**content, 'completed_sections': list(completed)})
         if persist:
             persist(snapshot)

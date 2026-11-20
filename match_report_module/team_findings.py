@@ -1,7 +1,7 @@
 """Two evidence-backed findings per team from the actual match."""
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from itertools import chain, combinations, product
+from itertools import combinations, product
 import logging
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -13,7 +13,7 @@ from standings_module.metrics import kickoff
 from standings_module.stages import EUROPEAN_LEAGUES, stage_scope
 from standings_module.team_derived import MIRRORS
 
-VERSION = 8
+VERSION = 9
 _LOG = logging.getLogger(__name__)
 
 
@@ -114,18 +114,22 @@ def _attach_match_percentiles(content, samples):
 def _candidate_pairs(own, opponent):
     by_topic = defaultdict(list)
     for topic, pool in TOPIC_METRICS.items():
-        common = {name for name in pool & own.keys() & opponent.keys()
+        context = {
+            'dribbling': {'Dribble Attempts'},
+            'progression': {'Dangerous Attacks'},
+        }.get(topic, set())
+        common = {name for name in (pool | context) & own.keys() & opponent.keys()
                   if own[name]['value'] > 0 and opponent[name]['value'] > 0}
-        if len(common) < 2:
+        if len(common) < 3:
             continue
         gaps = {name: abs(own[name]['value'] - opponent[name]['value'])
                 / max(abs(own[name]['value']), abs(opponent[name]['value']), 3 if name.endswith('(%)') else 2)
                 for name in common}
         for side in ('strength', 'weakness'):
-            supporting = {name for name in common if _supports(name, own[name], opponent[name], side)}
-            opposing = {name for name in common if _supports(
+            supporting = {name for name in common - context if _supports(name, own[name], opponent[name], side)}
+            opposing = {name for name in common - context if _supports(
                 name, own[name], opponent[name], 'weakness' if side == 'strength' else 'strength')}
-            for names in chain(combinations(sorted(common), 3), combinations(sorted(common), 2)):
+            for names in combinations(sorted(common), 3):
                 if len({_family(name) for name in names}) != len(names):
                     continue
                 evidence = supporting.intersection(names)
@@ -133,21 +137,16 @@ def _candidate_pairs(own, opponent):
                     continue
                 if opposing.intersection(names):
                     continue
-                score = sum(gaps[name] for name in evidence) / len(evidence) * (.92 if len(names) == 2 else 1)
+                score = sum(gaps[name] for name in evidence) / len(evidence)
                 families = frozenset(_family(name) for name in names)
                 by_topic[topic].append((score, topic, side, names, evidence, families))
 
     # Keep a few distinct evidence sets per topic so the fixture can reuse fewer
     # metrics without enumerating every combination from broad categories.
     for topic, options in by_topic.items():
-        most_metrics = {}
-        for option in options:
-            side, names = option[2:4]
-            most_metrics[side] = max(most_metrics.get(side, 0), len(names))
-        options = [row for row in options if len(row[3]) == most_metrics[row[2]]]
         options.sort(key=lambda row: (-row[0], row[2], row[3]))
         retained = []
-        for side in most_metrics:
+        for side in ('strength', 'weakness'):
             unique = {}
             for option in options:
                 families = option[5]
@@ -175,7 +174,7 @@ def _fixture_pair_score(pairs, goal_margin):
         winner, loser = pairs if goal_margin > 0 else pairs[::-1]
         result_fit = int(any(card[2] == 'strength' for card in winner))
         result_fit += int(any(card[2] == 'weakness' for card in loser))
-    return result_fit, len(topics), sum(len(card[3]) == 3 for card in cards), -repeated_metrics, sum(card[0] for card in cards)
+    return result_fit, len(topics), -repeated_metrics, sum(card[0] for card in cards)
 
 
 def _cards(selected, own, opponent, lang):

@@ -129,7 +129,7 @@ from standings_module import StandingsError, get_league_standings
 from standings_module.insights import enqueue_season, request_summary, player_profile, start_worker, stop_worker
 from report_module.crossing_metrics import normalize_crossing_metrics
 from report_module.metric_validation import sanitize_percentages, sanitize_player_highlights
-from match_report_module import MATCH_REPORT_VERSION, TEAM_ANALYSIS_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_momentum_perspectives, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, build_team_report_strengths, build_team_report_weaknesses, generate_match_report
+from match_report_module import MATCH_REPORT_VERSION, TEAM_ANALYSIS_REPORT_VERSION, build_team_report_attack_profile, build_team_report_defense_profile, build_team_report_metrics, build_team_report_overview, build_team_report_player_perspectives, build_team_report_regional_perspective, build_team_report_score_flow_profile, generate_match_report
 from player_comp_season_module import (
     aggregate_player_seasons,
     get_player_season_rows,
@@ -2344,34 +2344,22 @@ def team_analysis_report_data(
         emit_progress({"reports": reports}, "statistics")
         team_metrics, perspectives = build_team_report_metrics(reports, payload.teamId, lang)
         emit_progress({"perspectives": perspectives}, "perspectives")
-        player_perspectives = build_team_report_player_perspectives(reports, payload.teamId, lang)
+        player_perspectives = build_team_report_player_perspectives(reports, payload.teamId, lang, include_ai=False)
         emit_progress({"playerPerspectives": player_perspectives}, "playerPerspectives")
-        momentum_perspectives = build_team_report_momentum_perspectives(reports, payload.teamId, lang)
-        emit_progress({"momentumPerspectives": momentum_perspectives}, "momentumPerspectives")
         regional_perspective = build_team_report_regional_perspective(reports, payload.teamId, lang)
         emit_progress({"regionalPerspective": regional_perspective}, "regionalPerspective")
-        from report_module.profile_evidence import profile_snapshot
-        attack_profile = build_team_report_attack_profile(reports, payload.teamId, team_metrics, lang)
-        emit_progress({"attackProfile": profile_snapshot(attack_profile)}, "attackProfile")
-        defense_profile = build_team_report_defense_profile(reports, payload.teamId, team_metrics, lang)
-        emit_progress({"defenseProfile": profile_snapshot(defense_profile)}, "defenseProfile")
-        score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang)
+        from match_report_module.team_profile_comparison import enrich_team_profiles
+        attack_profile = build_team_report_attack_profile(reports, payload.teamId, team_metrics, lang, include_analysis=False)
+        defense_profile = build_team_report_defense_profile(reports, payload.teamId, team_metrics, lang, include_analysis=False)
+        strengths, weaknesses = enrich_team_profiles(reports, payload.teamId, lang, attack_profile, defense_profile)
+        emit_progress({"attackProfile": attack_profile, "defenseProfile": defense_profile,
+                       "strengths": strengths, "weaknesses": weaknesses},
+                      ("attackProfile", "defenseProfile", "strengths", "weaknesses"))
+        score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang, include_ai=False)
         emit_progress({"scoreFlowProfile": score_flow_profile}, "scoreFlowProfile")
-        strengths = build_team_report_strengths(reports, payload.teamId, team_metrics, lang, score_flow_profile)
-        emit_progress({"strengths": profile_snapshot(strengths)}, "strengths")
-        weaknesses = build_team_report_weaknesses(reports, payload.teamId, team_metrics, strengths, lang, score_flow_profile)
-        emit_progress({"weaknesses": profile_snapshot(weaknesses)}, "weaknesses")
-        from report_module.profile_editor import review_team_profiles
-        reviewed = review_team_profiles({
-            "attackProfile": attack_profile, "defenseProfile": defense_profile,
-            "strengths": strengths, "weaknesses": weaknesses,
-        }, lang)
-        attack_profile, defense_profile = reviewed["attackProfile"], reviewed["defenseProfile"]
-        strengths, weaknesses = reviewed["strengths"], reviewed["weaknesses"]
-        emit_progress(reviewed, "profileReview")
-        overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, momentum_perspectives, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
+        overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, {}, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
         emit_progress({"overview": overview}, "overview")
-        result = TeamAnalysisReportOut(reportId=job['id'], reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, momentumPerspectives=momentum_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
+        result = TeamAnalysisReportOut(reportId=job['id'], reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
         finish_report(db, user_id, job, result.model_dump())
         return result
     except Exception as exc:
@@ -2876,18 +2864,30 @@ def upgrade_saved_pre_match_findings(db, report_id, user_id, content, snapshot_t
         FINDINGS_VERSION, enrich_pre_match_findings, enrich_tactical_plans, findings_complete, tactical_plan_key,
     )
 
+    from match_analysis_module.pre_match_competition_findings import VERSION as SCOPED_FINDINGS_VERSION, build_scoped_findings
+
     usage = content.get("recent_squad_usage") or {}
     lang = content.get("language") or "en"
-    if not usage or (usage.get("team_findings_version") == FINDINGS_VERSION
-                     and findings_complete(usage.get("team_findings") or {})
-                     and usage.get("team_tactical_plans_key") == tactical_plan_key(usage, lang)):
+    scoped_current = usage.get("scoped_team_findings_version") == SCOPED_FINDINGS_VERSION
+    current = (usage.get("team_findings_version") == FINDINGS_VERSION
+               and (scoped_current or findings_complete(usage.get("team_findings") or {}))
+               and usage.get("team_tactical_plans_key") == tactical_plan_key(usage, lang))
+    if not usage or (current and scoped_current):
         return content
     db.rollback()
-    upgraded = enrich_pre_match_findings(content)
-    findings = enrich_tactical_plans(upgraded["recent_squad_usage"], content.get("teams") or [], lang)
-    if findings.get("team_findings_version") == FINDINGS_VERSION and findings != usage:
+    upgraded = content if current or scoped_current else enrich_pre_match_findings(content)
+    findings = (upgraded["recent_squad_usage"] if current else
+                enrich_tactical_plans(upgraded["recent_squad_usage"], content.get("teams") or [], lang))
+    if not scoped_current:
+        scoped = {**(findings.get("scoped_team_findings") or {}),
+                  **build_scoped_findings(findings.get("teams") or [], lang, content)}
+        if scoped:
+            findings = {**findings, "scoped_team_findings": scoped,
+                        "scoped_team_findings_version": SCOPED_FINDINGS_VERSION if len(scoped) == len(findings["teams"]) else 0}
+    if findings != usage:
         patch = {key: findings[key] for key in (
             "team_findings", "team_findings_version", "team_tactical_plans", "team_tactical_plans_key",
+            "scoped_team_findings", "scoped_team_findings_version",
         ) if key in findings}
         db.execute(text("""UPDATE enterprise_favorite_matches
             SET report_content=jsonb_set(report_content, '{recent_squad_usage}',

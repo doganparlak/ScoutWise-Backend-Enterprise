@@ -52,7 +52,7 @@ def rank_metrics(teams, mode="perMatch"):
     result = {}
     for name, entries in values.items():
         for tid, (value, metric) in entries.items():
-            lower = metric_sort_direction(name) == 'asc' if name in DEFINITIONS else name in LOWER_BETTER
+            lower = metric_sort_direction(name) == 'asc' if name in DEFINITIONS else name in LOWER_BETTER or name == 'Fouls Per 100 Opponent Passes'
             better = sum(other < value if lower else other > value for other, _ in entries.values())
             result.setdefault(tid, {})[name] = {
                 'position': better + 1, 'total_teams': len(entries),

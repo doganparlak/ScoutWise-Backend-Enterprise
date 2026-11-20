@@ -8,7 +8,7 @@ from standings_module.comparison_ranks import rank_metrics
 from standings_module.stages import EUROPEAN_LEAGUES
 
 
-def lineup_style_ranks(league_id, season_id, cutoff, scope):
+def lineup_style_ranks(league_id, season_id, cutoff, scope, *, on_match=None):
     from coach_pool_module import profiles, tactics
 
     with SessionLocal() as db:
@@ -55,6 +55,8 @@ def lineup_style_ranks(league_id, season_id, cutoff, scope):
                     if (key in {'role:defender:Passes', 'role:midfielder:Passes', 'role:attacker:Passes',
                                 'Outfield Final-third Pass Share (%)'} and pass_coverage < 8):
                         continue
+                    if on_match and denominator > 0:
+                        on_match(fixture['id'], tid, key, numerator / denominator * (100 if meta[key]['percentage'] else 1))
                     aggregate = totals[tid].setdefault(key, [0, 0, 0])
                     aggregate[0] += numerator
                     aggregate[1] += denominator

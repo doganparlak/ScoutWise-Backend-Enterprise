@@ -140,7 +140,7 @@ def _fixture_lineup_usage(fixture_id: int, team_id: int, include: str | None = N
         f"{SPORTMONKS_BASE_URL}/fixtures/{fixture_id}",
         params={
             "api_token": token,
-            "include": include or "participants;formations;lineups.player;lineups.position;lineups.details.type;lineups.xGLineup.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type",
+            "include": include or "participants;formations;lineups.player;lineups.position;lineups.details.type;lineups.xGLineup.type;events.type;pressure;ballCoordinates;periods.type;statistics.type;xGFixture.type;stage",
         },
         timeout=15 if include else 35,
     )
@@ -658,6 +658,7 @@ def _team_recent_squad_usage(
     *,
     _comparison_fixtures: list[dict[str, Any]] | None = None,
     _comparison_player_ids: set[int] | None = None,
+    _include_finding_snapshots: bool = False,
 ) -> dict[str, Any]:
     team_id = _as_int(team.get("id"))
     fallback = {
@@ -1007,7 +1008,13 @@ def _team_recent_squad_usage(
         if total_rating_minutes > 0
         else None
     )
+    if _include_finding_snapshots:
+        from .pre_match_competition_findings import finding_snapshots
+        scoped_inputs = {'_finding_snapshots': finding_snapshots(fixtures, full_fixtures)}
+    else:
+        scoped_inputs = {}
     return {
+        **scoped_inputs,
         "team_id": team_id,
         "sample_size": sample_size,
         "current_squad_count": len(current_player_ids),
@@ -1268,10 +1275,15 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
     with ThreadPoolExecutor(max_workers=2) as executor:
         usages = list(
             executor.map(
-                lambda team: _team_recent_squad_usage(team, season_id, season_name, competition_id, reference_date),
+                lambda team: _team_recent_squad_usage(team, season_id, season_name, competition_id, reference_date,
+                                                     _include_finding_snapshots=True),
                 teams,
             )
         )
+    from .pre_match_competition_findings import VERSION as SCOPED_FINDINGS_VERSION, build_scoped_findings, plan_findings
+    snapshots = {}
+    for usage in usages:
+        snapshots.update(usage.pop('_finding_snapshots', {}))
     from standings_module.comparison_ranks import enrich_comparison_ranks
     from .pre_match_player_comparison import comparison_player, enrich_player_comparison
     comparison = {'stats_scope': 'selected_matches', 'teams': [{'team_id': team['team_id'], 'sample_size': team.pop('comparison_sample_size', 0),
@@ -1286,7 +1298,14 @@ def build_recent_squad_usage(fixture: dict[str, Any], lang: str = "en") -> dict[
     result["head_to_head"] = _head_to_head_results(teams[0], teams[1], season_id, reference_date)
     publish("head_to_head")
     from .pre_match_findings import FINDINGS_VERSION, attach_tactical_plans, build_pre_match_findings, enrich_tactical_plans
-    result["team_findings"] = build_pre_match_findings(result["teams"], lang, teams)
+    scoped = build_scoped_findings(usages, lang, fixture, snapshots)
+    if len(scoped) < len(usages):
+        scoped = {**build_scoped_findings(usages, lang, fixture), **scoped}
+    result["scoped_team_findings"] = scoped
+    result["scoped_team_findings_version"] = SCOPED_FINDINGS_VERSION if len(scoped) == len(usages) else 0
+    defaults = plan_findings(scoped)
+    combined = build_pre_match_findings(result["teams"], lang, teams) if len(defaults) < len(usages) else {}
+    result["team_findings"] = {**combined, **defaults}
     result["team_findings_version"] = FINDINGS_VERSION if result["team_findings"] else 0
     publish("pre_team_analysis")
     result["regional_perspectives"] = {scope: _pre_match_regional_perspective(usages, teams, lang, scope) for scope in ("overall", "first_half", "second_half")}

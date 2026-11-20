@@ -84,6 +84,7 @@ PROFILE_RATES = {
     'Tackles Per 100 Opponent Passes': ('Tackles', 'Passes', True),
     'Interceptions Per 100 Opponent Passes': ('Interceptions', 'Passes', True),
     'Recoveries Per 100 Opponent Passes': ('Ball Recovery', 'Passes', True),
+    'Fouls Per 100 Opponent Passes': ('Fouls', 'Passes', True),
 }
 
 

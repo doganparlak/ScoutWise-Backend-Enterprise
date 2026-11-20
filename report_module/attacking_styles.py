@@ -18,7 +18,7 @@ def numeric(value):
         return None
 
 
-def _metric_options(style, catalog, side):
+def _metric_options(style, catalog, side, *, count=4):
     from coach_pool_module.archetypes import BUNDLES
     signals = sorted(style['signals'],key=lambda signal:-(signal['weight']*signal['support']*signal['coverage']))
     strengths = {signal['metric']:signal['weight']*signal['support']*signal['coverage'] for signal in signals}
@@ -28,9 +28,9 @@ def _metric_options(style, catalog, side):
     keys = list(dict.fromkeys([signal['metric'] for signal in signals] + BUNDLES[side][style['id']][0]))
     keys = [key for key in keys if key in catalog]
     options = []
-    for chosen in combinations(keys,4):
+    for chosen in combinations(keys,count):
         # Provider team totals and their outfield fallback cannot fill two cells.
-        if not core.issubset(chosen) or len({key.removeprefix('Outfield ') for key in chosen})!=4:
+        if not core.issubset(chosen) or len({key.removeprefix('Outfield ') for key in chosen})!=count:
             continue
         quality = sum(strengths.get(key,0) for key in chosen)
         options.append((chosen,quality))
@@ -62,7 +62,7 @@ def _distinct_metric_sets(options):
     return min(product(*options),key=objective)
 
 
-def select_team_styles(reports, team_id, lang='en', side='attack', single_match=False):
+def select_team_styles(reports, team_id, lang='en', side='attack', single_match=False, minimum_metrics=4):
     if side not in {'attack', 'defence'}:
         raise ValueError('Unknown profile side')
     from coach_pool_module import profiles as evidence, tactics
@@ -127,8 +127,10 @@ def select_team_styles(reports, team_id, lang='en', side='attack', single_match=
         if side == 'attack' and not distinct_attack_candidate(style, selected_fits):
             continue
         options = _metric_options(style,catalog,side)
+        if not options and minimum_metrics == 3:
+            options = _metric_options(style, catalog, side, count=3)
         if not options:
-            continue  # Four relevant recorded metrics are required; never invent a fourth.
+            continue
         source = _four_metric_cells(options[0][0],catalog)
         identity = style['id']
         selected.append({'styleId':identity, 'styleSide':side, 'title':registry[identity][0 if lang=='tr' else 1],
