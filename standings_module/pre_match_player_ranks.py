@@ -8,7 +8,7 @@ from .metrics import Aggregate, VERSION
 from .stages import EUROPEAN_LEAGUES
 
 
-def cached_player_ranks(league, season, scope, minute, mode="per90", *, players):
+def cached_player_ranks(league, season, scope, minute, mode="per90", *, players, distributions=None):
     """Return only requested ranks; shared SQL caches never retain league maps in RAM."""
     from .player_rankings import CACHE_VERSION, snapshot
     from .metrics import _hide_incomplete_attempts
@@ -24,6 +24,15 @@ def cached_player_ranks(league, season, scope, minute, mode="per90", *, players)
     def selected(db):
         result = db.execute(text("""SELECT scoutwise_selected_player_ranks_v1(
             :l,:s,:sc,CAST(:targets AS jsonb),:mode,:cutoff)"""), args).scalar()
+        if result is not None and distributions:
+            rows = db.execute(text("""SELECT d.label, d.metric_values, m->>'direction' AS direction
+                FROM scoutwise_league_rank_distributions_v1 d
+                JOIN scoutwise_league_rank_meta_v1 meta USING (league_id,season_id,scope)
+                CROSS JOIN LATERAL jsonb_array_elements(meta.metric_catalog) m
+                WHERE d.league_id=:l AND d.season_id=:s AND d.scope=:sc AND d.mode=:mode
+                AND d.label=m->>'key' AND d.label=ANY(:labels)"""),
+                {**args, 'labels': list(distributions)}).mappings()
+            distributions.update({row['label']: (row['metric_values'], row['direction']) for row in rows})
         return None if result is None else {(r['team_id'], r['player_id']): r['metrics'] for r in result}
 
     with benchmark_engine.begin() as db:

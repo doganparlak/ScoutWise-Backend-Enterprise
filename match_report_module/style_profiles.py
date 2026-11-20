@@ -1,14 +1,10 @@
 """Single-match attacking/defensive profiles using the shared style catalogue."""
-from copy import deepcopy
+from bisect import bisect_left, bisect_right
 from math import isfinite
-import json
 
-from report_module.profile_generation import generate_profile_json
-from report_module.profile_evidence import bind_row_evidence, profile_snapshot, PROFILE_EVIDENCE_GUIDANCE
-from report_module.terminology import FOOTBALL_TERMINOLOGY_GUIDANCE
 from report_module.attacking_styles import select_team_styles
 
-VERSION = 3
+VERSION = 7
 TASKS = {
     'attack': [('Goals',1.3,'finishing'),('Expected Goals',1,'finishing'),('Shots Total',1,'shots'),
                ('Key Passes',1.2,'creation'),('Expected Assists',1,'creation'),('Assists',1.1,'assists'),
@@ -87,119 +83,102 @@ def select_players(report,team_id,side):
     return [player for _,player in ranked[:2]]
 
 
-def _paragraphs(row,count):
-    import re
-    value = row.get('analysis')
-    values = [value] if isinstance(value,str) else value if isinstance(value,list) else []
-    analysis = [p.strip() for value in values if isinstance(value,str) for p in re.split(r'\n\s*\n',value) if p.strip()]
-    row['analysis'] = analysis
-    counts = [len(p.split()) for p in analysis]
-    if len(analysis)!=count or any(not 20<=words<=35 for words in counts):
-        raise ValueError(f"{row.get('styleId') or row.get('playerId')}: expected {count} paragraphs of 20-35 words, got {counts}")
+def _attach_percentiles(report, profiles):
+    from sqlalchemy.exc import SQLAlchemyError
+    from .style_profile_ranks import lineup_style_ranks
+    from standings_module.comparison_ranks import canonical_metric_name, competition_ranks
+    from standings_module.metrics import kickoff, numeric
+    from standings_module.pre_match_player_ranks import cached_player_ranks
+    from standings_module.stages import EUROPEAN_LEAGUES, stage_scope
 
+    fixture = report.get('fixture') or {}
+    league = report.get('league') or {}
+    season = report.get('season') or {}
+    league_id = int(league.get('id') or fixture.get('league_id') or 0)
+    season_id = int(season.get('id') or fixture.get('season_id') or 0)
+    if not league_id or not season_id or not fixture.get('starting_at'):
+        return
+    cutoff = kickoff(fixture['starting_at'])
+    if not cutoff:
+        return
+    scope = ('qualifying' if league_id in EUROPEAN_LEAGUES
+             and stage_scope(report.get('stage') or {}) == 'qualifying' else 'overall')
+    cards = [(team['team_id'], kind, row)
+             for team in profiles['teams'] for field in ('attackProfile', 'defenseProfile')
+             for kind in ('players', 'themes') for row in team[field][kind]]
+    targets = {(team_id, int(row['playerId'])) for team_id, kind, row in cards if kind == 'players'}
+    player_distributions = {canonical_metric_name(metric.get('sourceKey') or metric['label']): None
+                            for _, kind, row in cards if kind == 'players' for metric in row['metrics']}
+    try:
+        team_ranks = competition_ranks(league_id, season_id, cutoff, scope)
+    except (SQLAlchemyError, OSError, RuntimeError, ValueError, TypeError, KeyError):
+        team_ranks = {}
+    try:
+        player_ranks = cached_player_ranks(league_id, season_id, scope, int(cutoff.timestamp()) // 60,
+                                           mode='perMatch', players=targets, distributions=player_distributions)
+    except (SQLAlchemyError, OSError, RuntimeError, ValueError, TypeError, KeyError):
+        player_ranks = {}
 
-def _bind_profile(draft,plan):
-    result = {'themes':[],'players':[]}
-    for style in plan['themes']:
-        row = next((r for r in draft.get('themes') or [] if r.get('styleId')==style['styleId']),None)
-        if row is None:
-            raise ValueError('Missing selected match style')
-        _paragraphs(row,2)
-        source = style['source_metrics']
-        bound = bind_row_evidence({**row,**{k:style[k] for k in ('styleId','styleSide','title','description')}},source,4)
-        if bound.get('evidence_validation'):
-            raise ValueError(f"Style {style['styleId']}: {bound['evidence_validation']}; allowed metrics: {list(source)}")
-        bound['metrics']=list(deepcopy(source).values());bound['evidence_values']=deepcopy(source)
-        result['themes'].append(bound)
-    for player in plan['players']:
-        row = next((r for r in draft.get('players') or [] if str(r.get('playerId'))==str(player['playerId'])),None)
-        if row is None:
-            raise ValueError('Missing selected match player')
-        _paragraphs(row,1)
-        source = player['source_metrics']
-        bound = bind_row_evidence({**row,**{k:v for k,v in player.items() if k!='source_metrics'}},source,4)
-        if bound.get('evidence_validation'):
-            raise ValueError(f"Player {player['playerId']}: {bound['evidence_validation']}; allowed metrics: {list(source)}")
-        bound['metrics']=list(deepcopy(source).values());bound['evidence_values']=deepcopy(source)
-        result['players'].append(bound)
-    return profile_snapshot(result)
-
-
-def _repair_draft(draft,plans,lang):
-    fixes, targets = [], {}
-    for plan in plans:
-        team = next((r for r in draft.get('themes') or [] if str(r.get('teamId'))==str(plan['teamId'])),None)
-        if team is None:
-            team={'teamId':plan['teamId']};draft.setdefault('themes',[]).append(team)
-        for field in ('attackProfile','defenseProfile'):
-            profile=team.setdefault(field,{})
-            for kind,identity,count in [('themes','styleId',2),('players','playerId',1)]:
-                for source in plan[field][kind]:
-                    rows=profile.setdefault(kind,[])
-                    row=next((r for r in rows if str(r.get(identity))==str(source[identity])),None)
-                    if row is None:
-                        row={identity:source[identity]};rows.append(row)
-                    try:
-                        _paragraphs(row,count)
-                        bound=bind_row_evidence(row,source['source_metrics'],4)
-                        if bound.get('evidence_validation'):
-                            raise ValueError('; '.join(bound['evidence_validation']))
-                    except ValueError as exc:
-                        key=f"{plan['teamId']}:{field}:{kind}:{source[identity]}"
-                        targets[key]=row
-                        fixes.append({'rowId':key,'team':plan['teamName'],'identity':source.get('title') or source.get('name'),
-                                      'paragraphs':count,'original':row,'reason':str(exc),'source_metrics':source['source_metrics'],
-                                      'readingBoundary':source.get('readingBoundary')})
-    if not fixes:
-        raise ValueError('Unable to locate invalid match profile passage')
-    repair=generate_profile_json([
-        ('system',"Repair ONLY the supplied match-profile rows. Return JSON with themes as an array of {rowId, analysis, evidence_metrics}. Copy rowId exactly. analysis is an array of the requested paragraph count, each ONE paragraph of 20-30 words, aiming for 25. evidence_metrics is an aligned array of arrays of exact names from that row's source_metrics. Keep supported football conclusions, repair the stated problem, never invent facts or copy another row's data. Single-match counts are actual totals, never per-90 or averages. Use natural requested-language football terminology. No markdown or embedded newlines."+FOOTBALL_TERMINOLOGY_GUIDANCE),
-        ('human',json.dumps({'language':lang,'rows':fixes},ensure_ascii=False))])
-    for corrected in repair.get('themes') or []:
-        row=targets.get(corrected.get('rowId'))
-        if row is not None:
-            row.update({key:corrected[key] for key in ('analysis','evidence_metrics') if key in corrected})
-    return draft
-
-
-def build_match_profiles(report,lang='en'):
-    plans = []
-    for team in report.get('teams') or []:
-        sides = {}
-        for side,field in [('attack','attackProfile'),('defence','defenseProfile')]:
-            styles = select_team_styles([report],int(team['id']),lang,side,single_match=True)
-            sides[field]={'themes':[{k:style[k] for k in ('styleId','styleSide','title','description','source_metrics','readingBoundary')} for style in styles],
-                          'players':select_players(report,team['id'],side)}
-        plans.append({'teamId':team['id'],'teamName':team.get('name'),**sides})
-    if not any(plan[field][kind] for plan in plans for field in ('attackProfile','defenseProfile') for kind in ('themes','players')):
-        return {'version':VERSION,'teams':[{'team_id':plan['teamId'],'attackProfile':{'themes':[],'players':[]},'defenseProfile':{'themes':[],'players':[]}} for plan in plans]}
-    messages = [
-        ('system',"You are ScoutWise Enterprise's senior match analyst. Return JSON with themes as the root array: one object per supplied teamId, containing teamId, attackProfile and defenseProfile. Each profile contains themes and players. Copy exactly the supplied selected styleIds and playerIds in source order, never add or replace a selection. Use ONLY this SINGLE MATCH, never a team season or a recent-match sample. Every theme returns styleId, analysis as exactly TWO strings of 25 words EACH (20-30 words, minimum 20 and maximum 35), and evidence_metrics as two aligned arrays of exact source metric names. First paragraph explains the measured attacking/defensive dimension in this match; second adds a distinct supported football implication. Every player returns playerId, analysis as exactly ONE string in an array, 25 words (20-30 words, minimum 20 and maximum 35), and evidence_metrics as one aligned array. Explain the player's concrete contribution to this team's attacking or defensive performance in this match. Evidence must come from that row's source_metrics only. Every paragraph should connect at least two relevant metrics; do not recite a list of values. At most one short numerical fact per paragraph. All counts are actual match totals; NEVER say per 90 or per match averages. Percentages and per-100-pass rates retain their own meanings. Role contribution shares compare outfield players doing the SAME task. Player totals belong to the player; team/opponent totals never become player statistics. Selected styles are statistical fits, not directly observed pressing timing, off-ball positioning or coaching intent. Obey each readingBoundary. No invented causes, movement, tactical schemes, benchmarks, recommendations or missing-data explanations. Do not claim recurring or habitual styles from one match. In Turkish use dripling, kilit pas, başarı oranı and saha oyuncuları. No markdown, bullets or embedded newline inside analysis strings."+FOOTBALL_TERMINOLOGY_GUIDANCE+PROFILE_EVIDENCE_GUIDANCE),
-        ('human',json.dumps({'language':lang,'fixture':report.get('fixture'),'selected_teams':plans},ensure_ascii=False))]
-    draft = generate_profile_json(messages)
-    for attempt in range(2):
+    if any(metric.get('sourceKey', '').startswith(('role:', 'Outfield '))
+           for _, kind, row in cards if kind == 'themes' for metric in row['metrics']):
         try:
-            teams=[]
-            for plan in plans:
-                row=next((r for r in draft['themes'] if str(r.get('teamId'))==str(plan['teamId'])),None)
-                if row is None:
-                    raise ValueError('Missing match team')
-                bound_team={'team_id':plan['teamId'],**{field:_bind_profile(row.get(field) or {},plan[field]) for field in ('attackProfile','defenseProfile')}}
-                previous=next((team for team in (report.get('match_profiles') or {}).get('teams',[]) if team.get('team_id')==plan['teamId']),{})
-                # Adding a secondary dimension should not rewrite established
-                # interpretations whose selected identity and evidence stayed fixed.
-                for field in ('attackProfile','defenseProfile'):
-                    for kind,identity in (('themes','styleId'),('players','playerId')):
-                        for index,item in enumerate(bound_team[field][kind]):
-                            old=next((saved for saved in previous.get(field,{}).get(kind,[]) if saved.get(identity)==item.get(identity) and saved.get('metrics')==item.get('metrics')),None)
-                            if old:
-                                bound_team[field][kind][index]=deepcopy(old)
-                teams.append(bound_team)
-            return {'version':VERSION,'teams':teams}
-        except (ValueError,KeyError,TypeError) as exc:
-            if attempt:
-                raise
-            draft = _repair_draft(draft,plans,lang)
+            lineup_ranks = lineup_style_ranks(league_id, season_id, cutoff, scope)
+        except (SQLAlchemyError, OSError, RuntimeError, ValueError, TypeError, KeyError):
+            lineup_ranks = {}
+        team_ranks = {tid: {**team_ranks.get(tid, {}), **lineup_ranks.get(tid, {})}
+                      for tid in team_ranks.keys() | lineup_ranks.keys()}
+
+    team_distributions = {}
+    for ranks in team_ranks.values():
+        for name, rank in ranks.items():
+            values, _ = team_distributions.setdefault(name, ([], rank['direction']))
+            values.append(rank['season_value'])
+    for values, _ in team_distributions.values():
+        values.sort()
+
+    profiles['competition'] = {'id': league_id, 'name': league.get('name') or '',
+                               'imageUrl': league.get('image_path'), 'scope': scope}
+    for team_id, kind, row in cards:
+        player = kind == 'players'
+        ranks = (player_ranks.get((team_id, int(row['playerId'])), {}) if player
+                 else team_ranks.get(str(team_id), {}))
+        distributions = player_distributions if player else team_distributions
+        for metric in row['metrics']:
+            name = canonical_metric_name(metric.get('sourceKey') or metric['label'])
+            cohort = distributions.get(name)
+            if not cohort or len(cohort[0]) < 5:
+                continue
+            values, direction = cohort
+            total = len(values)
+            rank = ranks.get(name) or {}
+            position = rank.get('position')
+            if position is not None and 1 <= position <= total:
+                metric['percentile'] = round(100 * (total - position) / (total - 1))
+                metric['benchmarkValue'] = rank.get('season_value')
+            match_value = numeric(str(metric['value']).strip('%').replace(',', '.'))
+            if match_value is not None:
+                better = bisect_left(values, match_value) if direction == 'asc' else total - bisect_right(values, match_value)
+                metric['matchPercentile'] = round(100 * max(0, total - 1 - better) / (total - 1))
+            metric['benchmarkSize'] = total
+
+
+def build_match_profiles(report, lang='en'):
+    profiles = {'version': VERSION, 'teams': []}
+    for team in report.get('teams') or []:
+        team_id = int(team['id'])
+        row = {'team_id': team_id}
+        for side, field in (('attack', 'attackProfile'), ('defence', 'defenseProfile')):
+            styles = select_team_styles([report], team_id, lang, side, single_match=True)
+            row[field] = {
+                'themes': [{**{key: style[key] for key in ('styleId', 'styleSide', 'title', 'description')},
+                            'metrics': list(style['source_metrics'].values()), 'analysis': []} for style in styles],
+                'players': [{**{key: value for key, value in player.items() if key != 'source_metrics'},
+                             'metrics': list(player['source_metrics'].values()), 'analysis': []}
+                            for player in select_players(report, team_id, side)],
+            }
+        profiles['teams'].append(row)
+    _attach_percentiles(report, profiles)
+    return profiles
 
 
 def upgrade_match_profiles(content):

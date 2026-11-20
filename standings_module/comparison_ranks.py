@@ -148,7 +148,7 @@ def _calculate_competition_ranks(league, season, cutoff, scope):
             paired_rows.append(row)
             aggregate.add({**row, 'player_contributions': []})
     teams = aggregate.finish()['team_metrics']
-    for tid, metrics in build_team_derived(paired_rows)['teams'].items():
+    for tid, metrics in build_team_derived(paired_rows, include_profile_rates=True)['teams'].items():
         if tid in teams:
             teams[tid]['metrics'].update(metrics)
     return rank_metrics(teams)

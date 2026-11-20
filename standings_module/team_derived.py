@@ -76,7 +76,18 @@ def number(value):
         return None
 
 
-def build_team_derived(rows):
+PROFILE_RATES = {
+    'Long Ball Share (%)': ('Long Balls', 'Passes', False),
+    'Cross Share (%)': ('Total Crosses', 'Passes', False),
+    'Final-third Pass Share (%)': ('Passes In Final Third', 'Passes', False),
+    'Key Passes Per 100 Passes': ('Key Passes', 'Passes', False),
+    'Tackles Per 100 Opponent Passes': ('Tackles', 'Passes', True),
+    'Interceptions Per 100 Opponent Passes': ('Interceptions', 'Passes', True),
+    'Recoveries Per 100 Opponent Passes': ('Ball Recovery', 'Passes', True),
+}
+
+
+def build_team_derived(rows, *, include_profile_rates=False):
     teams = {}
     for row in rows:
         paired = row.get('team_contributions') or {}
@@ -86,8 +97,18 @@ def build_team_derived(rows):
             own = team.get('metrics') or {}
             other = next(other for key, other in paired.items() if key != tid)
             opponent = {**(other.get('metrics') or {}), **(other.get('opponent_inputs') or {})}
-            state = teams.setdefault(str(tid), {'counts': {}, 'rates': empty(), 'share': [0., 0., 0, False]})
+            state = teams.setdefault(str(tid), {'counts': {}, 'rates': empty(), 'profile_rates': {}, 'share': [0., 0., 0, False]})
             add_sample(state['rates'], opponent)
+            if include_profile_rates:
+                for name, (numerator, denominator, uses_opponent) in PROFILE_RATES.items():
+                    a = number(own.get(numerator))
+                    b = number((opponent if uses_opponent else own).get(denominator))
+                    if a is None or b is None or a < 0 or b <= 0 or (name.endswith('(%)') and a > b):
+                        continue
+                    rate = state['profile_rates'].setdefault(name, [0., 0., 0])
+                    rate[0] += a
+                    rate[1] += b
+                    rate[2] += 1
             values = {name: number(opponent.get(source)) for name, (source, _, _) in MIRRORS.items()}
             # Prefer the supplied xGA. Never reconstruct the provider's xGD.
             supplied_xga = number(own.get('Expected Goals Against (xGA)'))
@@ -136,6 +157,10 @@ def build_team_derived(rows):
                              'unit': '%' if metric['aggregation'] == 'derived_rate' else '',
                              'category': category, 'preference': preference,
                              'direction': metric_sort_direction(name), 'playerAwardSupported': False}
+        for name, (numerator, denominator, coverage) in state['profile_rates'].items():
+            value = round(numerator * 100 / denominator, 4)
+            metrics[name] = {'value': value, 'perMatch': value, 'matchesCovered': coverage,
+                             'aggregation': 'derived_rate'}
         result[tid] = metrics
     return {'teams': result, 'metric_catalog': list(catalog.values())}
 
