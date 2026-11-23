@@ -404,7 +404,7 @@ def _recorded_profile_themes(reports, team_id, lang, side, existing=()):
 
 
 def enrich_team_profiles(reports, team_id, lang, attack, defence):
-    from .report import build_team_report_attack_profile, build_team_report_defense_profile
+    from .report import _team_player_metric_reports, build_team_report_attack_profile, build_team_report_defense_profile
 
     scopes = _competition_scopes(reports)
     if not scopes:
@@ -421,8 +421,13 @@ def enrich_team_profiles(reports, team_id, lang, attack, defence):
             if len(selected) == len(reports):
                 scoped_attack, scoped_defence = dict(attack), dict(defence)
             else:
-                scoped_attack = build_team_report_attack_profile(selected, team_id, {}, lang, include_analysis=False, minimum_style_metrics=3)
-                scoped_defence = build_team_report_defense_profile(selected, team_id, {}, lang, include_analysis=False, minimum_style_metrics=3)
+                prepared_players = _team_player_metric_reports(selected)
+                scoped_attack = build_team_report_attack_profile(
+                    selected, team_id, {}, lang, include_analysis=False, minimum_style_metrics=3, prepared_player_reports=prepared_players,
+                )
+                scoped_defence = build_team_report_defense_profile(
+                    selected, team_id, {}, lang, include_analysis=False, minimum_style_metrics=3, prepared_player_reports=prepared_players,
+                )
             for profile, side in ((scoped_attack, 'attack'), (scoped_defence, 'defence')):
                 if len(profile['themes']) < 2:
                     profile['themes'] = _recorded_profile_themes(selected, team_id, lang, side, profile['themes'])

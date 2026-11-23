@@ -1,7 +1,10 @@
 """Full competition-season ranks for pre-match metrics; recent values stay intact."""
 from collections import OrderedDict
 from concurrent.futures import Future
+from copy import deepcopy
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 import logging
 import os
 from threading import RLock
@@ -14,6 +17,9 @@ from .metrics import Aggregate, LOWER_BETTER, COMPLETED_STATES, TEAM_METRIC_CATE
 from .stages import EUROPEAN_LEAGUES, stage_scope
 from .pre_match_player_ranks import strip_player_ranks
 from .team_derived import DEFINITIONS, build_team_derived, metric_sort_direction
+
+_REPORT_ENRICHMENT_CACHE = OrderedDict()
+_REPORT_ENRICHMENT_LOCK = RLock()
 
 _ALIASES = {name.casefold(): canonical for name, (_, canonical) in TEAM_METRIC_CATEGORY.items()}
 _ALIASES.update({
@@ -210,12 +216,24 @@ def enrich_comparison_ranks(usage, fixture, now=None):
         return usage
 
 
-def enrich_report_comparison_ranks(content, fixture):
+def enrich_report_comparison_ranks(content, fixture, *, report_key=None):
     if content.get('report_type') != 'pre_match' or not content.get('recent_squad_usage'):
         return content
     from match_analysis_module.pre_match_player_comparison import enrich_player_comparison, ensure_player_comparison_overview
     from match_analysis_module.pre_match_team_metrics import enrich_selected_team_metrics
     usage = content['recent_squad_usage']
+    cache_key = None
+    if report_key:
+        # Match the minute-resolution rank cutoff and invalidate on snapshot changes.
+        fingerprint = sha256(json.dumps(
+            [fixture, usage, content.get('teams'), content.get('language')], default=str,
+        ).encode()).digest()
+        cache_key = (report_key, int(datetime.now(timezone.utc).timestamp()) // 60, fingerprint)
+        with _REPORT_ENRICHMENT_LOCK:
+            saved = _REPORT_ENRICHMENT_CACHE.get(cache_key)
+            if saved and monotonic() - saved[0] < 30:
+                _REPORT_ENRICHMENT_CACHE.move_to_end(cache_key)
+                return {**content, 'recent_squad_usage': deepcopy(saved[1])}
     try:
         usage = enrich_selected_team_metrics(usage, fixture)
     except (SQLAlchemyError, ValueError, TypeError, KeyError) as exc:
@@ -223,4 +241,16 @@ def enrich_report_comparison_ranks(content, fixture):
     usage = enrich_comparison_ranks(usage, fixture)
     usage = enrich_player_comparison(usage, fixture)
     usage = ensure_player_comparison_overview(usage, content.get('teams') or [], content.get('language') or 'en')
+    comparison = usage.get('player_comparison') or {}
+    if cache_key and usage.get('competition_ranking') and comparison.get('competition_name') and any(
+        metric.get('competition_rank')
+        for team in comparison.get('teams') or []
+        for player in team.get('players') or []
+        for metric in player.get('metrics') or []
+    ):
+        with _REPORT_ENRICHMENT_LOCK:
+            _REPORT_ENRICHMENT_CACHE[cache_key] = monotonic(), deepcopy(usage)
+            _REPORT_ENRICHMENT_CACHE.move_to_end(cache_key)
+            if len(_REPORT_ENRICHMENT_CACHE) > 24:
+                _REPORT_ENRICHMENT_CACHE.popitem(last=False)
     return {**content, 'recent_squad_usage': usage}

@@ -134,6 +134,7 @@ def search_team_pool(
             "logoUrl": detail.get("logoUrl"),
             "city": detail.get("city") or "",
             "coachName": detail.get("coachName") or "",
+            "coachImageUrl": detail.get("coachImageUrl"),
             "playerCount": int(detail.get("playerCount") or 0),
             "stadiumName": detail.get("stadiumName") or "",
             "stadiumImageUrl": detail.get("stadiumImageUrl"),
@@ -174,6 +175,7 @@ def _get_team_details(team_id: int) -> dict[str, Any]:
         "logoUrl": team.get("image_path"),
         "city": venue.get("city_name") or "",
         "coachName": coach.get("display_name") or coach.get("name") or "",
+        "coachImageUrl": coach.get("image_path"),
         "playerCount": len(player_ids),
         "stadiumName": venue.get("name") or "",
         "stadiumImageUrl": venue.get("image_path"),
@@ -491,6 +493,7 @@ def get_fixture(
                 compact[side] = {
                     **(compact.get(side) or {}),
                     "coachName": detail.get("coachName") or "",
+                    "coachImageUrl": detail.get("coachImageUrl"),
                     "playerCount": int(detail.get("playerCount") or 0),
                 }
             home_details = details[0]

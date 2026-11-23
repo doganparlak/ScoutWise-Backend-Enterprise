@@ -2337,27 +2337,41 @@ def team_analysis_report_data(
     configure_progress(persist=save_partial)
     emit_progress(TeamAnalysisReportOut(reportId=job['id'], reports=[]).model_dump())
     try:
+        from match_report_module.report import _team_player_metric_reports, load_team_analysis_fixture
         with ThreadPoolExecutor(max_workers=min(5, len(fixture_ids))) as executor:
-            reports = list(executor.map(lambda fixture_id: generate_match_report(fixture_id, lang, False), fixture_ids))
+            reports = list(executor.map(lambda fixture_id: load_team_analysis_fixture(fixture_id, lang), fixture_ids))
         if any(payload.teamId not in {int(team.get('id') or 0) for team in report.get('teams', [])} for report in reports):
             raise HTTPException(422, 'Every selected fixture must include this team')
         emit_progress({"reports": reports}, "statistics")
-        team_metrics, perspectives = build_team_report_metrics(reports, payload.teamId, lang)
-        emit_progress({"perspectives": perspectives}, "perspectives")
-        player_perspectives = build_team_report_player_perspectives(reports, payload.teamId, lang, include_ai=False)
+        narrative = {}
+        team_metrics, perspectives = build_team_report_metrics(reports, payload.teamId, lang, narrative=narrative)
+        prepared_players = _team_player_metric_reports(reports)
+        player_perspectives = build_team_report_player_perspectives(
+            reports, payload.teamId, lang, include_ai=False, prepared_player_reports=prepared_players,
+        )
         emit_progress({"playerPerspectives": player_perspectives}, "playerPerspectives")
         regional_perspective = build_team_report_regional_perspective(reports, payload.teamId, lang)
         emit_progress({"regionalPerspective": regional_perspective}, "regionalPerspective")
         from match_report_module.team_profile_comparison import enrich_team_profiles
-        attack_profile = build_team_report_attack_profile(reports, payload.teamId, team_metrics, lang, include_analysis=False)
-        defense_profile = build_team_report_defense_profile(reports, payload.teamId, team_metrics, lang, include_analysis=False)
+        attack_profile = build_team_report_attack_profile(
+            reports, payload.teamId, team_metrics, lang, include_analysis=False, prepared_player_reports=prepared_players,
+        )
+        defense_profile = build_team_report_defense_profile(
+            reports, payload.teamId, team_metrics, lang, include_analysis=False, prepared_player_reports=prepared_players,
+        )
+        del prepared_players
         strengths, weaknesses = enrich_team_profiles(reports, payload.teamId, lang, attack_profile, defense_profile)
         emit_progress({"attackProfile": attack_profile, "defenseProfile": defense_profile,
                        "strengths": strengths, "weaknesses": weaknesses},
                       ("attackProfile", "defenseProfile", "strengths", "weaknesses"))
         score_flow_profile = build_team_report_score_flow_profile(reports, payload.teamId, lang, include_ai=False)
         emit_progress({"scoreFlowProfile": score_flow_profile}, "scoreFlowProfile")
-        overview = build_team_report_overview(reports, payload.teamId, perspectives, player_perspectives, {}, regional_perspective, attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang)
+        overview = build_team_report_overview(
+            reports, payload.teamId, perspectives, player_perspectives, {}, regional_perspective,
+            attack_profile, defense_profile, score_flow_profile, strengths, weaknesses, lang, narrative=narrative,
+        )
+        perspectives = narrative.get("perspectives", perspectives)
+        emit_progress({"perspectives": perspectives}, "perspectives")
         emit_progress({"overview": overview}, "overview")
         result = TeamAnalysisReportOut(reportId=job['id'], reports=reports, teamMetrics=team_metrics, perspectives=perspectives, playerPerspectives=player_perspectives, regionalPerspective=regional_perspective, attackProfile=attack_profile, defenseProfile=defense_profile, scoreFlowProfile=score_flow_profile, strengths=strengths, weaknesses=weaknesses, overview=overview)
         finish_report(db, user_id, job, result.model_dump())
@@ -2509,6 +2523,7 @@ def _build_pre_match_report(fixture: dict[str, Any], lang: str) -> dict[str, Any
             "name": str(side.get("name") or "—"),
             "image_url": side.get("imageUrl"),
             "coach_name": side.get("coachName") or "",
+            "coach_image_url": side.get("coachImageUrl"),
             "player_count": int(side.get("playerCount") or 0),
             "location": location,
             "formation": formation_for(int(side.get("id") or 0)) or None,
@@ -2914,26 +2929,34 @@ def open_enterprise_match_report(
     if not row:
         raise HTTPException(status_code=404, detail="Saved match report not found")
     content = dict(row['report_content'])
+    fixture = dict(row['fixture_payload'] or {})
+    requires_regeneration = (row['report_type'] == 'pre_match'
+        and _is_not_started_enterprise_fixture(fixture)
+        and (content.get('pre_match_schema_version') != PRE_MATCH_SCHEMA_VERSION
+             or content.get('version') != MATCH_REPORT_VERSION
+             or not has_recent_squad_usage(content)))
+    if requires_regeneration:
+        record_ready_report_open(db, user_id, row['report_type'], row['id'])
+        return EnterpriseMatchReportOut(
+            favorite_match_id=str(row['id']), status="ready", requires_regeneration=True,
+            content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(content))),
+            language=content.get('language') or 'en', version=int(content.get('version') or 1),
+        )
     if row['report_type'] == 'pre_match':
         content = upgrade_saved_pre_match_score_flow(db, row['id'], user_id, content)
     else:
         from match_report_module.saved_profiles import upgrade_saved_match_profiles
         content = upgrade_saved_match_profiles(db,row['id'],user_id,content)
     from match_analysis_module.model_profile import enrich_model_profile
-    content = enrich_model_profile(content, dict(row['fixture_payload'] or {}))
+    content = enrich_model_profile(content, fixture)
     from standings_module.comparison_ranks import enrich_report_comparison_ranks
     snapshot_teams = (content.get("recent_squad_usage") or {}).get("teams")
-    content = enrich_report_comparison_ranks(content, dict(row['fixture_payload'] or {}))
+    content = enrich_report_comparison_ranks(content, fixture, report_key=str(row['id']))
     if row['report_type'] == "pre_match":
         content = upgrade_saved_pre_match_findings(db, row["id"], user_id, content, snapshot_teams)
     record_ready_report_open(db,user_id,row["report_type"] or "post_match",row["id"])
     return EnterpriseMatchReportOut(
         favorite_match_id=str(row['id']), status="ready",
-        requires_regeneration=(row['report_type'] == 'pre_match'
-            and _is_not_started_enterprise_fixture(dict(row['fixture_payload'] or {}))
-            and (content.get('pre_match_schema_version') != PRE_MATCH_SCHEMA_VERSION
-                 or content.get('version') != MATCH_REPORT_VERSION
-                 or not has_recent_squad_usage(content))),
         content_json=sanitize_player_highlights(sanitize_percentages(normalize_crossing_metrics(content))),
         language=content.get('language') or 'en', version=int(content.get('version') or 1),
     )

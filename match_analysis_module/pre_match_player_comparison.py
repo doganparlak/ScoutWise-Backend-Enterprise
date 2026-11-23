@@ -43,7 +43,7 @@ def metric_category(name):
 
 
 def comparison_player(player):
-    return {key: player.get(key) for key in ('player_id','player_name','player_image_url','position_id','position_name','minutes','appearances','average_rating')} | {
+    return {key: player.get(key) for key in ('player_id','player_name','player_image_url','position_id','position_name','minutes','appearances','average_rating','goals')} | {
         'metrics': [{**metric, 'category': metric_category(metric['name']),
                      'lower_is_better': metric['name'] in LOWER_BETTER or metric_category(metric['name']) == 'errors_discipline'}
                     for metric in player.get('per90_metrics') or []]}
@@ -117,7 +117,8 @@ def cached_selected_players(usage, fixture):
                                 'recorded_minutes':total['minutesCovered'],'matches_covered':total['matchesCovered']})
         identity = identities[player['playerId']]
         result.append(comparison_player({**identity, 'minutes':player['minutes'],'appearances':player['appearances'],
-            'average_rating':identity.get('average_rating'), 'per90_metrics':metrics}))
+            'average_rating':identity.get('average_rating'), 'per90_metrics':metrics,
+            'goals': int((player['metricTotals'].get('Goals') or {}).get('sum') or 0)}))
     return result
 
 
@@ -126,6 +127,8 @@ def enrich_player_comparison(usage, fixture):
         return usage
     existing = usage.get('player_comparison')
     try:
+        from .pre_match_report import _select_player_highlights
+
         windows = {int(team['team_id']): set(map(int, team.get('selected_fixture_ids') or
                    [row['fixture_id'] for row in team.get('results') or []])) for team in usage.get('teams') or []}
         # Older comparison payloads contain only the competition subset. Reuse
@@ -156,6 +159,7 @@ def enrich_player_comparison(usage, fixture):
                     players=[(team['team_id'], player['player_id']) for team in data['teams'] for player in team.get('players') or []])
             except SQLAlchemyError:
                 pass  # Selected-match comparisons remain usable without league ranks.
+        ranked_summaries = {}
         for team in data['teams']:
             saved_team = next((item for item in usage.get('teams') or [] if item['team_id'] == team['team_id']), {})
             summary = saved_team.get('performance_summary') or {}
@@ -174,7 +178,7 @@ def enrich_player_comparison(usage, fixture):
                     recorded = saved.get('per90_metrics') or [*(saved.get('standout_metrics') or []), *(saved.get('development_metrics') or [])]
                     canonical = {metric['name']: metric for metric in comparison_player({'per90_metrics': recorded})['metrics']}
                     player['metrics'] = list({**{metric['name']: metric for metric in player.get('metrics') or []}, **canonical}.values())
-                    for key in ('minutes', 'appearances', 'average_rating'):
+                    for key in ('minutes', 'appearances', 'average_rating', 'goals'):
                         if saved.get(key) is not None:
                             player[key] = saved[key]
                 evidence = ranks.get((int(team['team_id']),int(player['player_id'])),{})
@@ -187,7 +191,26 @@ def enrich_player_comparison(usage, fixture):
                     metric['lower_is_better'] = metric['name'] in LOWER_BETTER or metric['category'] == 'errors_discipline'
                     if evidence.get(metric['name']):
                         metric['competition_rank'] = dict(evidence[metric['name']])
-        return {**usage,'player_comparison':data}
+                    else:
+                        metric.pop('competition_rank', None)
+            candidates = []
+            for player in team.get('players') or []:
+                if (player.get('minutes') or 0) <= 90 or player.get('average_rating') is None:
+                    continue
+                metrics = player.get('metrics') or []
+                goals = player.get('goals')
+                if goals is None:
+                    # Older snapshots store only the selected-window per-90 goal rate.
+                    goals = next((round(m['value'] * (m.get('recorded_minutes') or 0) / 90)
+                                  for m in metrics if m['name'] == 'Goals'), 0)
+                candidates.append({**player, 'goals': goals, 'per90_metrics': metrics})
+            ranked_summaries[team['team_id']] = _select_player_highlights(
+                candidates, team['sample_size'], ranked_only=True)
+        return {**usage, 'player_comparison': data, 'teams': [
+            {**team, 'performance_summary': ranked_summaries[team['team_id']]}
+            if team['team_id'] in ranked_summaries else team
+            for team in usage.get('teams') or []
+        ]}
     except (SQLAlchemyError, ValueError, KeyError, TypeError):
         return usage
 

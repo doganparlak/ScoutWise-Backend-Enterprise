@@ -9,7 +9,11 @@ from report_module.profile_generation import generate_profile_json
 import os
 import json
 import re
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
+from concurrent.futures import Future
+from copy import deepcopy
+from threading import Lock
+from time import monotonic
 from typing import Any
 
 import requests
@@ -24,7 +28,11 @@ SPORTMONKS_BASE_URL = os.getenv(
     "SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3/football"
 ).rstrip("/")
 MATCH_REPORT_VERSION = 52
-TEAM_ANALYSIS_REPORT_VERSION = 72
+TEAM_ANALYSIS_REPORT_VERSION = 74
+
+_TEAM_FIXTURE_CACHE = OrderedDict()
+_TEAM_FIXTURE_PENDING = {}
+_TEAM_FIXTURE_LOCK = Lock()
 
 MATCH_REPORT_INCLUDE = ";".join(
     [
@@ -898,8 +906,42 @@ def generate_match_report(fixture_id: int, lang: str = "en", build_narratives: b
     return report
 
 
+def load_team_analysis_fixture(fixture_id: int, lang: str) -> dict[str, Any]:
+    """Reuse completed fixture snapshots for overlapping team reports."""
+    key = (MATCH_REPORT_VERSION, fixture_id, lang)
+    with _TEAM_FIXTURE_LOCK:
+        saved = _TEAM_FIXTURE_CACHE.get(key)
+        if saved and monotonic() - saved[0] < 300:
+            _TEAM_FIXTURE_CACHE.move_to_end(key)
+            return deepcopy(saved[1])
+        pending = _TEAM_FIXTURE_PENDING.get(key)
+        if pending is None:
+            _TEAM_FIXTURE_PENDING[key] = future = Future()
+    if pending is not None:
+        return deepcopy(pending.result(timeout=90))
+    try:
+        report = generate_match_report(fixture_id, lang, False)
+        if report['fixture'].get('id') != fixture_id:
+            raise MatchReportError("ScoutWise returned an unexpected fixture")
+        snapshot = deepcopy(report)
+        if report['fixture'].get('state_id') in {5, 7, 8} and report.get('lineups') and report.get('coverage', {}).get('unique_team_metrics'):
+            with _TEAM_FIXTURE_LOCK:
+                _TEAM_FIXTURE_CACHE[key] = monotonic(), snapshot
+                _TEAM_FIXTURE_CACHE.move_to_end(key)
+                if len(_TEAM_FIXTURE_CACHE) > 48:
+                    _TEAM_FIXTURE_CACHE.popitem(last=False)
+        future.set_result(snapshot)
+        return report
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _TEAM_FIXTURE_LOCK:
+            del _TEAM_FIXTURE_PENDING[key]
+
+
 def build_team_report_metrics(
-    reports: list[dict[str, Any]], team_id: int, lang: str = "en"
+    reports: list[dict[str, Any]], team_id: int, lang: str = "en", *, narrative: dict | None = None
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
     samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     match_rows: list[dict[str, Any]] = []
@@ -999,15 +1041,19 @@ def build_team_report_metrics(
     if not available or not os.getenv("OPENAI_API_KEY"):
         return aggregate, fallback
     try:
-        from langchain_openai import ChatOpenAI
         language = "Turkish" if lang == "tr" else "English"
+        messages = [
+            ("system", "You are ScoutWise Enterprise's senior football team analyst. Return only one valid JSON object whose top-level keys MUST be copied character-for-character from REQUIRED_JSON_KEYS. Never translate, rename, title-case or omit those machine keys. Translate metric concepts only inside each string value. For every required key, write one evidence-led interpretation of 50-75 words in the requested language. Analyse only the named team across the selected matches. Opponent-derived fields describe production by the opponents faced in those same matches; interpret that exposure as part of the named team's profile, never as another team report or an external benchmark. The output must prioritise football conclusions, not recite the data: use at most two short numerical facts as evidence, then immediately explain what their relationship indicates about efficiency, consistency, risk, control, or recurring performance structure. Never state both the total and per-match version of the same metric; choose whichever is more informative. Do not enumerate metrics, repeat card values, report coverage counts, or walk through match-by-match ranges unless that variation directly supports the main conclusion. When the language is Turkish, every football term inside the values must be natural Turkish; the required JSON keys are the sole exception because they are machine identifiers and are not displayed. Use 2-3 cohesive sentences, with the evidence brief and the interpretation dominant. Never invent causation, tactical intent, external benchmarks, comparisons with unprovided opponents, or unavailable facts. For opponent_threat, lower values are preferable; relate allowed volumes, opportunity quality and success rates without calling a value high or low without supplied comparative evidence. For opponent_profile, interpret opponent tendencies as neutral context, never automatic superiority or weakness. Signed own-minus-opponent differences may be negative; Shot Share (%) is pooled across paired matches and is not possession share. xGD is provider-supplied, never reconstructed. Interpret every required category using all available relevant metrics, prioritising a supported football conclusion over metric definitions or generic data disclaimers. Do not use markdown or headings." + FOOTBALL_TERMINOLOGY_GUIDANCE),
+            ("human", f"Language: {language}\nREQUIRED_JSON_KEYS: {json.dumps(available, ensure_ascii=False)}\nAggregated team categories: {json.dumps(aggregate, ensure_ascii=False)}\nNon-zero per-match team values: {json.dumps(narrative_match_rows, ensure_ascii=False)}"),
+        ]
+        if narrative is not None:
+            narrative.update(category_messages=messages, category_fallback=fallback)
+            return aggregate, fallback
+        from langchain_openai import ChatOpenAI
         response = ChatOpenAI(
             model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")),
             api_key=os.environ["OPENAI_API_KEY"], temperature=0.2,
-        ).invoke([
-            ("system", "You are ScoutWise Enterprise's senior football team analyst. Return only one valid JSON object whose top-level keys MUST be copied character-for-character from REQUIRED_JSON_KEYS. Never translate, rename, title-case or omit those machine keys. Translate metric concepts only inside each string value. For every required key, write one evidence-led interpretation of 50-75 words in the requested language. Analyse only the named team across the selected matches. Opponent-derived fields describe production by the opponents faced in those same matches; interpret that exposure as part of the named team's profile, never as another team report or an external benchmark. The output must prioritise football conclusions, not recite the data: use at most two short numerical facts as evidence, then immediately explain what their relationship indicates about efficiency, consistency, risk, control, or recurring performance structure. Never state both the total and per-match version of the same metric; choose whichever is more informative. Do not enumerate metrics, repeat card values, report coverage counts, or walk through match-by-match ranges unless that variation directly supports the main conclusion. When the language is Turkish, every football term inside the values must be natural Turkish; the required JSON keys are the sole exception because they are machine identifiers and are not displayed. Use 2-3 cohesive sentences, with the evidence brief and the interpretation dominant. Never invent causation, tactical intent, external benchmarks, comparisons with unprovided opponents, or unavailable facts. For opponent_threat, lower values are preferable; relate allowed volumes, opportunity quality and success rates without calling a value high or low without supplied comparative evidence. For opponent_profile, interpret opponent tendencies as neutral context, never automatic superiority or weakness. Signed own-minus-opponent differences may be negative; Shot Share (%) is pooled across paired matches and is not possession share. xGD is provider-supplied, never reconstructed. Interpret every required category using all available relevant metrics, prioritising a supported football conclusion over metric definitions or generic data disclaimers. Do not use markdown or headings." + FOOTBALL_TERMINOLOGY_GUIDANCE),
-            ("human", f"Language: {language}\nREQUIRED_JSON_KEYS: {json.dumps(available, ensure_ascii=False)}\nAggregated team categories: {json.dumps(aggregate, ensure_ascii=False)}\nNon-zero per-match team values: {json.dumps(narrative_match_rows, ensure_ascii=False)}"),
-        ])
+        ).invoke(messages)
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I)
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
@@ -1021,7 +1067,7 @@ def build_team_report_metrics(
         return aggregate, fallback
 
 
-def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _team_player_metric_reports(reports: list[dict[str, Any]], *, minimum_rating_minutes: int = 90) -> list[dict[str, Any]]:
     """Prepare player evidence without changing raw single-match reports.
 
     Infer omitted counts only when another participant has that metric in the
@@ -1115,7 +1161,8 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
         for row, metrics, _ in samples:
             for group, items in sources(row).items():
                 filtered = [item for item in items if item.get("name") == "Minutes Played"
-                            or (coverage[group, str(item.get("name") or "")] >= 90
+                            or (coverage[group, str(item.get("name") or "")] >= (
+                                    minimum_rating_minutes if item.get("name") == "Rating" else 90)
                                 and (item.get("name") == "Rating"
                                      or match_coverage[group, str(item.get("name") or "")] >= minimum_matches))]
                 for item in filtered:
@@ -1128,9 +1175,13 @@ def _team_player_metric_reports(reports: list[dict[str, Any]]) -> list[dict[str,
 
 
 def build_team_report_player_perspectives(
-    reports: list[dict[str, Any]], team_id: int, lang: str = "en", *, include_ai: bool = True
+    reports: list[dict[str, Any]], team_id: int, lang: str = "en", *, include_ai: bool = True, prepared_player_reports: list[dict[str, Any]] | None = None
 ) -> dict[str, dict[str, str]]:
-    reports = _team_player_metric_reports(reports)
+    match_count = len(reports)
+    development_min_minutes = 300 if match_count >= 10 else 27 * match_count
+    minimum_minutes = min(90, development_min_minutes)
+    reports = (prepared_player_reports if prepared_player_reports is not None and minimum_minutes == 90
+               else _team_player_metric_reports(reports, minimum_rating_minutes=minimum_minutes))
     players: dict[str, dict[str, Any]] = {}
     for report in reports:
         for row in report.get("lineups") or []:
@@ -1170,7 +1221,7 @@ def build_team_report_player_perspectives(
                     player["metrics"][group][str(metric.get("name"))].append((value, minutes))
     eligible = []
     for player in players.values():
-        if player["minutes"] < 90 or not player["rating_minutes"]:
+        if player["minutes"] < minimum_minutes or not player["rating_minutes"]:
             continue
         player["rating"] = player["rating_weighted"] / player["rating_minutes"]
         compact_metrics = {}
@@ -1189,9 +1240,13 @@ def build_team_report_player_perspectives(
         player["metrics"] = compact_metrics
         eligible.append(player)
     ordered = sorted(eligible, key=lambda player: (-player["rating"], -player["minutes"], str(player["player_name"])))
-    featured = ordered[:3]
+    featured = [player for player in ordered if player["minutes"] >= 90 and player["rating_minutes"] >= 90][:3]
     featured_ids = {str(player["player_id"] or player["player_name"]) for player in featured}
-    development = [player for player in reversed(ordered) if str(player["player_id"] or player["player_name"]) not in featured_ids][:3]
+    development = [
+        player for player in reversed(ordered)
+        if player["minutes"] >= development_min_minutes
+        and str(player["player_id"] or player["player_name"]) not in featured_ids
+    ][:3]
     chosen = [(player, "featured") for player in featured] + [(player, "development") for player in development]
     result = {
         str(player["player_id"] or player["player_name"]): {
@@ -1396,6 +1451,7 @@ def build_team_report_attack_profile(
     team_metrics: dict[str, list[dict[str, Any]]],
     lang: str = "en",
     *, include_analysis: bool = True, minimum_style_metrics: int = 4,
+    prepared_player_reports: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from report_module.attacking_styles import STYLE_VERSION, select_team_styles, bind_selected_styles
     selected_styles = select_team_styles(reports, team_id, lang, minimum_metrics=minimum_style_metrics)
@@ -1413,7 +1469,7 @@ def build_team_report_attack_profile(
     for group, metrics in _team_attack_balance_evidence(reports, team_id).items():
         added_names = {metric["name"] for metric in metrics}
         team_evidence[group] = [metric for metric in team_evidence.get(group, []) if metric["name"] not in added_names] + metrics
-    reports = _team_player_metric_reports(reports)
+    reports = prepared_player_reports if prepared_player_reports is not None else _team_player_metric_reports(reports)
     players: dict[str, dict[str, Any]] = {}
     for report in reports:
         for row in report.get("lineups") or []:
@@ -1536,6 +1592,7 @@ def build_team_report_defense_profile(
     team_metrics: dict[str, list[dict[str, Any]]],
     lang: str = "en",
     *, include_analysis: bool = True, minimum_style_metrics: int = 4,
+    prepared_player_reports: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a selected-match defensive identity without goalkeeper-save evidence."""
     from report_module.attacking_styles import DEFENCE_STYLE_VERSION as STYLE_VERSION, select_team_styles, bind_selected_styles
@@ -1557,7 +1614,7 @@ def build_team_report_defense_profile(
     }
     team_evidence = {group: rows for group, rows in team_evidence.items() if rows}
     team_evidence.update(_team_defense_threat_evidence(reports, team_id))
-    reports = _team_player_metric_reports(reports)
+    reports = prepared_player_reports if prepared_player_reports is not None else _team_player_metric_reports(reports)
     players: dict[str, dict[str, Any]] = {}
     for report in reports:
         for row in report.get("lineups") or []:
@@ -1807,6 +1864,7 @@ def build_team_report_overview(
     strengths: dict[str, Any],
     weaknesses: dict[str, Any],
     lang: str = "en",
+    *, narrative: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Synthesize every team-report page into a compact section-by-section overview."""
     from report_module.profile_overview import CONTRACT, FIELDS, bind_row
@@ -1858,13 +1916,40 @@ def build_team_report_overview(
         # The modal and PDF already build these rows from structured evidence.
         keys = [key for key in section_titles if key not in {"momentum", "attack", "defense", "strengths", "weaknesses"}]
         visible_evidence = {key: evidence[key] for key in keys}
-        response = ChatOpenAI(model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")), api_key=os.environ["OPENAI_API_KEY"], temperature=.2).invoke([
+        combined = bool(narrative and narrative.get("category_messages"))
+        if combined:
+            visible_evidence["team_data"] = "Use the aggregated categories and interpretations for the perspectives field."
+        messages = [
             ("system", "You are ScoutWise Enterprise's lead team-report editor. Return only one valid JSON object whose top-level keys exactly match REQUIRED_KEYS. Each value must contain exactly summary and subBullets. summary must be a polished 20-32 word synthesis of that report page's decisive football conclusion, not a description of what the page contains. subBullets must be an array of zero to two objects with exactly label and text; label is a concise 2-4 word insight name and text is an 8-16 word supporting conclusion. Synthesize the supplied existing evidence and ScoutWise interpretations without contradicting them. Cover the team's identity across every section, prioritize inference over facts, and avoid repeating the same conclusion across pages. Team Card may be factual. Form & Results summarizes outcome pattern; Squad Profile & Tactics summarizes usage and formation evidence; Score Flow summarizes level/ahead/behind control; Regional summarizes recurring spatial character; Player Data summarizes standout/development patterns without listing players unnecessarily; Team Data summarizes the broad statistical identity. Never mention missing data, fallback, API, match count, raw internal keys, unavailable evidence, recommendations or limitations. Do not invent tactics, causation or benchmarks. When the requested language is Turkish, use only natural Turkish football terminology except proper names and established metric abbreviations; never use foreign adjectives such as 'consequential'. No markdown." + CONTRACT + FOOTBALL_TERMINOLOGY_GUIDANCE),
             ("human", f"Language: {'Turkish' if lang == 'tr' else 'English'}\nTeam: {team_name}\nREQUIRED_KEYS: {json.dumps(keys)}\nSection titles: {json.dumps({key: section_titles[key] for key in keys}, ensure_ascii=False)}\nExisting report evidence: {json.dumps(visible_evidence, ensure_ascii=False, default=str)}"),
-        ])
+        ]
+        if combined:
+            (_, category_system), (_, category_input) = narrative["category_messages"]
+            (_, overview_system), (_, overview_input) = messages
+            messages = [
+                ("system", "Return one JSON object with exactly two keys, perspectives and overview. "
+                 "For perspectives, use the category instructions below inside that field only. "
+                 "For overview, use the overview instructions below inside that field only. "
+                 "Use the same football evidence in both fields and use the category interpretations "
+                 "when synthesizing the Team Data overview.\n\nCategory instructions:\n"
+                 + category_system + "\n\nOverview instructions:\n"
+                 + overview_system.removesuffix(FOOTBALL_TERMINOLOGY_GUIDANCE)),
+                ("human", category_input + "\n\n" + overview_input),
+            ]
+        response = ChatOpenAI(model=os.getenv("OPENAI_MATCH_REPORT_MODEL", os.getenv("OPENAI_REPORT_MODEL", "gpt-5.6-luna")), api_key=os.environ["OPENAI_API_KEY"], temperature=.2).invoke(messages)
         parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", str(response.content or "").strip(), flags=re.I))
         if not isinstance(parsed, dict):
             raise ValueError("team overview response root was not a JSON object")
+        if combined:
+            categories = parsed.get("perspectives")
+            parsed = parsed.get("overview")
+            if isinstance(categories, dict):
+                narrative["perspectives"] = {
+                    group: value.strip() if isinstance(value := categories.get(group), str) and value.strip() else fallback_text
+                    for group, fallback_text in narrative["category_fallback"].items()
+                }
+            if not isinstance(parsed, dict):
+                raise ValueError("combined team narrative was missing the overview")
         rows = []
         for index, (key, title) in enumerate(section_titles.items()):
             if key not in keys:

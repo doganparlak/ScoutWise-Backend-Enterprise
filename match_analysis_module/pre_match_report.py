@@ -30,7 +30,7 @@ from .regional_play import aggregate_regional_play, regional_perspective
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY, TEAM_METRIC_CATEGORY, _categorize, _derive_team_percentages, _metric, _value
 
 
-PRE_MATCH_SCHEMA_VERSION = 13
+PRE_MATCH_SCHEMA_VERSION = 15
 
 _COMPLETED_STATES = {"FT", "AET", "PEN", "WO", "AP"}
 
@@ -202,6 +202,7 @@ _PLAYER_NEGATIVE_METRIC_TERMS = (
     "penalty committed", "dribbled past", "passed", "dispossessed", "turn over",
 )
 _PLAYER_METRIC_MIN_RECORDED_MINUTES = 90
+_DEVELOPMENT_PLAYER_MIN_MINUTES = 300
 _PLAYER_HIGHLIGHT_EXCLUDED_METRICS = {
     "Long Balls Won Percentage",
     "Long Balls Won (%)",
@@ -350,7 +351,7 @@ def _distinct_player_highlight_metrics(metrics):
     return selected
 
 
-def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size: int) -> None:
+def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size: int, ranked_only: bool = False) -> None:
     """Pick three role-output metrics from each eligible player's per-90 sample.
 
     Positive selections are the player's strongest relative outputs in the
@@ -367,6 +368,12 @@ def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size:
         scored = []
         risk_scored = []
         for metric in player.get("per90_metrics") or []:
+            if ranked_only:
+                rank = metric.get("competition_rank") or {}
+                total = rank.get("total_players", 0)
+                if (total < 5 or not 1 <= rank.get("position", 0) <= total
+                    or (metric.get("recorded_minutes") or 0) < _PLAYER_METRIC_MIN_RECORDED_MINUTES):
+                    continue
             if (not _highlight_metric_eligible(metric, sample_size)
                 or str(metric.get("name") or "") in _PLAYER_HIGHLIGHT_EXCLUDED_METRICS
                 or str(metric.get("name") or "").casefold() in _PLAYER_INSIGHT_EXCLUDED_METRICS):
@@ -402,8 +409,8 @@ def _attach_player_highlight_metrics(players: list[dict[str, Any]], sample_size:
         )
 
 
-def _select_player_highlights(players, sample_size):
-    _attach_player_highlight_metrics(players, sample_size)
+def _select_player_highlights(players, sample_size, *, ranked_only=False):
+    _attach_player_highlight_metrics(players, sample_size, ranked_only=ranked_only)
     rating_order = sorted(
         [player for player in players if _interpretation_metrics(player, 'featured', sample_size)],
         key=lambda item: (-item["average_rating"], -item["minutes"], item["player_name"]),
@@ -433,7 +440,8 @@ def _select_player_highlights(players, sample_size):
     # be surfaced as a development-risk player beside outfield contributors.
     outfield_performers = [
         player for player in players
-        if _can_interpret_player(player, 'development', sample_size)
+        if player["minutes"] >= _DEVELOPMENT_PLAYER_MIN_MINUTES
+        and _can_interpret_player(player, 'development', sample_size)
         and str(player.get("position_name") or "").strip().casefold()
         not in {"goalkeeper", "kaleci"}
     ]

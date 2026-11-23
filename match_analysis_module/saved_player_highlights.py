@@ -3,7 +3,10 @@ from copy import deepcopy
 
 
 def upgrade_player_highlights(content):
-    from .pre_match_report import _attach_player_highlight_metrics, _can_interpret_player, _distinct_player_highlight_metrics
+    from .pre_match_report import (
+        _DEVELOPMENT_PLAYER_MIN_MINUTES, _attach_player_highlight_metrics,
+        _can_interpret_player, _distinct_player_highlight_metrics,
+    )
     usages = (content.get('recent_squad_usage') or {}).get('teams') or []
     changes = []
     comparison = (content.get('recent_squad_usage') or {}).get('player_comparison') or {}
@@ -56,7 +59,7 @@ def upgrade_player_highlights(content):
     # frozen fixtures as the report; never substitute today's recent matches.
     replaced = False
     comparison = usage.get('player_comparison') or {}
-    if comparison.get('stats_scope') == 'selected_matches':
+    if (content.get('pre_match_schema_version') or 0) < 15 and comparison.get('stats_scope') == 'selected_matches':
         for team in usage['teams']:
             summary = team.get('performance_summary') or {}
             if summary.get('development'):
@@ -68,7 +71,8 @@ def upgrade_player_highlights(content):
             players = [{**p, 'per90_metrics':deepcopy(p.get('metrics') or [])} for p in source.get('players') or []
                        if (p.get('minutes') or 0)>90 and isinstance(p.get('average_rating'),(int,float))]
             _attach_player_highlight_metrics(players,team['sample_size'])
-            candidates = [p for p in players if str(p.get('position_name') or '').strip().casefold() not in {'goalkeeper','kaleci'}
+            candidates = [p for p in players if p['minutes'] >= _DEVELOPMENT_PLAYER_MIN_MINUTES
+                          and str(p.get('position_name') or '').strip().casefold() not in {'goalkeeper','kaleci'}
                           and _can_interpret_player(p,'development',team['sample_size'])]
             if not candidates:
                 continue
