@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from api_module.database import engine
 from match_report_module.report import DERIVED_PERCENTAGE_METRICS, PLAYER_METRIC_CATEGORY
+from report_module.metric_validation import valid_metric
 from standings_module.metrics import Aggregate, VERSION, AVERAGES, PLAYER_RATE_METRICS, LOWER_BETTER, kickoff, numeric
 from standings_module.pre_match_player_ranks import cached_player_ranks
 from standings_module.stages import EUROPEAN_LEAGUES, stage_scope
@@ -46,7 +47,7 @@ def comparison_player(player):
     return {key: player.get(key) for key in ('player_id','player_name','player_image_url','position_id','position_name','minutes','appearances','average_rating','goals')} | {
         'metrics': [{**metric, 'category': metric_category(metric['name']),
                      'lower_is_better': metric['name'] in LOWER_BETTER or metric_category(metric['name']) == 'errors_discipline'}
-                    for metric in player.get('per90_metrics') or []]}
+                    for metric in player.get('per90_metrics') or [] if valid_metric(metric['name'], metric.get('value'), nonzero=True)]}
 
 
 
@@ -296,7 +297,6 @@ PLAYER_OVERVIEW_VERSION = 2
 def player_comparison_overview_evidence(usage, teams, lang):
     """Anonymous role distributions across the roster, independent of selectors."""
     from statistics import median
-    from report_module.metric_validation import valid_metric
 
     data = usage.get('player_comparison') or {}
     result = []

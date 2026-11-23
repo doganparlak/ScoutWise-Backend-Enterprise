@@ -97,7 +97,8 @@ def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0
     direction = direction or selected['direction']
     field = {'total': 'value', 'perMatch': 'perMatch', 'per90': 'per90'}[mode]
     eligible = [(p['metrics'][metric][field], p, p['metrics'][metric]) for p in payload['players']
-                if metric in p['metrics'] and p['metrics'][metric].get(field) is not None]
+                if metric in p['metrics'] and (value := p['metrics'][metric].get(field)) is not None
+                and round(value, 4) != 0]
     eligible.sort(key=lambda item: (item[0] if direction == 'asc' else -item[0],
                                    -item[2]['matchesCovered'], -item[1]['minutes'], item[1]['playerId'], item[1]['teamId']))
     rows = []
