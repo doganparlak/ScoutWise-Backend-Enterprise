@@ -52,30 +52,48 @@ def comparison_player(player):
 
 def append_comparison_role_metrics(players, fixtures, team_id):
     """Keep keeper and xG counts available without changing standout-player selection."""
+    def metric(detail):
+        raw_name = (detail.get('type') or {}).get('name')
+        category, name = PLAYER_METRIC_CATEGORY.get(raw_name, ('', ''))
+        name = {'Expected Goals (xG)': 'Expected Goals', 'Expected Goals': 'Expected Goals',
+                'Expected Goals on Target (xGoT)': 'Expected Goals On Target',
+                'Expected Goals On Target': 'Expected Goals On Target',
+                'Expected Assists (xA)': 'Expected Assists', 'Expected Assists': 'Expected Assists'}.get(raw_name, name)
+        data = detail.get('data')
+        amount = numeric(data.get('value') if isinstance(data, dict) and 'value' in data else detail.get('value', data))
+        return category, name, amount
+
     totals = {}
     for fixture in fixtures:
+        appearances = []
+        covered = set()
         for row in fixture.get('lineups') or []:
-            if int(row.get('team_id') or 0) != int(team_id):
-                continue
-            details = row.get('details') or []
-            def value(detail):
-                data = detail.get('data')
-                return numeric(data.get('value') if isinstance(data, dict) and 'value' in data else detail.get('value', data))
-            minutes = next((value(detail) for detail in details if (detail.get('type') or {}).get('name') == 'Minutes Played'), None)
+            stats = [metric(detail) for detail in [*(row.get('xglineup') or row.get('xGLineup') or []), *(row.get('details') or [])]]
+            minutes = next((amount for _, name, amount in stats if name == 'Minutes Played'), None)
             if not minutes or minutes <= 0:
                 continue
-            seen = set()
-            for detail in [*(row.get('xglineup') or row.get('xGLineup') or []), *details]:
-                raw_name = (detail.get('type') or {}).get('name')
-                category, name = PLAYER_METRIC_CATEGORY.get(raw_name, ('',''))
-                name = {'Expected Goals (xG)':'Expected Goals','Expected Goals':'Expected Goals','Expected Goals on Target (xGoT)':'Expected Goals On Target','Expected Goals On Target':'Expected Goals On Target','Expected Assists (xA)':'Expected Assists','Expected Assists':'Expected Assists'}.get(raw_name,name)
-                amount = value(detail)
-                if (category != 'goalkeeping' and name not in {'Saves','Goals Conceded','Expected Goals','Expected Goals On Target','Expected Assists'}) or not name or '%' in name or amount is None or amount < 0 or name in seen:
-                    continue
-                seen.add(name)
+            appearances.append((row, stats, minutes))
+            covered.update(name for category, name, amount in stats
+                           if name and '%' not in name and not name.startswith('Expected')
+                           and (category == 'goalkeeping' or name in {'Saves', 'Goals Conceded'})
+                           and amount is not None and amount >= 0)
+        for row, stats, minutes in appearances:
+            if int(row.get('team_id') or 0) != int(team_id):
+                continue
+            seen = {name for _, name, _ in stats}
+            values = {}
+            for category, name, amount in stats:
+                if (category == 'goalkeeping' or name in {'Saves', 'Goals Conceded', 'Expected Goals', 'Expected Goals On Target', 'Expected Assists'}) and name and '%' not in name and amount is not None and amount >= 0:
+                    values.setdefault(name, amount)
+            position_name = str((row.get('position') or {}).get('name') or row.get('position_name') or '')
+            if str(row.get('position_id')) == '24' or position_name.casefold() == 'goalkeeper':
+                values.update(dict.fromkeys(covered - seen, 0.0))
+            for name, amount in values.items():
                 key = (int(row.get('player_id') or 0), name)
-                item = totals.setdefault(key, {'sum':0,'minutes':0,'matches':0})
-                item['sum'] += amount; item['minutes'] += minutes; item['matches'] += 1
+                item = totals.setdefault(key, {'sum': 0, 'minutes': 0, 'matches': 0})
+                item['sum'] += amount
+                item['minutes'] += minutes
+                item['matches'] += 1
     for player in players:
         existing = {m['name'] for m in player.get('per90_metrics') or []}
         for (pid, name), item in totals.items():

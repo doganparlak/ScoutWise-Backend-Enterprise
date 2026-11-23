@@ -1,7 +1,7 @@
 """Compact, mergeable standings statistics. No network, database or AI calls."""
 from __future__ import annotations
 
-from report_module.rate_evidence import empty, add_sample, rate_value, key as rate_key, RATES
+from report_module.rate_evidence import empty, add_sample, rate_value, key as rate_key, missing_attempt_names, RATES
 import hashlib
 import json
 import math
@@ -14,6 +14,7 @@ VERSION = 2
 # Additive player-field coverage; the shared compact-row structure stays compatible.
 PLAYER_METRIC_VERSION = 2
 TEAM_ADVANCED_VERSION = 3
+PLAYER_COUNT_COVERAGE_VERSION = 1
 # Keep provider identifiers: xGD is supplied, never reconstructed as xG - xGA.
 TEAM_ADVANCED_METRICS = frozenset({
     'Expected Goals Against (xGA)', 'Expected Goals Corners (xGC)',
@@ -87,7 +88,7 @@ def player_metric_result(player, team_matches, name, mode='total'):
     return (value, total) if value is not None else None
 
 
-def player_metric_values(row):
+def player_metric_values(row, unknown=None):
     values = {}
     for detail in [*(row.get('details') or []), *(row.get('xglineup') or row.get('xGLineup') or [])]:
         name = (detail.get('type') or {}).get('name') or ''
@@ -99,6 +100,8 @@ def player_metric_values(row):
         value = numeric(raw.get('value') if isinstance(raw, dict) and 'value' in raw else detail.get('value'))
         if canonical in PLAYER_COUNT_METRICS and value is not None and (value >= 0 or canonical == 'Shooting Performance'):
             values.setdefault(canonical, value)
+        elif unknown is not None and canonical in PLAYER_COUNT_METRICS:
+            unknown.add(canonical)
     return values
 
 
@@ -173,6 +176,7 @@ def normalize_fixture(fixture):
         if team_id in teams:
             teams[team_id]['opponent_inputs'] = inputs
     players = []
+    goalkeepers = set()
     seen = set()
     for row in fixture.get('lineups') or []:
         pid, tid = int(row.get('player_id') or 0), int(row.get('team_id') or 0)
@@ -188,16 +192,42 @@ def normalize_fixture(fixture):
         if minutes is not None and minutes <= 0 or minutes is None and rating is None:
             continue
         player = row.get('player') or {}
+        unknown = set()
+        metrics = player_metric_values(row, unknown)
+        if str(row.get('position_id')) == '24' or (row.get('position') or {}).get('name', '').casefold() == 'goalkeeper':
+            goalkeepers.add((pid, tid))
         players.append({'playerId': pid, 'teamId': tid,
                         'name': player.get('display_name') or player.get('name') or row.get('player_name') or str(pid),
                         'imageUrl': player.get('image_path'), 'rating': rating, 'minutes': minutes,
-                        'metrics': player_metric_values(row)})
+                        'metrics': metrics, 'unknownMetrics': sorted(unknown - metrics.keys())})
+    # Only metrics observed on a participating peer can establish a
+    # covered zero. Keep explicit nulls and unknown advanced inputs absent.
+    from report_module.metric_validation import is_standard_count, scoreless_team_ids
+    scoreless = scoreless_team_ids(fixture.get('scores'))
+    covered = {
+        name for player in players if (player['minutes'] or 0) > 0
+        for name in player['metrics'] if is_standard_count(name)
+    }
+    keeper_only = {'Saves', 'Saves Insidebox', 'Penalties Saved', 'Punches', 'Good High Claim'}
+    for player in players:
+        if not (player['minutes'] or 0) > 0:
+            continue
+        metrics = player['metrics']
+        available = covered | ({'Goals'} if str(player['teamId']) in scoreless else set())
+        if (player['playerId'], player['teamId']) not in goalkeepers:
+            available = available - keeper_only
+        protected = missing_attempt_names(metrics)
+        inferred = sorted(name for name in available - metrics.keys() - set(player['unknownMetrics'])
+                          if rate_key(name) not in protected)
+        metrics.update(dict.fromkeys(inferred, 0.0))
+        player['inferredZeroMetrics'] = inferred
     result = {'fixture_id': int(fixture['id']), 'league_id': int(fixture['league_id']),
               'season_id': int(fixture['season_id']), 'kickoff_at': kickoff(fixture['starting_at']),
               'home_team_id': locations['home'], 'away_team_id': locations['away'],
               'included_in_aggregation': fixture.get('state_id') in COMPLETED_STATES,
               'team_contributions': teams, 'player_contributions': players,
-              'coverage': {'teamAdvancedVersion': TEAM_ADVANCED_VERSION, 'playerMetricVersion': PLAYER_METRIC_VERSION, 'teamsWithStats': sum(bool(t['metrics']) for t in teams.values()),
+              'coverage': {'teamAdvancedVersion': TEAM_ADVANCED_VERSION,
+                           'playerCountCoverageVersion': PLAYER_COUNT_COVERAGE_VERSION, 'playerMetricVersion': PLAYER_METRIC_VERSION, 'teamsWithStats': sum(bool(t['metrics']) for t in teams.values()),
                            'ratedPlayers': sum(p['rating'] is not None for p in players)}}
     result['source_fingerprint'] = hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()
     return result
@@ -264,7 +294,9 @@ class Aggregate:
             metrics = dict(p.get('metrics') or {})
             if numeric(p.get('minutes')) is not None and p['minutes'] > 0:
                 metrics['Minutes Played'] = p['minutes']
-            add_sample(item.setdefault('_rate_inputs', empty()), metrics)
+            inferred = set(p.get('inferredZeroMetrics') or [])
+            add_sample(item.setdefault('_rate_inputs', empty()),
+                       {name: value for name, value in metrics.items() if name not in inferred})
             for name, value in metrics.items():
                 if name not in PLAYER_COUNT_METRICS or numeric(value) is None:
                     continue

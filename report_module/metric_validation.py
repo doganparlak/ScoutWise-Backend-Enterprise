@@ -180,3 +180,11 @@ def sanitize_player_highlights(content: Any) -> Any:
                            and valid_metric(str(metric.get('name') or ''), metric.get('value'), nonzero=True)
                            and (not metric.get('is_percentage') or percentage(metric.get('value'), 100) is not None)]
     return result
+
+
+def scoreless_team_ids(scores):
+    return {
+        str(row['participant_id']) for row in scores or []
+        if row.get('description') == 'CURRENT' and row.get('participant_id')
+        and numeric((row.get('score') or {}).get('goals')) == 0
+    }

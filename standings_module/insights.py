@@ -18,7 +18,7 @@ from .team_derived import enrich_team_derived
 from .periods import select_completed_periods
 from .stages import EUROPEAN_LEAGUES, SCOPES, scoped_schedule
 from .player_rankings import ensure_schema as ensure_player_schema, save_snapshot as save_player_snapshot, period_winners as player_period_winners
-from .metrics import PLAYER_AWARD_METRICS, Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, PLAYER_METRIC_VERSION, TEAM_ADVANCED_VERSION, advanced_team_metrics, team_opponent_inputs, kickoff, normalize_fixture, period_for
+from .metrics import PLAYER_AWARD_METRICS, Aggregate, COMPLETED_STATES, PERIOD_ZONE, VERSION, PLAYER_METRIC_VERSION, PLAYER_COUNT_COVERAGE_VERSION, TEAM_ADVANCED_VERSION, advanced_team_metrics, team_opponent_inputs, kickoff, normalize_fixture, period_for
 
 log = logging.getLogger(__name__)
 BASE = os.getenv('SPORTMONKS_BASE_URL', 'https://api.sportmonks.com/v3/football').rstrip('/')
@@ -205,7 +205,8 @@ def cached_summary_rebuild(job):
             FROM league_match_contributions WHERE league_id=:league AND season_id=:season"""), job).mappings().all()
     included = [r for r in rows if r['included_in_aggregation']]
     if (not included or len(included) < job['fixture_count']
-            or any(r['calculation_version'] != VERSION or
+            or any(r['calculation_version'] != VERSION
+                   or (r['coverage'] or {}).get('playerCountCoverageVersion', 0) < PLAYER_COUNT_COVERAGE_VERSION or
                    ((r['coverage'] or {}).get('playerMetricVersion', 0) < PLAYER_METRIC_VERSION
                     or (r['coverage'] or {}).get('teamAdvancedVersion', 0) < TEAM_ADVANCED_VERSION) for r in included)
             or (job['league'] in EUROPEAN_LEAGUES and
@@ -258,6 +259,8 @@ def fixture_details(fixtures, token, include=None):
 
 
 def reusable_contribution(old, played, now):
+    if old and (old.get('coverage') or {}).get('playerCountCoverageVersion', 0) < PLAYER_COUNT_COVERAGE_VERSION:
+        return False
     if (not old or old['kickoff_at'] != played or old['calculation_version'] != VERSION
             or (old.get('coverage') or {}).get('playerMetricVersion', 0) < PLAYER_METRIC_VERSION):
         return False

@@ -10,7 +10,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from api_module.database import benchmark_engine
-from report_module.rate_evidence import RATES, add_sample, empty, key as rate_key, rate_value
+from report_module.metric_validation import is_standard_count
+from report_module.rate_evidence import RATES, add_sample, empty, key as rate_key, missing_attempt_names, rate_value
 
 from match_analysis_module.pre_match_findings import TOPIC_ANCHORS, TOPIC_METRICS, _preference, _supports
 from report_module.team_findings import CATALOG, CATALOG_VERSION
@@ -22,7 +23,7 @@ from .style_profile_ranks import lineup_style_ranks
 from .style_profiles import TASKS
 from .team_findings import _comparison_metrics, _family, _match_metrics
 
-DISPLAY_VERSION = 10
+DISPLAY_VERSION = 11
 _LOG = logging.getLogger(__name__)
 _BENCHMARK_ERRORS = (SQLAlchemyError, OSError, RuntimeError, ValueError, TypeError, KeyError)
 
@@ -213,6 +214,32 @@ def _match_values(raw):
     return {rate_key(name): float(value) for name, value in values.items()}
 
 
+def _player_match_values(entries, targets, scoreless_teams=()):
+    """Include omitted zero counts when the fixture provides coverage for them."""
+    if not targets:
+        return
+    covered_counts = {
+        rate_key(name) for _, _, raw in entries for name, value in raw.items()
+        if is_standard_count(name) and numeric(value) is not None and rate_key(name) in targets
+    }
+    # Goalkeeper-only inputs aren't comparable across outfield appearances.
+    covered_counts.difference_update({'saves', 'goals_conceded', 'penalty_saves', 'goals_prevented'})
+    for player_id, team_id, raw in entries:
+        values = _match_values(raw)
+        recorded = {rate_key(name) for name in raw}
+        coverage = covered_counts | ({'goals'} if team_id in scoreless_teams and 'goals' in targets else set())
+        zeros = coverage - recorded - missing_attempt_names(raw)
+        yield player_id, team_id, {**dict.fromkeys(zeros, 0.0), **values}, zeros
+
+
+def _scoreless_teams(scores):
+    return {
+        int(score['participant_id']) for score in scores
+        if score.get('description') == 'CURRENT' and score.get('participant_id')
+        and numeric((score.get('score') or {}).get('goals')) == 0
+    }
+
+
 def _competition_match_rows(league, season, phase, cutoff, include_players):
     # Stream saved contributions once for all four sections and their PDF pages.
     player_column = 'player_contributions' if include_players else "'[]'::jsonb AS player_contributions"
@@ -267,12 +294,18 @@ def _attach_competition_matches(reports, team_id, profiles):
                     values.update({rate_key(name): metric['perMatch']
                                    for name, metric in derived.get(str(tid), {}).items()})
                     record(values, None if int(tid) == team_id else False, fixture_id)
-                for player in row['player_contributions'] or []:
-                    if not (numeric(player.get('minutes')) or 0) > 0:
-                        continue
-                    record(_match_values(player.get('metrics') or {}),
-                           int(player['playerId']) if int(player['teamId']) == team_id else False,
-                           fixture_id, player=True)
+                entries = [
+                    (int(player['playerId']), int(player['teamId']),
+                     {**dict.fromkeys(player.get('unknownMetrics') or []), **(player.get('metrics') or {})})
+                    for player in row['player_contributions'] or []
+                    if (numeric(player.get('minutes')) or 0) > 0
+                ]
+                scoreless = {
+                    int(tid) for tid, contribution in (row['team_contributions'] or {}).items()
+                    if numeric((contribution.get('metrics') or {}).get('Goals')) == 0
+                }
+                for player_id, player_team, values, _ in _player_match_values(entries, player_keys, scoreless):
+                    record(values, player_id if player_team == team_id else False, fixture_id, player=True)
         except _BENCHMARK_ERRORS:
             _LOG.warning('Match distributions unavailable for team report (%s)', league)
             cohorts = {False: defaultdict(list), True: defaultdict(list)}
@@ -296,16 +329,27 @@ def _attach_competition_matches(reports, team_id, profiles):
                     key = rate_key(name)
                     if key in team_keys:
                         samples[None, key].setdefault(fixture_id, metric['value'])
+            entries = []
             for player in report.get('lineups') or []:
-                player_id = int(player.get('player_id') or 0)
-                if int(player.get('team_id') or 0) != team_id or not player_id:
+                player_id, player_team = int(player.get('player_id') or 0), int(player.get('team_id') or 0)
+                raw = {
+                    canonical_metric_name(row['name']): row.get('value')
+                    for rows in [*(player.get('categories') or {}).values(), player.get('expected_metrics') or []]
+                    for row in rows if row.get('name') and not row.get('_inferred_zero')
+                }
+                if player_id and (numeric(raw.get('Minutes Played')) or 0) > 0:
+                    entries.append((player_id, player_team, raw))
+            for player_id, player_team, values, inferred in _player_match_values(
+                entries, player_keys, _scoreless_teams(report.get('scores') or []),
+            ):
+                if player_team != team_id:
                     continue
-                values = _match_metrics(player)
-                if values.get('Minutes Played', {}).get('value', 0) <= 0:
-                    continue
-                for key, value in _match_values({name: cell['value'] for name, cell in values.items()}).items():
-                    if key in player_keys:
-                        samples[player_id, key].setdefault(fixture_id, value)
+                for key in player_keys & values.keys():
+                    metric_samples = samples[player_id, key]
+                    if key in inferred:
+                        metric_samples.setdefault(fixture_id, values[key])
+                    else:
+                        metric_samples[fixture_id] = values[key]
         for by_metric in cohorts.values():
             for values in by_metric.values():
                 values.sort()
