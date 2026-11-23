@@ -86,11 +86,6 @@ class PlayerPoolSearchRow(BaseModel):
     content: Dict[str, Any]
 
 
-class PlayerPoolWeeklyPopularIn(BaseModel):
-    limit: Optional[int] = Field(default=10, ge=1, le=10)
-    worldCupMode: Optional[bool] = False
-
-
 class PlayerPoolFilterOptionsOut(BaseModel):
     teamsByLeague: Dict[str, List[str]] = Field(default_factory=dict)
     teams: List[str]

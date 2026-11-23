@@ -35,7 +35,6 @@ from scoutwise_pro_module.discovery import DiscoveryIn, discovery_config, discov
 from scoutwise_pro_module.strategy_fit import StrategyFitIn, strategy_fit
 from scoutwise_pro_module.league_fit import LeagueFitIn, LeagueFitInsightsIn, league_fit_data, league_fit_insights
 from api_module.database import SessionLocal, get_db
-from api_module.nec import router as nec_router
 from api_module.models import (
     LoginIn,
     LoginOut,
@@ -87,7 +86,6 @@ from api_module.models import (
     PlayerPoolPotentialOut,
     PlayerPoolSearchIn,
     PlayerPoolSearchRow,
-    PlayerPoolWeeklyPopularIn,
     PlayerCompSeasonAggregateIn,
     PlayerCompSeasonAggregateOut,
     PlayerCompSeasonCandidateOut,
@@ -115,7 +113,6 @@ from api_module.utilities import (
 )
 from player_pool_module.entity_images import ImageLookupBatch, resolve_images, enrich_player_rows
 from player_pool_module.player_pool import get_player_pool_filter_options, search_players
-from player_pool_module.weekly_popular import get_weekly_popular_players, record_player_search
 from matchup_module.comparison import get_matchup_comparison, get_player_comparison_sources
 from league_pool_module.league_pool import get_league_pool_options, search_league_pool
 from team_portfolio_module.portfolio import router as team_portfolio_router, begin_report, finish_report
@@ -236,7 +233,6 @@ from api_module.report_center import router as report_center_router
 app.include_router(report_center_router)
 from api_module.dashboard_workspace import router as dashboard_workspace_router, ensure_dashboard_workspace, record_ready_report_open
 app.include_router(dashboard_workspace_router)
-app.include_router(nec_router)
 app.include_router(team_portfolio_router)
 app.include_router(coach_portfolio_router)
 app.include_router(coach_reports_router)
@@ -1961,23 +1957,6 @@ def player_pool_search(
     return enrich_player_rows(db, search_players(db, payload.model_dump(exclude_none=True)))
 
 
-@app.post("/player-pool/{player_id}/search-hit")
-def player_pool_record_search_hit(
-    player_id: str,
-    worldCupMode: bool = FastAPIQuery(False),
-    user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    del user_id
-    try:
-        record_player_search(db, player_id, worldCupMode)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid player_id") from None
-
-    db.commit()
-    return {"ok": True}
-
-
 @app.post("/player-pool/{player_id}/potential", response_model=PlayerPoolPotentialOut)
 def player_pool_reveal_potential(
     player_id: str,
@@ -2010,16 +1989,6 @@ def player_pool_reveal_form(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Form reveal failed") from exc
-
-
-@app.post("/player-pool/weekly-popular", response_model=list[PlayerPoolSearchRow])
-def player_pool_weekly_popular(
-    payload: PlayerPoolWeeklyPopularIn = Body(default=PlayerPoolWeeklyPopularIn()),
-    user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    del user_id
-    return enrich_player_rows(db, get_weekly_popular_players(db, payload.limit or 10, bool(payload.worldCupMode)))
 
 
 @app.post("/player-pool/matchup/comparison", response_model=MatchupComparisonOut)
