@@ -40,8 +40,8 @@ def _fetch_player_by_sportmonks_id(db: Session, sportmonks_id: int, world_cup_mo
     table_name = player_pool_table(world_cup_mode)
     rows = db.execute(text(f"""
         SELECT id, metadata AS content FROM {table_name}
-        WHERE CASE WHEN metadata->>'player_id' ~ '^[0-9]+([.]0+)?$'
-              THEN (metadata->>'player_id')::numeric END = :sportmonks_id
+        WHERE (CASE WHEN metadata->>'player_id' ~ '^[0-9]+([.]0+)?$'
+              THEN trunc((metadata->>'player_id')::numeric)::text END) = CAST(:sportmonks_id AS text)
         LIMIT 2
     """), {"sportmonks_id": sportmonks_id}).mappings().all()
     if len(rows) != 1:

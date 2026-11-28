@@ -4,6 +4,7 @@ from report_module.analysis_quality import generate_grounded
 
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
+import logging
 from typing import Literal, Union, get_args
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, create_model, model_validator
@@ -12,6 +13,8 @@ from matchup_module.comparison import _fetch_player_metadata
 from scoutwise_pro_module.league_fit_verdict import VERDICT_LABELS
 from scoutwise_pro_module.pro import get_strategy
 from scoutwise_pro_module.team_fit import eligible_roles, target_metrics, rate, metric_families, STATISTICAL_WORDING
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyFitIn(BaseModel):
@@ -146,7 +149,8 @@ def strategy_fit(db, user_id, payload, language):
         metadata = _fetch_player_metadata(db, str(payload.playerId))['content']
     except ValueError as exc:
         raise HTTPException(status_code=404, detail='Player not found') from exc
-    available = {key: value for key, value in target_metrics(metadata).items() if key not in ('Match Count', 'Captain', 'Rating')}
+    available = {key: value for key, value in target_metrics(metadata).items()
+                 if key not in ('Match Count', 'Captain', 'Rating') and abs(value) >= 0.005}
     if not available:
         raise HTTPException(status_code=422, detail='Player metrics unavailable')
     evidence = {'output_language': 'Turkish' if normalize_lang(language) == 'tr' else 'English', 'strategy': strategy, 'player': metadata.get('player_name') or metadata.get('name'), 'roles': eligible_roles(metadata), 'metrics': available, 'metric_categories': metric_families(available)}
@@ -156,10 +160,18 @@ def strategy_fit(db, user_id, payload, language):
         output = strategy_insight_model(available)
         result = generate_grounded(CHAT_LLM, output, [('system', PROMPT + (DISCOVERY_CONTEXT_PROMPT if payload.discoveryContext is not None else '')), ('human', json.dumps(evidence, ensure_ascii=False))], evidence)
         result = output.model_validate(result.model_dump() if isinstance(result, BaseModel) else result)
-        result = verbalize_requirements(CHAT_LLM, result, evidence['output_language'])
-        summary = summarize_strategy(CHAT_LLM, strategy, evidence['output_language'])
+        try:
+            result = verbalize_requirements(CHAT_LLM, result, evidence['output_language'])
+        except Exception as exc:
+            logger.warning('Strategy fit retained reviewed requirements after wording pass failed (%s)', type(exc).__name__)
+        try:
+            summary = summarize_strategy(CHAT_LLM, strategy, evidence['output_language'])
+        except Exception as exc:
+            logger.warning('Strategy fit retained the original strategy after summary failed (%s)', type(exc).__name__)
+            summary = strategy
         lang = 'tr' if evidence['output_language'] == 'Turkish' else 'en'
         return {**resolve_insights(result, available), 'summary': summary, 'strategy': strategy,
                 'verdict': {'key': result.verdict, 'label': VERDICT_LABELS[result.verdict][lang]}}
     except Exception as exc:
+        logger.error('Strategy fit generation failed for player=%s (%s)', payload.playerId, type(exc).__name__)
         raise HTTPException(status_code=502, detail='Strategy fit insights could not be generated') from exc

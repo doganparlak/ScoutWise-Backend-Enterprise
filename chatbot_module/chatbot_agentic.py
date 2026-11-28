@@ -970,7 +970,9 @@ def answer_selected_player(
     """
     metadata = dict(row.get("metadata") or {})
     metadata["id"] = row["id"]
-    candidate = _metadata_to_candidate(metadata, content=row.get("content") or "")
+    candidate = _metadata_to_candidate(
+        metadata, content=row.get("content") or "", include_rare_events=True,
+    )
     profile = candidate_to_meta(candidate)["players"][0]
     profile["playerId"] = metadata.get("player_id")
     for key in ("potential", "form", "is_on_loan", "contract_team_id", "contract_team_name", "loan_end_date", "contract_end_date", "end_date"):

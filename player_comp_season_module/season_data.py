@@ -1,7 +1,8 @@
 from __future__ import annotations
-from report_module.rate_evidence import apply_merged_rates
+from report_module.rate_evidence import RATES, VERSION, apply_merged_rates, key as metric_key
 
 import re
+from math import isclose, isfinite
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
@@ -81,7 +82,6 @@ def search_season_players(
                 SELECT
                     player_id,
                     player_name,
-                    {folded_name} AS normalized_name,
                     CASE
                         WHEN {folded_name} = :query_norm THEN 0
                         WHEN {folded_name} LIKE :query_prefix THEN 1
@@ -95,47 +95,46 @@ def search_season_players(
                     OR {_folded_column_sql("nationality_name")} = :nationality_norm
                   )
             ),
-            candidate_ids AS (
-                SELECT player_id, MIN(match_rank) AS match_rank
+            best_aliases AS (
+                SELECT DISTINCT ON (player_id)
+                    player_id, player_name, match_rank
                 FROM matched_names
-                GROUP BY player_id
-                ORDER BY MIN(match_rank), player_id
+                ORDER BY player_id, match_rank, LENGTH(player_name) DESC, player_name
+            ),
+            candidates AS (
+                SELECT player_id, player_name, match_rank
+                FROM best_aliases
+                ORDER BY match_rank, player_id
                 LIMIT :limit
             )
             SELECT
                 candidates.player_id,
                 latest.player_name AS display_name,
-                best_match.player_name AS matched_alias,
+                candidates.player_name AS matched_alias,
                 latest.nationality_name,
                 latest.team_name AS latest_team_name,
                 latest.position_name AS latest_position_name,
+                latest.position_counts AS latest_position_counts,
+                latest.age AS latest_age,
                 latest.season_name AS latest_season_name,
                 history.row_count,
                 history.first_season_name,
                 history.latest_season_name AS history_latest_season_name
-            FROM candidate_ids candidates
+            FROM candidates
             JOIN LATERAL (
                 SELECT
                     player_name,
                     nationality_name,
                     team_name,
                     position_name,
+                    position_counts,
+                    age,
                     season_name
                 FROM player_comp_season_data
                 WHERE player_id = candidates.player_id
                 ORDER BY season_id DESC, updated_at DESC
                 LIMIT 1
             ) latest ON TRUE
-            JOIN LATERAL (
-                SELECT player_name
-                FROM matched_names alias
-                WHERE alias.player_id = candidates.player_id
-                ORDER BY
-                    alias.match_rank,
-                    LENGTH(alias.player_name) DESC,
-                    alias.player_name
-                LIMIT 1
-            ) best_match ON TRUE
             JOIN LATERAL (
                 SELECT
                     COUNT(*)::int AS row_count,
@@ -158,12 +157,25 @@ def search_season_players(
             "nationality": str(row["nationality_name"] or ""),
             "latestTeam": str(row["latest_team_name"] or ""),
             "latestPosition": str(row["latest_position_name"] or ""),
+            "latestRole": _primary_season_role(row["latest_position_counts"]),
+            "latestAge": int(row["latest_age"]) if row["latest_age"] is not None else None,
             "latestSeason": str(row["latest_season_name"] or row["history_latest_season_name"] or ""),
             "firstSeason": str(row["first_season_name"] or ""),
             "rowCount": int(row["row_count"] or 0),
         }
         for row in rows
     ]
+
+
+def _primary_season_role(position_counts: Any) -> str:
+    if not isinstance(position_counts, Mapping):
+        return ""
+    roles = [
+        (count, role)
+        for role, raw in position_counts.items()
+        if role and (count := _number(raw)) is not None and isfinite(count) and count > 0
+    ]
+    return max(roles, default=(0, ""))[1]
 
 
 def get_season_player_nationalities(db: Session) -> List[str]:
@@ -227,6 +239,10 @@ def _fetch_player_rows(db: Session, player_id: int) -> List[Dict[str, Any]]:
 
 
 def _row_out(row: Mapping[str, Any]) -> Dict[str, Any]:
+    match_count = int(row.get("match_count") or 0)
+    stats = row.get("stats") or {}
+    average_minutes = next((_number(value) for name, value in stats.items()
+                            if metric_key(name) == "minutes_played"), None)
     return {
         "key": _source_key(row),
         "playerId": int(row["player_id"]),
@@ -241,7 +257,8 @@ def _row_out(row: Mapping[str, Any]) -> Dict[str, Any]:
         "leagueImagePath": str(row.get("league_image_path") or ""),
         "seasonId": int(row["season_id"]),
         "seasonName": str(row.get("season_name") or ""),
-        "matchCount": int(row.get("match_count") or 0),
+        "matchCount": match_count,
+        "minutes": _record_minutes(average_minutes, _source_counts(stats), match_count),
         "positionName": str(row.get("position_name") or ""),
         "positionCounts": dict(row.get("position_counts") or {}),
         "age": int(row["age"]) if row.get("age") is not None else None,
@@ -275,6 +292,70 @@ def _latest_value(rows: Iterable[Mapping[str, Any]], field: str) -> Any:
         if value is not None and value != "":
             return value
     return None
+
+
+def _source_counts(source_stats: Mapping[str, Any]) -> Mapping[str, Any]:
+    evidence = source_stats.get("_rate_inputs")
+    return evidence.get("counts", {}) if isinstance(evidence, dict) and evidence.get("version") == VERSION else {}
+
+
+def _record_minutes(average_minutes: float | None, counts: Mapping[str, Any], match_count: int) -> float | None:
+    minutes_evidence = counts.get("minutes_played", {})
+    if minutes_evidence:
+        record_minutes = _number(minutes_evidence.get("sum")) if minutes_evidence.get("covered") == match_count else None
+    else:
+        record_minutes = average_minutes * match_count if average_minutes is not None else None
+    return record_minutes if record_minutes is not None and isfinite(record_minutes) and record_minutes > 0 else None
+
+
+def _metric_display_values(
+    stats: Mapping[str, Any], source_stats: Mapping[str, Any], match_count: int,
+) -> Dict[str, Dict[str, float | None]]:
+    counts = _source_counts(source_stats)
+    normalized_source = {metric_key(name): _number(value) for name, value in source_stats.items()}
+    record_minutes = _record_minutes(normalized_source.get("minutes_played"), counts, match_count)
+    display: Dict[str, Dict[str, float | None]] = {}
+    for name, value in stats.items():
+        numeric = _number(value)
+        if numeric is None or not isfinite(numeric):
+            continue
+        key = metric_key(name)
+        if key in RATES or key.endswith("_percentage") or key in {"rating", "shooting_performance"}:
+            display[name] = {"total": numeric, "per90": numeric}
+            continue
+
+        observation = counts.get(key, {})
+        recorded_total = _number(observation.get("sum"))
+        if recorded_total is not None and not isfinite(recorded_total):
+            recorded_total = None
+        coverage_sensitive = key in {"expected_goals", "expected_goals_on_target"}
+        if coverage_sensitive and recorded_total is None:
+            display[name] = {"total": None, "per90": None}
+            continue
+        if recorded_total is None:
+            if not observation and match_count > 0:
+                # Legacy volume metrics use the existing per-appearance convention.
+                total = numeric * match_count
+                per90 = total * 90 / record_minutes if record_minutes is not None else None
+                display[name] = {"total": total, "per90": numeric if key == "minutes_played" else per90}
+            else:
+                display[name] = {"total": None, "per90": None}
+            continue
+
+        covered = observation.get("covered")
+        source_average = normalized_source.get(key)
+        # Sparse event counts can omit zero-event matches. The stored average
+        # confirms whether the recorded sum was normalized over all appearances.
+        whole_record_count = not coverage_sensitive and source_average is not None and isclose(
+            source_average * match_count, recorded_total, abs_tol=0.00005 * match_count,
+        )
+        per90 = None
+        if record_minutes is not None and (covered == match_count or whole_record_count):
+            per90 = recorded_total * 90 / record_minutes
+        if key == "minutes_played":
+            per90 = numeric
+        display[name] = {"total": recorded_total, "per90": per90}
+    return display
 
 
 def aggregate_player_seasons(
@@ -349,5 +430,6 @@ def aggregate_player_seasons(
         "competitions": competitions,
         "positionCounts": {key: round(value, 2) for key, value in position_counts.items()},
         "stats": {name: value for name, value in stats.items() if _number(value) is not None},
+        "metricDisplay": _metric_display_values(stats, latest.get("stats") or {}, total_matches),
         "selectedRows": [_row_out(row) for row in selected],
     }

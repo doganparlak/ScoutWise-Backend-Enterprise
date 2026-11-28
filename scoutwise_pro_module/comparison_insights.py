@@ -3,6 +3,10 @@ from __future__ import annotations
 from report_module.analysis_quality import generate_grounded
 
 import json
+from collections import OrderedDict
+from hashlib import sha256
+from threading import Lock
+from time import monotonic
 from typing import Annotated, Literal
 
 from fastapi import HTTPException
@@ -13,6 +17,45 @@ from sqlalchemy.orm import Session
 from api_module.utilities import normalize_lang
 
 CategoryKey = Literal['scoutwise_scores', 'contribution_impact', 'goalkeeping', 'shooting', 'passing', 'defending', 'errors_discipline']
+
+
+_INSIGHTS_CACHE_TTL = 600
+_INSIGHTS_CACHE_MAX_BYTES = 1024 * 1024
+_INSIGHTS_CACHE_MAX_ENTRIES = 128
+_insights_cache: OrderedDict[bytes, tuple[float, bytes]] = OrderedDict()
+_insights_cache_lock = Lock()
+_insights_cache_bytes = 0
+
+
+def _get_cached_insights(key: bytes) -> dict[str, str] | None:
+    global _insights_cache_bytes
+    with _insights_cache_lock:
+        entry = _insights_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, body = entry
+        if expires_at <= monotonic():
+            del _insights_cache[key]
+            _insights_cache_bytes -= len(body)
+            return None
+        _insights_cache.move_to_end(key)
+    return json.loads(body)
+
+
+def _cache_insights(key: bytes, insights: dict[str, str]) -> None:
+    global _insights_cache_bytes
+    body = json.dumps(insights, ensure_ascii=False, separators=(',', ':')).encode()
+    if len(body) > _INSIGHTS_CACHE_MAX_BYTES:
+        return
+    with _insights_cache_lock:
+        previous = _insights_cache.pop(key, None)
+        if previous is not None:
+            _insights_cache_bytes -= len(previous[1])
+        _insights_cache[key] = (monotonic() + _INSIGHTS_CACHE_TTL, body)
+        _insights_cache_bytes += len(body)
+        while len(_insights_cache) > _INSIGHTS_CACHE_MAX_ENTRIES or _insights_cache_bytes > _INSIGHTS_CACHE_MAX_BYTES:
+            _, (_, evicted_body) = _insights_cache.popitem(last=False)
+            _insights_cache_bytes -= len(evicted_body)
 
 
 class ComparisonMetricEvidence(BaseModel):
@@ -89,7 +132,9 @@ Produce short, useful football insight rather than statistics narration. No head
 '''
 
 
-def get_comparison_insights(db: Session, payload: ProComparisonInsightsIn, accept_language: str | None):
+def get_comparison_insights(
+    db: Session, payload: ProComparisonInsightsIn, accept_language: str | None, *, user_id: str,
+):
     # Reuse exactly the ChatOpenAI client used by Pro's existing named comparison agent.
     from chatbot_module.chatbot import CHAT_LLM
 
@@ -133,6 +178,15 @@ def get_comparison_insights(db: Session, payload: ProComparisonInsightsIn, accep
         'categories': [category.model_dump() for category in payload.categories],
         'discovery_context': payload.discoveryContext.model_dump() if payload.mode == 'single' and payload.discoveryContext else None,
     }
+    # Validate current player context before reusing reviewed commentary.
+    cache_key = sha256(json.dumps(
+        [user_id, payload.mode, payload.playerIds, payload.sourceSelections, evidence],
+        ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    ).encode()).digest()
+    cached = _get_cached_insights(cache_key)
+    if cached is not None:
+        return {'insights': cached}
+
     try:
         output_model = create_model(
             "ScoutWiseCategoryPerspectives",
@@ -155,4 +209,5 @@ def get_comparison_insights(db: Session, payload: ProComparisonInsightsIn, accep
             raise ValueError('Incomplete insights')
     except Exception as exc:
         raise HTTPException(status_code=502, detail='Comparison insights could not be generated. Please retry.') from exc
+    _cache_insights(cache_key, insights)
     return {'insights': insights}

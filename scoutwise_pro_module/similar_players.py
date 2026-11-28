@@ -1,9 +1,15 @@
 """Deterministic role-filtered player similarity; no LLM or tactical inputs."""
+from collections import OrderedDict
+from hashlib import sha256
+import json
+from threading import Lock
+
 from bisect import bisect_left, bisect_right
 from math import sqrt
 from heapq import nsmallest
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from matchup_module.comparison import _fetch_player_metadata
 from player_pool_module.player_pool import search_players, fetch_player_rows_by_ids
 from scoutwise_pro_module.discovery import ALIASES, BUNDLES, CONTEXT_METRICS, CATEGORY_DEFINITIONS, CONTEXT_BUNDLES, DiscoveryFilters, player_metrics, discovery_roles, discovery_search_roles
@@ -13,6 +19,11 @@ from scoutwise_pro_module.similarity_weights import feature_weights
 MIN_COVERAGE = 0.70
 MIN_COMMON_METRICS = 15
 MIN_CATEGORIES = 3
+MAX_CACHED_RANKINGS = 128
+_rank_cache = OrderedDict()
+_revision_enabled = set()
+_rank_cache_lock = Lock()
+
 METRIC_CATEGORIES = {
     metric.lstrip('-'): category
     for category, _, _, groups in CATEGORY_DEFINITIONS
@@ -46,6 +57,7 @@ class SimilarFilters(DiscoveryFilters):
 class SimilarPlayersIn(BaseModel):
     playerId: int = Field(gt=0)
     filters: SimilarFilters = Field(default_factory=SimilarFilters)
+    preview: bool = False
 
 
 def identity(row):
@@ -132,25 +144,75 @@ def similarity_eligibility(db, payload):
             'minimumMetrics': MIN_COMMON_METRICS, 'minimumCategories': MIN_CATEGORIES}
 
 
+def _player_data_revision(db):
+    bind = db.get_bind()
+    with _rank_cache_lock:
+        enabled = bind in _revision_enabled
+    if not enabled:
+        # Use the caller's connection so a burst of requests cannot exhaust
+        # the pool by holding one connection while waiting for another.
+        if db.execute(text("SELECT to_regclass('public.scoutwise_player_data_revision')")).scalar() is None:
+            return None
+        with _rank_cache_lock:
+            _revision_enabled.add(bind)
+    return db.execute(text("SELECT revision FROM public.scoutwise_player_data_revision WHERE singleton")).scalar_one()
+
+
+def _profile_fingerprint(content):
+    inputs = {key: content[key] for key in SIMILARITY_METADATA_FIELDS if key in content}
+    return sha256(json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()).digest()
+
+
+def _rank_candidates(db, source, filters):
+    candidate_filters = dict(filters)
+    choices = {key: candidate_filters.pop(key, []) for key in ('nationality', 'team', 'league')}
+    rows = search_players(
+        db, candidate_filters,
+        all_matches=True,
+        candidate_roles=sorted(discovery_search_roles(discovery_roles(source['content']))),
+        candidate_choices=choices, metadata_fields=SIMILARITY_METADATA_FIELDS, batch_size=1000,
+    )
+    return [
+        (int(match['player']['id']), _profile_fingerprint(match['player']['content']),
+         {key: value for key, value in match.items() if key != 'player'})
+        for match in rank_similar(source, rows)
+    ]
+
+
 def similar_players(db, payload):
+    revision = _player_data_revision(db)
     source = load_similarity_source(db, payload.playerId)
-    # Revalidate at search time even when the client has passed the precheck.
     if not source_is_eligible(source):
         raise HTTPException(status_code=422, detail='similarity_source_insufficient')
-    # Stream the complete eligible pool in bounded batches; scoring still uses
-    # every candidate and preserves the existing result/subscription limits.
+
     filters = payload.filters.model_dump(mode='json', exclude_none=True)
-    choices = {key: filters.pop(key, []) for key in ('nationality', 'team', 'league')}
-    rows = search_players(db, filters, all_matches=True, candidate_roles=sorted(discovery_search_roles(discovery_roles(source['content']))), candidate_choices=choices, metadata_fields=SIMILARITY_METADATA_FIELDS, batch_size=1000)
-    ranked = rank_similar(source, rows)
-    del rows  # Non-winning candidate metadata is no longer needed.
-    profiles = {str(row['id']): row for row in fetch_player_rows_by_ids(db, [int(match['player']['id']) for match in ranked])}
-    for match in ranked:
-        candidate = match['player']
-        full = profiles.get(str(candidate['id']))
-        # A concurrent data refresh can replace row IDs. Never attach another
-        # player's profile or changed ranking inputs to an already scored row.
-        if full is None or {key: value for key, value in full['content'].items() if key in SIMILARITY_METADATA_FIELDS} != candidate['content']:
+    cache_key = (db.get_bind(), revision, payload.playerId, json.dumps(filters, sort_keys=True))
+    ranked = None
+    if revision is not None:
+        with _rank_cache_lock:
+            ranked = _rank_cache.get(cache_key)
+            if ranked is not None:
+                _rank_cache.move_to_end(cache_key)
+    cache_miss = ranked is None
+    if cache_miss:
+        ranked = _rank_candidates(db, source, filters)
+
+    selected = ranked[:3] if payload.preview else ranked
+    profiles = {int(row['id']): row for row in fetch_player_rows_by_ids(db, [row_id for row_id, _, _ in selected])}
+    results = []
+    for row_id, fingerprint, score in selected:
+        full = profiles.get(row_id)
+        if full is None or _profile_fingerprint(full['content']) != fingerprint:
             raise HTTPException(status_code=409, detail='Player data changed during search. Please retry.')
-        match['player'] = full
-    return {'players': ranked, 'minimumCoverage': 70, 'minimumCommonMetrics': MIN_COMMON_METRICS, 'minimumCategories': MIN_CATEGORIES, 'method': 'role-weighted-percentile-cosine70-closeness30-v3'}
+        results.append({**score, 'player': full})
+
+    if revision is not None:
+        if _player_data_revision(db) != revision:
+            raise HTTPException(status_code=409, detail='Player data changed during search. Please retry.')
+        if cache_miss:
+            with _rank_cache_lock:
+                _rank_cache[cache_key] = ranked
+                _rank_cache.move_to_end(cache_key)
+                if len(_rank_cache) > MAX_CACHED_RANKINGS:
+                    _rank_cache.popitem(last=False)
+    return {'players': results, 'minimumCoverage': 70, 'minimumCommonMetrics': MIN_COMMON_METRICS, 'minimumCategories': MIN_CATEGORIES, 'method': 'role-weighted-percentile-cosine70-closeness30-v3'}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from report_module.analysis_quality import generate_grounded
+from report_module.position_groups import comparison_groups, comparison_role_groups, ROLE_GROUP
 from scoutwise_pro_module.comparison_insights import DiscoveryAnalysisContext, DISCOVERY_CONTEXT_PROMPT
 import json
 from collections import defaultdict
@@ -10,7 +11,7 @@ from sqlalchemy import text
 from fastapi import HTTPException
 from api_module.utilities import normalize_lang
 from matchup_module.comparison import _fetch_player_metadata
-from scoutwise_pro_module.competition_profile import competition_profile, load_competition_candidate
+from scoutwise_pro_module.competition_profile import competition_position_counts, competition_profile, load_competition_candidate
 from scoutwise_pro_module.team_fit import eligible_roles
 from scoutwise_pro_module.comparison_insights import ComparisonCategoryEvidence
 from scoutwise_pro_module.league_fit_verdict import weighted_verdict, VERDICT_LABELS
@@ -80,24 +81,34 @@ def league_fit_data(db, payload):
         raise HTTPException(status_code=422, detail='Position or minutes data unavailable')
     rows = db.execute(text('SELECT * FROM player_comp_data WHERE league_id = :league AND player_id <> :player'),
                       {'league': payload.leagueId, 'player': metadata.get('player_id')}).mappings().all()
+    groups = comparison_groups(roles)
     peers = defaultdict(list)
     for row in rows:
-        if set(eligible_roles(row)).intersection(roles):
-            peers[row['player_id']].append(row)
-    cohort = [competition_profile(records) for records in peers.values()
-              if sum(float((row.get('stats') or {}).get('minutes_played') or 0) * float(row.get('match_count') or 0) for row in records) >= 90]
+        peers[row['player_id']].append(row)
+    cohort = []
+    cohort_groups = set()
+    for records in peers.values():
+        if sum(float((row.get('stats') or {}).get('minutes_played') or 0)
+               * float(row.get('match_count') or 0) for row in records) < 90:
+            continue
+        peer_roles = eligible_roles({'position_counts': competition_position_counts(records)})
+        shared_groups = groups.keys() & {ROLE_GROUP.get(role, role) for role in peer_roles}
+        if shared_groups:
+            cohort.append(competition_profile(records))
+            cohort_groups.update(shared_groups)
     if not cohort:
         raise HTTPException(status_code=422, detail='No eligible league players')
     eligible_ids = {peer['player_id'] for peer in cohort}
     ages = [float(peer['age']) for peer in cohort if peer.get('age')]
+    compared_groups = comparison_role_groups(group for group in groups if group in cohort_groups)
     aggregate = {'id': f'league:{payload.leagueId}', 'content': {
         'league_name': league['league_name'], 'league_country_name': league['league_country_name'],
-        'league_image_path': league['league_image_path'], 'selected_positions': list(roles),
+        'league_image_path': league['league_image_path'], 'selected_positions': [role for group in compared_groups for role in group],
         'player_count': len(cohort),
         'team_count': len({row['team_id'] for row in rows if row['player_id'] in eligible_ids}),
         'age': round(sum(ages) / len(ages), 1) if ages else None,
     }}
-    return {'league': aggregate, 'roles': list(roles), 'playerName': candidate['player_name'],
+    return {'league': aggregate, 'roles': list(roles), 'comparedRoleGroups': compared_groups, 'playerName': candidate['player_name'],
             'candidate': {'id': str(payload.playerId), 'content': candidate},
             'cohort': [{'id': str(peer['player_id']), 'content': peer} for peer in cohort]}
 
@@ -129,7 +140,7 @@ def league_fit_insights(db, payload, language):
     lang = 'tr' if normalize_lang(language) == 'tr' else 'en'
     verdict = {'key': assessment['key'], 'label': VERDICT_LABELS[assessment['key']][lang]}
     output = league_fit_insight_model(payload.categories)
-    evidence = {'output_language': 'Turkish' if normalize_lang(language) == 'tr' else 'English', 'player': context['playerName'], 'league': context['league']['content']['league_name'], 'roles': context['roles'], 'cohortPlayers': context['league']['content']['player_count'], 'metric_value_order': ['candidate', 'positional league average'], 'categories': [c.model_dump() for c in payload.categories]}
+    evidence = {'output_language': 'Turkish' if normalize_lang(language) == 'tr' else 'English', 'player': context['playerName'], 'league': context['league']['content']['league_name'], 'roles': context['roles'], 'comparedRoleGroups': context['comparedRoleGroups'], 'cohortPlayers': context['league']['content']['player_count'], 'metric_value_order': ['candidate', 'positional league average'], 'categories': [c.model_dump() for c in payload.categories]}
     evidence['fixed_verdict'] = verdict
     evidence['internal_role_assessment'] = assessment
     evidence['discovery_context'] = payload.discoveryContext.model_dump() if payload.discoveryContext else None

@@ -2196,7 +2196,9 @@ def _derived_stat_value(metric: str, metadata: Dict[str, Any]) -> Optional[float
     return round((numerator / denominator) * 100.0, 2)
 
 
-def extract_allowed_stats_from_metadata(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+def extract_allowed_stats_from_metadata(
+    metadata: Dict[str, Any], *, include_rare_events: bool = False
+) -> List[Dict[str, Any]]:
     stats = []
     for metric in ALLOWED_METRICS:
         value = _num((metadata or {}).get(metric))
@@ -2204,15 +2206,15 @@ def extract_allowed_stats_from_metadata(metadata: Dict[str, Any]) -> List[Dict[s
             value = _derived_stat_value(metric, metadata or {})
         if value is None:
             continue
-        if abs(value) <= 0.05:
+        if abs(value) <= (0.0 if include_rare_events else 0.05):
             continue
         stats.append({"metric": metric, "value": value})
     return stats
 
 
-def doc_to_candidate(doc: Document, index: int) -> Dict[str, Any]:
+def doc_to_candidate(doc: Document, index: int, *, include_rare_events: bool = False) -> Dict[str, Any]:
     md = doc.metadata or {}
-    stats = extract_allowed_stats_from_metadata(md)
+    stats = extract_allowed_stats_from_metadata(md, include_rare_events=include_rare_events)
     age = _num(md.get("age"))
     position_counts = md.get("position_counts")
     position, constraint_position_names = metadata_position_signals(md)
@@ -2245,9 +2247,11 @@ def doc_to_candidate(doc: Document, index: int) -> Dict[str, Any]:
     }
 
 
-def _metadata_to_candidate(metadata: Dict[str, Any], index: int = 1, content: Optional[str] = None) -> Dict[str, Any]:
+def _metadata_to_candidate(
+    metadata: Dict[str, Any], index: int = 1, content: Optional[str] = None, *, include_rare_events: bool = False
+) -> Dict[str, Any]:
     doc = Document(page_content=content or "", metadata=metadata or {})
-    return doc_to_candidate(doc, index)
+    return doc_to_candidate(doc, index, include_rare_events=include_rare_events)
 
 
 def _lookup_tokens(name_norm: str) -> List[str]:

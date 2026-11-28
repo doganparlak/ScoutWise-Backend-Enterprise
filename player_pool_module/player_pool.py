@@ -144,6 +144,12 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
     for value in (candidate_choices or {}).get("league", []):
         parts = value.rsplit(" | ", 1)
         league_choices.append({"name": norm_name(parts[0]), "country": norm_name(parts[1]) if len(parts) == 2 else ""})
+    league_name_sql = f"REGEXP_REPLACE(TRIM({folded_text_sql('league_name')}), '[[:space:]]+', ' ', 'g')"
+    # Apply the indexable league-name constraint separately from country validation.
+    league_name_filter = (
+        f"AND {league_name_sql} = ANY(CAST(:choice_league_names AS text[]))"
+        if league_choices else ""
+    )
     context_league_sql = folded_text_sql("league_name").replace("metadata->>'league_name'", "choice_context.league_name")
     context_country_sql = folded_text_sql("league_country_name").replace("metadata->>'league_country_name'", "choice_context.league_country_name")
 
@@ -222,18 +228,8 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
             'eligibility_numeric_pattern': numeric_pattern,
         }
 
-    query = text(f"""
-        SELECT id, {content_sql} AS content, {image_sql} AS image_url
-        FROM {table_name}
-        {image_join}
-        {eligibility_join}
-        WHERE TRUE {eligibility_sql}
-          AND (
-                :name_q IS NULL
-                OR metadata->>'player_name' ILIKE :name_q
-                OR metadata->>'player_name_norm' ILIKE :name_norm_q
-                OR {folded_text_sql("player_name")} LIKE :name_folded_q
-              )
+    source_sql = table_name
+    candidate_role_filter = f"""
           AND (
                 CAST(:candidate_roles AS text[]) IS NULL
                 OR {"TRUE" if discovery_metric_names is not None else "FALSE"}
@@ -246,16 +242,56 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
                     WHERE {role_value_short_sql("discovery_role.value")} = ANY(CAST(:candidate_roles AS text[]))
                 )
               )
+    """
+    if candidate_roles and not world_cup_mode:
+        indexed_roles = db.execute(text("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_index
+                WHERE indexrelid = to_regclass('public.player_data_similarity_roles_gin_idx')
+                  AND indisvalid AND indisready
+            )
+        """)).scalar()
+        if indexed_roles:
+            indexed_match = "public.scoutwise_similarity_candidate_roles(metadata) && CAST(:candidate_roles AS text[])"
+            if discovery_metric_names is None:
+                candidate_role_filter = f"AND {indexed_match}"
+            else:
+                # Exact eligibility can also fall back to primary_position_code,
+                # which is outside the index expression. Keep those rows and
+                # leave the full role and coverage checks below in place.
+                source_sql = f"""(
+                    SELECT id, metadata FROM {table_name} WHERE {indexed_match}
+                    UNION ALL
+                    SELECT id, metadata FROM {table_name}
+                    WHERE UPPER(metadata->>'primary_position_code') = ANY(CAST(:candidate_roles AS text[]))
+                      AND NOT ({indexed_match})
+                ) discovery_role_candidates"""
+                candidate_role_filter = ""
+
+    query = text(f"""
+        SELECT id, {content_sql} AS content, {image_sql} AS image_url
+        FROM {source_sql}
+        {image_join}
+        {eligibility_join}
+        WHERE TRUE {eligibility_sql}
+          AND (
+                :name_q IS NULL
+                OR metadata->>'player_name' ILIKE :name_q
+                OR metadata->>'player_name_norm' ILIKE :name_norm_q
+                OR {folded_text_sql("player_name")} LIKE :name_folded_q
+              )
+          {candidate_role_filter}
+          {league_name_filter}
           AND (CAST(:choices_nationality AS text[]) IS NULL OR REGEXP_REPLACE(TRIM({folded_text_sql("nationality_name")}), '[[:space:]]+', ' ', 'g') = ANY(CAST(:choices_nationality AS text[])))
           AND (CAST(:choices_team AS text[]) IS NULL OR REGEXP_REPLACE(TRIM({folded_text_sql("team_name")}), '[[:space:]]+', ' ', 'g') = ANY(CAST(:choices_team AS text[])))
           AND (
               CAST(:choices_league AS jsonb) IS NULL
-              OR REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g') IN (
+              OR {league_name_sql} IN (
                   SELECT name FROM jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
                   WHERE country = ''
               )
               OR (
-                  REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g') IN (
+                  {league_name_sql} IN (
                       SELECT name FROM jsonb_to_recordset(CAST(:choices_league AS jsonb)) AS chosen_league(name text, country text)
                   )
                   AND EXISTS (
@@ -268,7 +304,7 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
                           WHEN COALESCE(metadata->>'player_id', '') ~ '^-?[0-9]+$'
                           THEN (metadata->>'player_id')::bigint ELSE NULL END
                         AND choice_context.player_id::text = COALESCE(metadata->>'player_id', '')
-                        AND REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g') = REGEXP_REPLACE(TRIM({folded_text_sql("league_name")}), '[[:space:]]+', ' ', 'g')
+                        AND REGEXP_REPLACE(TRIM({context_league_sql}), '[[:space:]]+', ' ', 'g') = {league_name_sql}
                       -- Keep the indexed per-player lookup; avoid a hashed subplan
                       -- that normalizes every player_comp_data row for each search.
                       OFFSET 0
@@ -417,6 +453,7 @@ def search_players(db: Session, filters: Dict[str, Any], *, all_matches: bool = 
             "candidate_roles": candidate_roles,
             **{f"choices_{key}": [norm_name(value) for value in (candidate_choices or {}).get(key, [])] or None for key in ("nationality", "team")},
             "choices_league": json.dumps(league_choices) if league_choices else None,
+            "choice_league_names": sorted({choice["name"] for choice in league_choices}),
             "nationality": nationality,
             "nationality_folded_q": f"%{nationality_norm}%" if nationality_norm else None,
             "league": league,
@@ -482,8 +519,31 @@ def fetch_player_rows_by_ids(db: Session, player_ids: List[int]) -> List[Dict[st
     return _player_rows(rows)
 
 
-def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) -> Dict[str, Any]:
+def get_player_pool_filter_options(
+    db: Session, world_cup_mode: bool = False, *, include_positions: bool = True,
+    team_nationality_only: bool = False
+) -> Dict[str, Any]:
     table_name = player_pool_table(world_cup_mode)
+
+    if team_nationality_only:
+        choices = db.execute(text(f"""
+            SELECT ARRAY_AGG(DISTINCT team ORDER BY team)
+                       FILTER (WHERE team <> '') AS teams,
+                   ARRAY_AGG(DISTINCT nationality ORDER BY nationality)
+                       FILTER (WHERE nationality <> '') AS nationalities
+            FROM (
+                SELECT metadata->>'team_name' AS team,
+                       metadata->>'nationality_name' AS nationality
+                FROM {table_name}
+            ) identity_options
+        """)).mappings().one()
+        return {
+            "teams": choices["teams"] or [],
+            "nationalities": choices["nationalities"] or [],
+            "leagues": [],
+            "positions": [],
+            "teamsByLeague": {},
+        }
 
     def distinct_metadata_values(field_name: str) -> List[str]:
         rows = db.execute(text(f"""
@@ -494,26 +554,28 @@ def get_player_pool_filter_options(db: Session, world_cup_mode: bool = False) ->
         """)).scalars().all()
         return [value for value in rows if value]
 
-    position_rows = db.execute(text(f"""
-        SELECT DISTINCT value
-        FROM (
-            SELECT metadata->>'position_name' AS value
-            FROM {table_name}
-            WHERE COALESCE(metadata->>'position_name', '') <> ''
-            UNION
-            SELECT seen_position.value AS value
-            FROM {table_name}
-            CROSS JOIN LATERAL jsonb_array_elements_text(
-                CASE
-                    WHEN jsonb_typeof(metadata->'position_names_seen') = 'array'
-                    THEN metadata->'position_names_seen'
-                    ELSE '[]'::jsonb
-                END
-            ) AS seen_position(value)
-            WHERE COALESCE(seen_position.value, '') <> ''
-        ) positions
-        ORDER BY value
-    """)).scalars().all()
+    position_rows = []
+    if include_positions:
+        position_rows = db.execute(text(f"""
+            SELECT DISTINCT value
+            FROM (
+                SELECT metadata->>'position_name' AS value
+                FROM {table_name}
+                WHERE COALESCE(metadata->>'position_name', '') <> ''
+                UNION
+                SELECT seen_position.value AS value
+                FROM {table_name}
+                CROSS JOIN LATERAL jsonb_array_elements_text(
+                    CASE
+                        WHEN jsonb_typeof(metadata->'position_names_seen') = 'array'
+                        THEN metadata->'position_names_seen'
+                        ELSE '[]'::jsonb
+                    END
+                ) AS seen_position(value)
+                WHERE COALESCE(seen_position.value, '') <> ''
+            ) positions
+            ORDER BY value
+        """)).scalars().all()
 
     league_options = distinct_metadata_values("league_name")
     if not world_cup_mode:

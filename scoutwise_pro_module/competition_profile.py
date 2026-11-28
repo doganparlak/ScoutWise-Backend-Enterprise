@@ -6,17 +6,23 @@ from sqlalchemy import text
 from report_module.rate_evidence import apply_merged_rates
 
 
+def competition_position_counts(rows):
+    positions = defaultdict(float)
+    for row in rows:
+        for role, count in (row.get('position_counts') or {}).items():
+            positions[role] += float(count or 0)
+    return dict(positions)
+
+
 def competition_profile(rows):
     """Merge team records within one competition, weighted by appearances."""
     first = rows[0]
     result = {key: first.get(key) for key in
               ('player_id', 'player_name', 'team_name', 'league_name', 'age', 'height', 'weight')}
     result['match_count'] = sum(float(row.get('match_count') or 0) for row in rows)
-    totals, weights, positions = defaultdict(float), defaultdict(float), defaultdict(float)
+    totals, weights = defaultdict(float), defaultdict(float)
     for row in rows:
         weight = float(row.get('match_count') or 0)
-        for role, count in (row.get('position_counts') or {}).items():
-            positions[role] += float(count or 0)
         for metric, value in (row.get('stats') or {}).items():
             try:
                 numeric = float(value)
@@ -26,7 +32,7 @@ def competition_profile(rows):
                 totals[metric] += numeric * weight
                 weights[metric] += weight
     result.update({key: totals[key] / weights[key] for key in totals})
-    result['position_counts'] = dict(positions)
+    result['position_counts'] = competition_position_counts(rows)
     apply_merged_rates(result, [row.get('stats') or {} for row in rows],
                        [float(row.get('match_count') or 0) for row in rows])
     return result

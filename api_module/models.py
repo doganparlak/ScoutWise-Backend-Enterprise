@@ -349,6 +349,8 @@ class PlayerCompSeasonCandidateOut(BaseModel):
     nationality: str = ""
     latestTeam: str = ""
     latestPosition: str = ""
+    latestRole: str = ""
+    latestAge: Optional[int] = None
     latestSeason: str = ""
     firstSeason: str = ""
     rowCount: int = 0
@@ -379,6 +381,7 @@ class PlayerCompSeasonRowOut(BaseModel):
     seasonId: int
     seasonName: str = ""
     matchCount: int = 0
+    minutes: float | None = None
     positionName: str = ""
     positionCounts: Dict[str, float] = Field(default_factory=dict)
     age: Optional[int] = None
@@ -402,6 +405,11 @@ class PlayerCompSeasonAggregateIn(BaseModel):
     sources: List[PlayerCompSeasonSourceIn] = Field(min_length=1, max_length=200)
 
 
+class PlayerCompSeasonMetricDisplayOut(BaseModel):
+    total: Optional[float] = None
+    per90: Optional[float] = None
+
+
 class PlayerCompSeasonAggregateOut(BaseModel):
     playerId: int
     displayName: str
@@ -417,6 +425,7 @@ class PlayerCompSeasonAggregateOut(BaseModel):
     competitions: List[str] = Field(default_factory=list)
     positionCounts: Dict[str, float] = Field(default_factory=dict)
     stats: Dict[str, float] = Field(default_factory=dict)
+    metricDisplay: Dict[str, PlayerCompSeasonMetricDisplayOut] = Field(default_factory=dict)
     selectedRows: List[PlayerCompSeasonRowOut] = Field(default_factory=list)
 
 
@@ -587,6 +596,14 @@ class LeagueInsightsIn(BaseModel):
     scope: Literal["qualifying", "league", "knockout", "overall"] | None = None
 
 
+class LeagueSavedViewIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=r"\S")
+    tab: Literal["teams", "players"]
+    preset: Literal["standings", "general", "attack", "defense", "passing", "xg"]
+    columns: list[str] | None = Field(default=None, max_length=14)
+    mode: Literal["total", "perMatch", "per90"]
+
+
 class LeaguePlayerRankingsIn(BaseModel):
     periodStart: CalendarDate | None = None
     leagueId: int = Field(ge=1)
@@ -594,6 +611,14 @@ class LeaguePlayerRankingsIn(BaseModel):
     scope: Literal["qualifying", "league", "knockout", "overall"] | None = None
     metric: str = Field(default="Rating", min_length=1, max_length=100)
     mode: Literal["total", "perMatch", "per90"] = "total"
+    preset: Literal["general", "attack", "defense"] | None = None
+    columns: list[str] | None = Field(default=None, min_length=1, max_length=14)
+    teamId: int | None = Field(default=None, ge=1)
+    query: str = Field(default="", max_length=100)
+    cellContext: bool = False
+    averages: bool = False
+    standouts: bool = False
+    exportRows: bool = False
     direction: Literal["asc", "desc"] | None = None
     offset: int = Field(default=0, ge=0, le=100000)
-    limit: int = Field(default=50, ge=1, le=100)
+    limit: int = Field(default=50, ge=1, le=500)

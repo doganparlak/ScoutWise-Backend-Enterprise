@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from report_module.analysis_quality import generate_grounded
+from report_module.position_groups import ROLE_GROUP, comparison_role_groups
 from report_module.rate_evidence import apply_merged_rates, RATES, key as rate_key, missing_attempt_names
 from report_module.metric_validation import pooled_rate_counts
 
@@ -129,22 +130,12 @@ def eligible_roles(metadata):
     return {key: round(value, 2) for key, value in shares[:2] if shares[0][1] - value <= 20 + 1e-8}
 
 
-ALTERNATIVE_PEER_ROLES = {
-    'RM': {'LM', 'LW'}, 'RW': {'LM', 'LW'},
-    'LM': {'RM', 'RW'}, 'LW': {'RM', 'RW'},
-    'RB': {'LB'}, 'LB': {'RB'},
-    'CDM': {'CM'}, 'CAM': {'CM'},
-}
-
-
 def select_team_peers(roles, candidates):
-    """Only broaden the cohort when no usable exact-role peer exists."""
-    usable = [peer for peer in candidates if peer['name'] and peer['common_metrics']]
-    exact = [peer for peer in usable if set(roles).intersection(peer['roles'])]
-    if exact:
-        return exact
-    alternatives = set().union(*(ALTERNATIVE_PEER_ROLES.get(role, set()) for role in roles))
-    return [peer for peer in usable if alternatives.intersection(peer['roles'])]
+    """Match eligible candidate and peer roles through the portal position groups."""
+    groups = {ROLE_GROUP.get(role, role) for role in roles}
+    return [peer for peer in candidates
+            if peer['name'] and peer['common_metrics']
+            and groups.intersection(ROLE_GROUP.get(role, role) for role in peer['roles'])]
 
 
 def rate(name):
@@ -608,4 +599,7 @@ CLASSIFICATION FOR THIS ASSESSMENT: fixed_verdict is null. Choose exactly one ve
     if verdict is None:
         verdict = {'key': result.verdict.key, 'label': VERDICT_LABELS[result.verdict.key]['tr' if lang == 'tr' else 'en']}
     response['insights']['verdict'] = verdict
+    peer_groups = {ROLE_GROUP.get(role, role) for role in benchmark_roles}
+    candidate_groups = dict.fromkeys(ROLE_GROUP.get(role, role) for role in roles)
+    response['comparedRoleGroups'] = comparison_role_groups(group for group in candidate_groups if group in peer_groups)
     return response

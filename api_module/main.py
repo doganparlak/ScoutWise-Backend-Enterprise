@@ -52,6 +52,7 @@ from api_module.models import (
     LeagueStandingsOut,
     LeagueInsightsIn,
     LeaguePlayerRankingsIn,
+    LeagueSavedViewIn,
     MatchAnalysisOptionsIn,
     MatchAnalysisOptionsOut,
     MatchAnalysisSearchIn,
@@ -136,7 +137,7 @@ from player_comp_season_module import (
 from tactic_board_module.tactic_board import create_tactic_board, delete_tactic_board, list_tactic_boards, update_tactic_board, search_tactic_teams
 from potential_form_module.form import reveal_player_form
 from potential_form_module.potential import reveal_player_potential
-from report_module.report import generate_report_content
+from report_module.report import generate_report_content, with_scouting_phase_evidence
 from chatbot_module.tools_agentic import ensure_player_position_label_cache
 from scoutwise_pro_module.pro import (
     delete_named_strategy,
@@ -690,7 +691,7 @@ def get_enterprise_dashboard_report(
         "favorite_player_id": str(row.get("cache_key") or row["id"]),
         "status": row["status"],
         "content": row["content"],
-        "content_json": sanitize_percentages(normalize_crossing_metrics(content_json)),
+        "content_json": with_scouting_phase_evidence(sanitize_percentages(normalize_crossing_metrics(content_json))),
         "language": row.get("language") or "en",
         "version": int(row.get("version") or 1),
     }
@@ -779,7 +780,7 @@ def pro_strategies_delete(
 
 
 @app.get("/scouting-reports/players/{player_id}/percentiles")
-def enterprise_report_player_percentiles(player_id: int, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+def enterprise_report_player_percentiles(player_id: int, include_scopes: bool = False, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     """Refresh modal benchmarks by provider identity without regenerating AI text."""
     if player_id <= 0:
         raise HTTPException(status_code=422, detail="Invalid player ID")
@@ -789,7 +790,7 @@ def enterprise_report_player_percentiles(player_id: int, user_id: str = Depends(
                     THEN trunc((metadata->>'player_id')::numeric)::text
                     ELSE NULL END) = CAST(:player_id AS text) LIMIT 1"""),
         {'player_id': player_id}).scalar()
-    return build_domestic_percentiles(db, metadata or {'player_id': player_id})
+    return build_domestic_percentiles(db, metadata or {'player_id': player_id}, include_scopes=include_scopes)
 
 
 @app.get("/pro/players/{player_id}/percentiles")
@@ -854,7 +855,7 @@ def pro_comparison_insights(
     accept_language: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    return get_comparison_insights(db, payload, accept_language)
+    return get_comparison_insights(db, payload, accept_language, user_id=user_id)
 
 
 @app.post("/pro/chat")
@@ -2033,11 +2034,15 @@ def player_pool_matchup_sources(
 @app.get("/player-pool/options", response_model=PlayerPoolFilterOptionsOut)
 def player_pool_options(
     worldCupMode: bool = FastAPIQuery(False),
+    includePositions: bool = FastAPIQuery(True),
+    teamNationalityOnly: bool = FastAPIQuery(False),
     user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
     del user_id
-    return get_player_pool_filter_options(db, worldCupMode)
+    return get_player_pool_filter_options(
+        db, worldCupMode, include_positions=includePositions, team_nationality_only=teamNationalityOnly,
+    )
 
 
 @app.post(
@@ -2817,6 +2822,17 @@ def enterprise_pre_match_player_comparison(favorite_id: uuid.UUID, user_id: str 
     if not changed:
         raise HTTPException(status_code=409, detail='The report changed; reopen it to compare players')
     return result
+
+
+@app.get("/favorite-matches/{favorite_id}/player-match-percentiles")
+def enterprise_post_match_player_percentiles(favorite_id: uuid.UUID, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from match_report_module.player_percentiles import match_player_percentiles
+    row = db.execute(text("""SELECT report_content,fixture_payload FROM enterprise_favorite_matches
+        WHERE id=:id AND user_id=:uid AND report_type='post_match' AND report_status='ready' AND report_content IS NOT NULL"""),
+        {'id': str(favorite_id), 'uid': user_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail='Saved post-match report not found')
+    return match_player_percentiles(db, row['report_content'], row['fixture_payload'] or {})
 
 
 def upgrade_saved_pre_match_score_flow(db, report_id, user_id, content):
@@ -3719,7 +3735,7 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
                     "favorite_player_id": outward_favorite_id,
                     "status": row["status"],
                     "content": row["content"],
-                    "content_json": sanitize_percentages(row["content_json"]),
+                    "content_json": with_scouting_phase_evidence(sanitize_percentages(row["content_json"])),
                     "language": row["language"],
                     "version": row["version"],
                 }
@@ -3728,7 +3744,7 @@ def _get_or_create_enterprise_player_pool_report_from_payload(
                 "favorite_player_id": outward_favorite_id,
                 "status": row["status"],
                 "content": row["content"],
-                "content_json": sanitize_percentages(row["content_json"]),
+                "content_json": with_scouting_phase_evidence(sanitize_percentages(row["content_json"])),
                 "language": row["language"],
                 "version": row["version"],
             }
@@ -3998,12 +4014,39 @@ def league_insights(payload: LeagueInsightsIn, user_id: str = Depends(require_au
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/league-saved-views")
+def league_saved_views(user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from standings_module.saved_views import list_views
+    return list_views(db, user_id)
+
+
+@app.post("/league-saved-views")
+def save_league_view(payload: LeagueSavedViewIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from standings_module.saved_views import save_view
+    try:
+        return save_view(db, user_id, payload.name.strip(), payload.model_dump(exclude={'name'}))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/league-saved-views/{view_id}")
+def delete_league_view(view_id: uuid.UUID, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    from standings_module.saved_views import delete_view
+    delete_view(db, user_id, view_id)
+    return {"ok": True}
+
+
 @app.post("/league-player-rankings")
 def league_player_rankings(payload: LeaguePlayerRankingsIn, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
     from standings_module.player_rankings import request_rankings
+    if payload.limit > 100 and not (payload.exportRows and payload.preset):
+        raise HTTPException(status_code=422, detail="Ranking page limit is 100")
     try:
         return request_rankings(db, payload.leagueId, payload.seasonId, payload.scope,
-                                payload.metric, payload.mode, payload.direction, payload.offset, payload.limit, payload.periodStart)
+                                payload.metric, payload.mode, payload.direction, payload.offset, payload.limit, payload.periodStart,
+                                preset=payload.preset, team_id=payload.teamId, columns=payload.columns,
+                                query=payload.query, cell_context=payload.cellContext, averages=payload.averages,
+                                standouts=payload.standouts, export_rows=payload.exportRows)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import unicodedata
+from bisect import bisect_left, bisect_right
 from threading import Lock
 from datetime import datetime
 from sqlalchemy import text
@@ -89,7 +91,65 @@ def save_snapshot(db, job, scope, aggregate, source_computed_at=None, period_awa
          'payload': json.dumps({**snapshot(aggregate), 'period_awards': period_awards or {}}, allow_nan=False)})
 
 
-def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0, limit=50):
+PLAYER_PRESETS = {
+    'general': ('Rating', 'Goals', 'Assists', 'Key Passes', 'Tackles', 'Interceptions'),
+    'attack': ('Goals', 'Expected Goals', 'Assists', 'Shots Total', 'Shots On Target', 'Big Chances Created'),
+    'defense': ('Tackles', 'Interceptions', 'Ball Recovery', 'Clearances', 'Aerials Won'),
+}
+
+
+def preset_page(payload, preset, metric, direction, offset, limit, team_id, column_keys=None, *, mode="per90", query="", cell_context=False, averages=False, standouts=False):
+    catalog = {item['key']: item for item in payload['metric_catalog'] if item['key'] != 'Match Count'}
+    defaults = [key for key in PLAYER_PRESETS[preset] if key in catalog]
+    keys = [key for key in dict.fromkeys(column_keys or defaults) if key in catalog] or defaults
+    columns = [catalog[key] for key in keys]
+    if not columns:
+        return {'metric_catalog': payload['metric_catalog'], 'columns': [], 'defaultColumns': defaults, 'rows': [],
+                'total': 0, 'offset': offset, 'limit': limit}
+    if metric not in {column['key'] for column in columns}:
+        metric, direction = columns[0]['key'], None
+    def normalize(value):
+        return ''.join(char for char in unicodedata.normalize('NFKD', value.casefold().replace('ı', 'i'))
+                       if not unicodedata.combining(char))
+
+    search = normalize(query.strip())
+    field = {'total': 'value', 'perMatch': 'perMatch', 'per90': 'per90'}[mode]
+    universe = payload['players']
+    players = [player for player in universe if (team_id is None or player['teamId'] == team_id)
+               and (not search or search in normalize(f"{player['name']} {player['teamName']}"))]
+    page = ranked_page({**payload, 'players': players}, metric, mode, direction, offset, limit, include_zero=True)
+    page.update(columns=columns, defaultColumns=defaults)
+    metrics_by_player = {(player['playerId'], player['teamId']): player['metrics'] for player in players}
+    distributions = {}
+    if cell_context or averages:
+        for column in columns:
+            key = column['key']
+            distributions[key] = sorted(value for player in universe
+                                        if (value := player['metrics'].get(key, {}).get(field)) is not None)
+    if averages:
+        page['averages'] = {key: sum(values) / len(values) for key, values in distributions.items() if values}
+    for row in page['rows']:
+        samples = metrics_by_player[row['playerId'], row['teamId']]
+        row['presetValues'] = {key: samples.get(key, {}).get(field) for key in keys}
+        if cell_context:
+            row['metricContext'] = {}
+            for column in columns:
+                key = column['key']
+                value, values = row['presetValues'][key], distributions[key]
+                if value is None or not values:
+                    continue
+                left, right = bisect_left(values, value), bisect_right(values, value)
+                better = left if column['direction'] == 'asc' else len(values) - right
+                weaker = len(values) - right if column['direction'] == 'asc' else left
+                row['metricContext'][key] = {'rank': better + 1, 'percentile': round(100 * (weaker + (right - left) / 2) / len(values))}
+    if standouts:
+        leaders = ranked_page(payload, metric, mode, None, 0, 3, include_zero=True, standout_team=team_id)
+        page['standouts'] = {'leaders': leaders['rows'], 'clubBest': leaders.get('clubBest')}
+
+    return page
+
+
+def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0, limit=50, *, include_zero=False, standout_team=None):
     catalog = [item for item in payload['metric_catalog'] if item['key'] != 'Match Count']
     selected = next((m for m in catalog if m['key'] == metric), None)
     if selected is None:
@@ -98,34 +158,54 @@ def ranked_page(payload, metric='Rating', mode='total', direction=None, offset=0
     field = {'total': 'value', 'perMatch': 'perMatch', 'per90': 'per90'}[mode]
     eligible = [(p['metrics'][metric][field], p, p['metrics'][metric]) for p in payload['players']
                 if metric in p['metrics'] and (value := p['metrics'][metric].get(field)) is not None
-                and round(value, 4) != 0]
+                and (include_zero or round(value, 4) != 0)]
     eligible.sort(key=lambda item: (item[0] if direction == 'asc' else -item[0],
                                    -item[2]['matchesCovered'], -item[1]['minutes'], item[1]['playerId'], item[1]['teamId']))
     rows = []
     previous = None
+    club_best = None
     rank = 0
     for index, (value, player, evidence) in enumerate(eligible):
         if previous is None or value != previous:
             rank = index + 1
         previous = value
-        if offset <= index < offset + limit:
+        on_page = offset <= index < offset + limit
+        is_club_best = standout_team is not None and club_best is None and player['teamId'] == standout_team
+        if on_page or is_club_best:
             row = {k: v for k, v in player.items() if k != 'metrics'}
             row.update(position=rank, awardMetric=metric, awardValue=round(value, 4), awardMode='total' if metric in PLAYER_CONTEXT_METRICS else mode,
                        awardUnit=selected['unit'], awardMatchesCovered=evidence['matchesCovered'],
                        awardMinutesCovered=evidence.get('minutesCovered'))
             if 'denominator' in evidence:
                 row.update(awardNumerator=evidence['numerator'], awardDenominator=evidence['denominator'])
-            rows.append(row)
+            if on_page:
+                rows.append(row)
+            if is_club_best:
+                club_best = row
+        if index + 1 >= offset + limit and (standout_team is None or club_best is not None):
+            break
     return {'metric_catalog': catalog, 'metric': selected, 'rows': rows,
-            'total': len(eligible), 'offset': offset, 'limit': limit, 'direction': direction, 'mode': mode}
+            'total': len(eligible), 'offset': offset, 'limit': limit, 'direction': direction, 'mode': mode, 'clubBest': club_best}
 
 
-def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode='total', direction=None, offset=0, limit=50, period_start=None):
+def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode='total', direction=None, offset=0, limit=50, period_start=None, *, preset=None, team_id=None, columns=None, query="", cell_context=False, averages=False, standouts=False, export_rows=False):
     # Schema is initialized at startup/migration time, never during a read request.
     scope = scope or ('league' if league_id in EUROPEAN_LEAGUES else 'overall')
     if scope not in SCOPES or (league_id not in EUROPEAN_LEAGUES and scope != 'overall'):
         raise ValueError('Invalid competition scope')
     params = {'league': league_id, 'season': season_id, 'scope': scope, 'version': CACHE_VERSION}
+    if preset:
+        current = db.execute(text("""SELECT ranks.payload, ranks.source_computed_at, summary.status
+            FROM enterprise_league_player_rankings ranks
+            JOIN league_season_summaries summary USING (league_id, season_id)
+            WHERE ranks.league_id=:league AND ranks.season_id=:season AND ranks.scope=:scope
+              AND ranks.calculation_version=:version AND ranks.source_computed_at=summary.computed_at"""),
+            params).mappings().first()
+        if current is not None:
+            page = preset_page(current['payload'], preset, metric, direction, offset, limit, team_id, columns,
+                               mode=mode, query=query, cell_context=cell_context, averages=averages, standouts=standouts)
+            page.update(season_winner=None, biweekly_winner=None, source_computed_at=current['source_computed_at'].isoformat())
+            return finalize_page(db, page, scope, current['status'], None, export_rows)
     summary = db.execute(text('''SELECT computed_at,status,(SELECT COALESCE(jsonb_agg(jsonb_build_object(
                 'period_start',p->'period_start','period_end',p->'period_end',
                 'fixture_count',p->'fixture_count','status',COALESCE(p->'status','"ready"'::jsonb),
@@ -187,40 +267,60 @@ def request_rankings(db, league_id, season_id, scope=None, metric='Rating', mode
         db.commit()
         saved = db.execute(text('''SELECT source_computed_at FROM enterprise_league_player_rankings
             WHERE league_id=:league AND season_id=:season AND scope=:scope'''), params).mappings().one()
-    if league_id in EUROPEAN_LEAGUES:
-        periods = summary['scoped_periods'] or []
-    else:
-        periods = db.execute(text("""SELECT period_start,period_end,fixture_count,status,computed_at
-            FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season"""), params).mappings().all()
-    _, chosen = select_completed_periods(periods, period_start)
-    # Snapshot values are normalized once in Supabase; return only this page.
-    with benchmark_engine.begin() as ranking_db:
-        ready = ranking_db.execute(text("SELECT public.scoutwise_ensure_league_rank_rows_v1(:league,:season,:scope)"), params).scalar_one()
-        if not ready:
+    chosen = None
+    if preset:
+        saved_payload = db.execute(text("""SELECT payload, source_computed_at FROM enterprise_league_player_rankings
+            WHERE league_id=:league AND season_id=:season AND scope=:scope"""), params).mappings().first()
+        if saved_payload is None:
             return empty
-        page = ranking_db.execute(text("""SELECT public.scoutwise_league_player_page_v1(
-            :league,:season,:scope,:metric,:mode,:direction,:offset,:limit,:period)"""),
-            {**params, 'metric': metric, 'mode': mode, 'direction': direction, 'offset': offset,
-             'limit': limit, 'period': chosen.isoformat() if chosen else None}).scalar_one()
+        snapshot_payload = saved_payload['payload']
+        page = preset_page(snapshot_payload, preset, metric, direction, offset, limit, team_id, columns,
+                           mode=mode, query=query, cell_context=cell_context, averages=averages, standouts=standouts)
+        page['season_winner'] = None
+        page['biweekly_winner'] = None
+        page['source_computed_at'] = saved_payload['source_computed_at'].isoformat()
+    else:
+        if league_id in EUROPEAN_LEAGUES:
+            periods = summary['scoped_periods'] or []
+        else:
+            periods = db.execute(text("""SELECT period_start,period_end,fixture_count,status,computed_at
+                FROM league_biweekly_summaries WHERE league_id=:league AND season_id=:season"""), params).mappings().all()
+        _, chosen = select_completed_periods(periods, period_start)
+        # Snapshot values are normalized once in Supabase; return only this page.
+        with benchmark_engine.begin() as ranking_db:
+            ready = ranking_db.execute(text("SELECT public.scoutwise_ensure_league_rank_rows_v1(:league,:season,:scope)"), params).scalar_one()
+            if not ready:
+                return empty
+            page = ranking_db.execute(text("""SELECT public.scoutwise_league_player_page_v1(
+                :league,:season,:scope,:metric,:mode,:direction,:offset,:limit,:period)"""),
+                {**params, 'metric': metric, 'mode': mode, 'direction': direction, 'offset': offset,
+                 'limit': limit, 'period': chosen.isoformat() if chosen else None}).scalar_one()
     if page.get('error') == 'unsupported_metric':
         raise ValueError('Unsupported player metric for this league')
     if page.get('error'):
         return empty
+    return finalize_page(db, page, scope, summary['status'], chosen, export_rows and bool(preset))
+
+
+def finalize_page(db, page, scope, summary_status, chosen, export_rows):
     season_winner = page.pop('season_winner')
     biweekly_winner = page.pop('biweekly_winner')
     source_computed_at = datetime.fromisoformat(page.pop('source_computed_at'))
     players = [*page['rows'], *([season_winner] if season_winner else []), *([biweekly_winner] if biweekly_winner else [])]
-    ids = list({p['playerId'] for p in players})
-    if ids:
-        images = dict(db.execute(text('''SELECT player_id,image_url FROM enterprise_player_images
-            WHERE player_id=ANY(CAST(:ids AS bigint[])) AND image_status='available' AND image_url IS NOT NULL'''), {'ids': ids}).all())
+    if export_rows:
+        players = []
+    if players:
+        ids = {p['playerId'] for p in players}
+        team_ids = {p['teamId'] for p in players}
+        images = {(kind, entity_id): url for kind, entity_id, url in db.execute(text("""
+            SELECT 'player', player_id, image_url FROM enterprise_player_images
+            WHERE player_id=ANY(CAST(:ids AS bigint[])) AND image_status='available' AND image_url IS NOT NULL
+            UNION ALL
+            SELECT 'team', team_id, image_url FROM enterprise_team_images
+            WHERE team_id=ANY(CAST(:teams AS bigint[])) AND image_status='available' AND image_url IS NOT NULL
+        """), {'ids': list(ids), 'teams': list(team_ids)}).all()}
         for player in players:
-            player['imageUrl'] = images.get(player['playerId']) or player.get('imageUrl')
-    team_ids = list({p['teamId'] for p in players})
-    if team_ids:
-        logos = dict(db.execute(text('''SELECT team_id,image_url FROM enterprise_team_images
-            WHERE team_id=ANY(CAST(:ids AS bigint[])) AND image_status='available' AND image_url IS NOT NULL'''), {'ids': team_ids}).all())
-        for player in players:
-            player['teamImageUrl'] = logos.get(player['teamId'])
-    return {**page, 'season_winner': season_winner, 'biweekly_winner': biweekly_winner, 'selectedPeriodStart': chosen, 'status': 'ready', 'refreshing': summary['status'] in {'pending', 'processing'},
+            player['imageUrl'] = images.get(('player', player['playerId'])) or player.get('imageUrl')
+            player['teamImageUrl'] = images.get(('team', player['teamId']))
+    return {**page, 'season_winner': season_winner, 'biweekly_winner': biweekly_winner, 'selectedPeriodStart': chosen, 'status': 'ready', 'refreshing': summary_status in {'pending', 'processing'},
             'computed_at': source_computed_at, 'scope': scope}

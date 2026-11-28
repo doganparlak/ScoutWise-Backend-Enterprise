@@ -4,6 +4,7 @@ No metric is zero-filled. A player's league stints are combined before rates
 are derived. Percentiles use equal player weights, tied midranks, and the same
 300-minute and top-two/20-percentage-point position rules on both sides.
 """
+from report_module.position_groups import ROLE_GROUP, comparison_groups
 from report_module.rate_evidence import apply_merged_rates, key as rate_key, rate_value
 import json
 from bisect import bisect_left, bisect_right
@@ -19,30 +20,6 @@ from scoutwise_pro_module.team_fit import eligible_roles
 MIN_MINUTES = 300
 MIN_PEERS = 5
 BENCHMARK_VERSION = 11
-POSITION_GROUPS = {
-    'central_midfield': ('CDM', 'CM', 'CAM'),
-    'full_back': ('LB', 'RB'),
-    'centre_back': ('CB',),
-    'goalkeeper': ('GK',),
-    'centre_forward': ('CF',),
-    'wide': ('LM', 'RM', 'LW', 'RW'),
-}
-ROLE_GROUP = {role: group for group, roles in POSITION_GROUPS.items() for role in roles}
-
-
-def comparison_groups(roles):
-    """Map already eligible top-two roles to unique groups, in usage order.
-
-    Eligibility is decided BEFORE grouping. Two roles in one family cannot
-    promote an otherwise ineligible secondary role. Unspecified roles retain
-    their own benchmark rather than silently joining an unrelated family.
-    """
-    groups = {}
-    for role, share in roles.items():
-        group = ROLE_GROUP.get(role, role)
-        entry = groups.setdefault(group, {'roles': list(POSITION_GROUPS.get(group, (role,))), 'playerRoles': {}})
-        entry['playerRoles'][role] = share
-    return groups
 
 # Explicit source mappings avoid guessing formulas from display labels.
 COUNTS = {
@@ -216,18 +193,36 @@ def profile_benchmarks(source, peers, groups=None):
     return benchmarks
 
 
-def build_domestic_percentiles(db, metadata):
+def latest_domestic_scope(db, player_id, team_id, league_name):
+    if not team_id:
+        return None
+    league_id = db.execute(text("""
+        SELECT league_id
+        FROM player_comp_season_data
+        WHERE player_id = :player_id AND team_id = :team_id
+          AND league_type = 'league' AND league_sub_type = 'domestic'
+        ORDER BY season_id DESC NULLS LAST,
+          (LOWER(BTRIM(league_name)) = :league_name) DESC NULLS LAST,
+          updated_at DESC NULLS LAST, league_id
+        LIMIT 1
+    """), {'player_id': player_id, 'team_id': team_id, 'league_name': league_name}).scalar()
+    return f'team:{league_id}:{team_id}' if league_id is not None else None
+
+
+def build_domestic_percentiles(db, metadata, *, include_scopes=False):
     start = perf_counter()
     player_id = number(metadata.get('player_id'))
     if not player_id:
         return {'version': BENCHMARK_VERSION, 'competitions': [], 'computationMs': 0}
-    rows = db.execute(text("""SELECT player_id, team_id, team_name, league_id, league_name, league_image_path,
-        gender, match_count, position_counts, stats
+    all_rows = db.execute(text("""SELECT player_id, team_id, team_name, league_id, league_name, league_image_path,
+        league_type, league_sub_type, gender, match_count, position_counts, stats
         FROM player_comp_data
-        WHERE league_type = 'league' AND league_sub_type = 'domestic'
-          AND player_id = :player_id ORDER BY league_id, team_id"""), {'player_id': int(player_id)}).mappings().all()
+        WHERE player_id = :player_id
+          AND (:include_scopes OR (league_type = 'league' AND league_sub_type = 'domestic'))
+        ORDER BY league_id, team_id"""), {'player_id': int(player_id), 'include_scopes': include_scopes}).mappings().all()
+    rows = [row for row in all_rows if row['league_type'] == 'league' and row['league_sub_type'] == 'domestic']
     league_ids = list({row['league_id'] for row in rows})
-    if not league_ids:
+    if not league_ids and not include_scopes:
         return {'version': BENCHMARK_VERSION, 'competitions': [], 'computationMs': round((perf_counter()-start)*1000, 2)}
     # Only the selected player's stints are materialized in backend RAM.
     grouped = defaultdict(list)
@@ -246,6 +241,23 @@ def build_domestic_percentiles(db, metadata):
         return benchmark_targets[key]
 
     competitions = []
+    scopes = []
+    preferred_scope = None
+
+    def add_scope(source, rows, team_id=None):
+        if not include_scopes or not source:
+            return
+        first = rows[0]
+        scopes.append({
+            'leagueId': first['league_id'], 'leagueName': first['league_name'],
+            'leagueLogoUrl': next((row['league_image_path'] for row in rows if row['league_image_path']), None),
+            **({'teamId': team_id} if team_id is not None else {}),
+            'teams': list(dict.fromkeys(row['team_name'] for row in rows if row['team_name'])),
+            'matches': source['matches'], 'minutes': source['minutes'],
+            'metrics': {name: {key: metric[key] for key in ('value', 'basis', 'lowerIsBetter')}
+                        for name, metric in source['metrics'].items()},
+        })
+
     for league_id in sorted(league_ids):
         own_rows = [r for r in rows if r['league_id'] == league_id]
         genders = {r['gender'] for r in own_rows}
@@ -255,6 +267,8 @@ def build_domestic_percentiles(db, metadata):
         source = profiles.get((league_id, int(player_id), gender))
         if not source:
             continue
+        if len({row['team_id'] for row in own_rows}) > 1:
+            add_scope(source, own_rows)
         role_metrics = collect_benchmarks(source, league_id)
         competitions.append({'leagueId': league_id, 'leagueName': own_rows[0]['league_name'],
             'leagueLogoUrl': next((r.get('league_image_path') for r in own_rows if r.get('league_image_path')), None),
@@ -266,6 +280,7 @@ def build_domestic_percentiles(db, metadata):
     # cohort deduplicated, replacing this player's pooled profile with the
     # selected stint exactly once. Peers remain league-wide, not club-only.
     team_competitions = []
+    domestic_stints = {}
     for competition in competitions:
         stints = defaultdict(list)
         for row in rows:
@@ -273,6 +288,7 @@ def build_domestic_percentiles(db, metadata):
                 stints[row['team_id']].append(row)
         for team_id, team_rows in stints.items():
             source = aggregate(team_rows)
+            domestic_stints[(team_id, competition['leagueId'])] = source
             if not source or not source['roles']:
                 continue
             team_competitions.append({**competition, 'teamId': team_id,
@@ -280,11 +296,28 @@ def build_domestic_percentiles(db, metadata):
                 'currentTeam': str(team_id) == str(metadata.get('team_id')),
                 'minutes': source['minutes'], 'matches': source['matches'], 'roles': source['roles'],
                 'benchmarks': collect_benchmarks(source, competition['leagueId'])})
+    current_team_id = number(metadata.get('team_id'))
+    if include_scopes:
+        stints = defaultdict(list)
+        for row in all_rows:
+            stints[(row['team_id'], row['league_id'])].append(row)
+        for key, team_rows in stints.items():
+            team_id, _ = key
+            source = domestic_stints[key] if key in domestic_stints else aggregate(team_rows)
+            add_scope(source, team_rows, team_id)
+        scopes.sort(key=lambda scope: -scope['minutes'])
+        if current_team_id and any(
+            team_id == current_team_id and source and source['minutes'] >= MIN_MINUTES
+            for (team_id, _), source in domestic_stints.items()
+        ):
+            league_name = str(metadata.get('team_current_league_name') or
+                              metadata.get('latest_domestic_fixture_league_name') or
+                              metadata.get('league_name') or '').strip().lower()
+            preferred_scope = latest_domestic_scope(db, int(player_id), int(current_team_id), league_name)
     team_competitions.sort(key=lambda c: (not c['currentTeam'], -c['minutes'], c['leagueId'], c['teamId']))
     # PDF uses only the latest club's domestic stint and its most-played role.
     # League peers remain deduplicated annual league profiles. Replace our own
     # pooled profile with the selected stint so the target is counted once.
-    current_team_id = number(metadata.get('team_id'))
     pdf_candidates = []
     for competition in competitions:
         own_rows = [r for r in rows if r['league_id'] == competition['leagueId']
@@ -321,4 +354,6 @@ def build_domestic_percentiles(db, metadata):
     competitions.sort(key=lambda c: (not c['currentTeam'], -c['minutes'], c['leagueId']))
     return {'version': BENCHMARK_VERSION, 'minimumMinutes': MIN_MINUTES, 'minimumPeers': MIN_PEERS,
             'period': 'annual', 'generatedAt': datetime.now(timezone.utc).isoformat(),
-            'competitions': competitions, 'teamCompetitions': team_competitions, 'pdfCompetition': pdf_competition, 'computationMs': round((perf_counter()-start)*1000, 2)}
+            'competitions': competitions, 'teamCompetitions': team_competitions, 'pdfCompetition': pdf_competition,
+            **({'scopes': scopes, 'preferredScope': preferred_scope} if include_scopes else {}),
+            'computationMs': round((perf_counter()-start)*1000, 2)}

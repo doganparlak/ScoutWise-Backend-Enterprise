@@ -4,7 +4,7 @@ from player_pool_module.utilities import player_name_pattern
 
 from report_module.scouting_evidence import sanitize_scouting_documents
 
-from report_module.metric_validation import percentage, sanitize_percentages, valid_metric
+from report_module.metric_validation import is_percentage, numeric, percentage, sanitize_percentages, valid_metric
 
 from report_module.percentiles import build_domestic_percentiles
 from report_module.progress import emit_progress, is_streaming
@@ -1100,6 +1100,64 @@ def _phase_taxonomy_distribution_sets(
     return sets
 
 
+def with_scouting_phase_evidence(snapshot: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """Attach evidence to a saved report without querying or regenerating it."""
+    if not isinstance(snapshot, dict) or "phase_evidence" in snapshot:
+        return snapshot
+    card = snapshot.get("player_card")
+    documents = snapshot.get("metrics_docs")
+    if not isinstance(card, dict) or not isinstance(documents, list):
+        return snapshot
+    docs = [doc for doc in documents if isinstance(doc, dict)]
+    if not docs:
+        return snapshot
+
+    value_cache: Dict[str, float | None] = {}
+    phase_evidence: Dict[str, List[Dict[str, Any]]] = {}
+    for phase in _required_phase_names(card):
+        views: List[Dict[str, Any]] = []
+        for view in _phase_taxonomy_distribution_sets(card, docs, phase):
+            categories = sorted(view["items"], key=lambda item: -item["percentage"])
+            available = []
+            for category in categories:
+                signals = []
+                for metric in category["metrics"]:
+                    if metric in {"Match Count", "Minutes Played"}:
+                        continue
+                    if metric not in value_cache:
+                        value_cache[metric] = numeric(_metric_context_value(docs, metric))
+                    value = value_cache[metric]
+                    if value is not None:
+                        signals.append((metric, value))
+                available.append(iter(signals))
+
+            metrics: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            while len(metrics) < 3:
+                before = len(metrics)
+                for category, signals in zip(categories, available):
+                    signal = next((entry for entry in signals if _metric_key(entry[0]) not in seen), None)
+                    if signal is None:
+                        continue
+                    metric, value = signal
+                    seen.add(_metric_key(metric))
+                    basis = "percentage" if is_percentage(metric) else "perMatch"
+                    if metric == "Rating":
+                        basis = "rating"
+                    elif metric == "Shooting Performance":
+                        basis = "coveredMatch"
+                    metrics.append({"metric": metric, "value": value, "basis": basis, "category": category["category"]})
+                    if len(metrics) == 3:
+                        break
+                if len(metrics) == before:
+                    break
+            if metrics:
+                views.append({"role": view["role"], "metrics": metrics})
+        if views:
+            phase_evidence[phase] = views
+    return {**snapshot, "phase_evidence": phase_evidence}
+
+
 def _phase_taxonomy_distribution(
     player_card: Dict[str, Any],
     metric_docs: List[Dict[str, Any]],
@@ -1755,6 +1813,7 @@ def generate_report_content(
         "player_identity": identity, "player_card": player_card,
         "metrics_docs": sanitize_scouting_documents(sanitize_percentages(docs)), "report_text": "",
     }
+    content_json = with_scouting_phase_evidence(content_json)
     source_metadata = (docs[0].get("metadata") or {}) if docs else {}
     content_json["domestic_percentiles"] = build_domestic_percentiles(db, source_metadata)
     emit_progress(content_json, "statistics")
